@@ -27,3 +27,6 @@ htmlcov/
 
 # Experiment log (auto-created)
 .backtest/
+
+# Documentation build output
+site/

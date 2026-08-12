@@ -7,6 +7,6 @@ class EngineAdapter(ABC):
     """Abstract base class for backtesting engine adapters."""
 
     @abstractmethod
-    def run(self, *args, **kwargs):
+    def run(self, *args: object, **kwargs: object) -> object:
         """Run a backtest; each engine adapter implements its own execution."""
         raise NotImplementedError

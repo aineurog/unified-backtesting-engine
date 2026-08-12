@@ -1,5 +1,6 @@
 site_name: Unified Backtesting Engine
 site_description: A unified interface and output across backtesting engines.
+docs_dir: docs
 theme:
   name: readthedocs
 nav:
