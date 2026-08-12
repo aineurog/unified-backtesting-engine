@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal, TypeGuard, cast
 
 import numpy as np
 import pandas as pd
@@ -254,7 +254,7 @@ _EXIT_NAMES: tuple[str, ...] = (
 )
 
 
-def _is_exit(obj: object) -> bool:
+def _is_exit(obj: object) -> TypeGuard[Exit]:
     return isinstance(obj, (TakeProfit, ATRStop, TrailingStop, TimeExit, ChandelierExit))
 
 
@@ -587,8 +587,13 @@ def scale_out_fraction(cfg: Exit) -> float:
 
 
 def _coerce_exits(exits: object) -> tuple[Exit, ...]:
+    # A single exit object is accepted as a one-element shorthand (§7.2 shows
+    # ``RiskConfig(exit=ATRStop(...))``); a sequence is taken as-is. Strings are rejected
+    # (they are not exits).
+    if _is_exit(exits):
+        return (exits,)
     if isinstance(exits, (str, bytes)) or not isinstance(exits, Sequence):
-        raise ConfigError("exits must be a sequence of exit configs")
+        raise ConfigError("exits must be an exit config or a sequence of exit configs")
     out = tuple(exits)
     for e in out:
         if not _is_exit(e):
@@ -680,7 +685,8 @@ class RiskConfig:
     Attributes:
         sizing: The position-sizing model (default :class:`SizeModel` ``all_in``, §7.1).
         exit: The ordered tuple of exits (default empty — exits come from signals only,
-            §7.1). May be given as a list (converted to a tuple).
+            §7.1). May be given as a single exit object (wrapped into a one-tuple, the
+            §7.2 shorthand) or a list/tuple (converted to a tuple).
     """
 
     sizing: SizeModel = SizeModel()

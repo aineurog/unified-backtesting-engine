@@ -348,6 +348,14 @@ def test_risk_config_accepts_list_and_converts_to_tuple():
     assert len(cfg.exit) == 2
 
 
+def test_risk_config_accepts_single_exit_shorthand():
+    # §7.2 shows ``RiskConfig(exit=ATRStop(...))`` — a bare exit is wrapped into a 1-tuple.
+    cfg = RiskConfig(exit=ATRStop(3))  # type: ignore[arg-type]
+    assert isinstance(cfg.exit, tuple)
+    assert len(cfg.exit) == 1
+    assert isinstance(cfg.exit[0], ATRStop)
+
+
 def test_risk_config_rejects_bad_sizing():
     with pytest.raises(ConfigError):
         RiskConfig(sizing="all_in")  # type: ignore[arg-type]
