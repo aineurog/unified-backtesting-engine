@@ -1,0 +1,156 @@
+"""Tests for the position-sizing subsystem (§6.3)."""
+
+from dataclasses import FrozenInstanceError
+
+import numpy as np
+import pytest
+
+from ube.core.errors import ConfigError
+from ube.core.risk import (
+    SIZE_KINDS,
+    SizeModel,
+    all_in_size,
+    equal_weight_size,
+    fixed_fraction_size,
+    fixed_units_size,
+    size_position,
+    volatility_target_size,
+)
+
+
+def test_size_kinds_constant():
+    assert SIZE_KINDS == (
+        "fixed_fraction",
+        "fixed_units",
+        "volatility_target",
+        "all_in",
+        "equal_weight",
+    )
+
+
+# ---------------------------------------------------------------------------
+# SizeModel validation.
+# ---------------------------------------------------------------------------
+
+
+def test_default_model_is_all_in_without_value():
+    model = SizeModel()
+    assert model.kind == "all_in"
+    assert model.value is None
+
+
+def test_model_is_frozen():
+    with pytest.raises(FrozenInstanceError):
+        SizeModel().kind = "all_in"  # type: ignore[misc]
+
+
+def test_unknown_kind_raises():
+    with pytest.raises(ConfigError):
+        SizeModel(kind="martingale")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("kind", ["fixed_fraction", "fixed_units", "volatility_target"])
+def test_value_required_kinds_missing_value_raise(kind):
+    with pytest.raises(ConfigError):
+        SizeModel(kind=kind)  # type: ignore[arg-type]
+
+
+def test_value_free_kind_rejects_value():
+    with pytest.raises(ConfigError):
+        SizeModel(kind="all_in", value=0.5)  # type: ignore[arg-type]
+
+
+def test_non_positive_value_raises():
+    with pytest.raises(ConfigError):
+        SizeModel(kind="fixed_fraction", value=0.0)
+    with pytest.raises(ConfigError):
+        SizeModel(kind="fixed_units", value=-3)
+
+
+# ---------------------------------------------------------------------------
+# The five sizers.
+# ---------------------------------------------------------------------------
+
+
+def test_fixed_fraction_size():
+    # Allocate 10% of 10_000 at price 50 -> 20 units.
+    result = fixed_fraction_size(0.1, capital=10_000, price=50)
+    assert float(result) == pytest.approx(20.0)
+
+
+def test_fixed_fraction_size_is_vectorized():
+    result = fixed_fraction_size(0.1, capital=np.array([10_000, 20_000]), price=50)
+    np.testing.assert_allclose(result, [20.0, 40.0])
+
+
+def test_fixed_units_size():
+    result = fixed_units_size(5)
+    assert float(result) == pytest.approx(5.0)
+
+
+def test_all_in_size():
+    result = all_in_size(10_000, 50)
+    assert float(result) == pytest.approx(200.0)
+
+
+def test_equal_weight_size():
+    result = equal_weight_size(10_000, 50, n=4)
+    assert float(result) == pytest.approx(50.0)
+
+
+def test_volatility_target_size():
+    # units = target * capital / (price * vol)
+    result = volatility_target_size(0.01, capital=100_000, price=100, vol=0.02)
+    assert float(result) == pytest.approx(500.0)
+
+
+def test_sizers_reject_bad_inputs():
+    with pytest.raises(ConfigError):
+        fixed_fraction_size(0.1, capital=10_000, price=0)
+    with pytest.raises(ConfigError):
+        all_in_size(-100, 50)
+    with pytest.raises(ConfigError):
+        equal_weight_size(10_000, 50, n=0)
+    with pytest.raises(ConfigError):
+        volatility_target_size(0.01, capital=100_000, price=100, vol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# size_position dispatcher.
+# ---------------------------------------------------------------------------
+
+
+def test_size_position_accepts_bare_kind_for_value_free_kinds():
+    assert float(size_position("all_in", capital=10_000, price=50)) == pytest.approx(200.0)
+    assert float(
+        size_position("equal_weight", capital=10_000, price=50, n=4)
+    ) == pytest.approx(50.0)
+
+
+def test_size_position_accepts_model():
+    model = SizeModel(kind="fixed_fraction", value=0.1)
+    assert float(size_position(model, capital=10_000, price=50)) == pytest.approx(20.0)
+
+
+def test_size_position_fixed_units():
+    model = SizeModel(kind="fixed_units", value=7)
+    assert float(size_position(model, capital=0, price=0)) == pytest.approx(7.0)
+
+
+def test_size_position_volatility_target():
+    model = SizeModel(kind="volatility_target", value=0.01)
+    assert float(
+        size_position(model, capital=100_000, price=100, vol=0.02)
+    ) == pytest.approx(500.0)
+
+
+def test_size_position_missing_required_kwarg_raises():
+    with pytest.raises(ConfigError):
+        size_position("equal_weight", capital=10_000, price=50)  # missing n
+    with pytest.raises(ConfigError):
+        size_position(SizeModel(kind="volatility_target", value=0.01), capital=1, price=1)
+
+
+def test_size_position_bare_value_requiring_kind_raises():
+    with pytest.raises(ConfigError):
+        size_position("fixed_fraction", capital=10_000, price=50)
