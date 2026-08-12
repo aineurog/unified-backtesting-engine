@@ -250,7 +250,9 @@ def build_benchmark(
     instruments = list(data)
     if config.kind == "equal_weight":
         n = len(instruments)
-        return portfolio_curve(instruments, [1.0 / n] * n)
+        # Empty input must hit portfolio_curve's clean DataShapeError guard, not a
+        # ZeroDivisionError on `1 / n`.
+        return portfolio_curve(instruments, [1.0 / n] * n if n else [])
 
     if config.weights is None:  # validated at construction; defensive
         raise ConfigError("kind='custom' requires weights")

@@ -190,6 +190,13 @@ def test_build_benchmark_equal_weight():
     np.testing.assert_allclose(curve.equity, [1.0, 1.15])
 
 
+def test_build_benchmark_equal_weight_empty_data_raises_clean_error():
+    # An empty portfolio must surface as a §15 DataShapeError, not a raw
+    # ZeroDivisionError from the 1/n equal-weight computation.
+    with pytest.raises(DataShapeError):
+        build_benchmark(BenchmarkConfig(kind="equal_weight"), [])
+
+
 def test_build_benchmark_custom():
     cfg = BenchmarkConfig(kind="custom", weights=[0.25, 0.75])
     curve = build_benchmark(
