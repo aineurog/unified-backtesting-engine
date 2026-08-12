@@ -64,7 +64,8 @@ def _coerce_bool(values: object, name: str) -> np.ndarray:
         raise InvalidSignalError(
             f"signal column {name!r} must be boolean; got dtype {arr.dtype}"
         )
-    return arr
+    # Copy so the frozen container never aliases (or freezes) the caller's buffer.
+    return arr.copy()
 
 
 @dataclass(frozen=True)

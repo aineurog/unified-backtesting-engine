@@ -142,6 +142,40 @@ def test_arrays_are_read_only():
         sig.long_entry[0] = True
 
 
+def test_constructor_does_not_alias_caller_buffer():
+    # A frozen container must own its data: mutating the caller's buffer afterwards
+    # must not change the container.
+    src = np.zeros(3, dtype=bool)
+    sig = Signals(
+        long_entry=src,
+        long_exit=np.zeros(3, dtype=bool),
+        short_entry=np.zeros(3, dtype=bool),
+        short_exit=np.zeros(3, dtype=bool),
+    )
+    src[0] = True
+    assert not sig.long_entry[0]
+
+
+def test_constructor_does_not_freeze_caller_array():
+    # Construction must not silently make the caller's own array read-only.
+    src = np.zeros(3, dtype=bool)
+    Signals(
+        long_entry=src,
+        long_exit=np.zeros(3, dtype=bool),
+        short_entry=np.zeros(3, dtype=bool),
+        short_exit=np.zeros(3, dtype=bool),
+    )
+    src[0] = True  # still writable — no hidden side effect
+    assert src[0]
+
+
+def test_from_array_does_not_alias_input():
+    src = np.zeros((3, 4), dtype=bool)
+    sig = Signals.from_array(src)
+    src[0, 0] = True
+    assert not sig.long_entry[0]
+
+
 # ---------------------------------------------------------------------------
 # Conflict rule (§6.1) — the only two contradictory pairings, naming the bar.
 # ---------------------------------------------------------------------------
