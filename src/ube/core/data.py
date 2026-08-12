@@ -397,6 +397,27 @@ class MarketData:
 
     # -- helpers --------------------------------------------------------------
 
+    def head(self, n: int) -> MarketData:
+        """Return the first ``n`` bars as a zero-copy view, without re-validation.
+
+        OHLC invariants are per-bar, so any prefix of an already-validated
+        ``MarketData`` is itself valid; the slice is therefore built without re-running
+        the structural checks. The arrays are shared with this instance (both sides are
+        read-only), so the result is a cheap view suitable for handing a growing window
+        to a per-bar callable (``ube.core.signals.from_callable``).
+        """
+        if n < 0 or n > self.n_bars:
+            raise DataShapeError(f"head({n}) out of range for {self.n_bars} bars")
+        sliced = MarketData.__new__(MarketData)
+        object.__setattr__(sliced, "open", self.open[:n])
+        object.__setattr__(sliced, "high", self.high[:n])
+        object.__setattr__(sliced, "low", self.low[:n])
+        object.__setattr__(sliced, "close", self.close[:n])
+        object.__setattr__(sliced, "volume", self.volume[:n])
+        object.__setattr__(sliced, "index", self.index[:n])
+        object.__setattr__(sliced, "bar_type", self.bar_type)
+        return sliced
+
     def to_dataframe(self) -> pd.DataFrame:
         """Reconstruct a pandas ``DataFrame`` with canonical columns and index."""
         return pd.DataFrame(
