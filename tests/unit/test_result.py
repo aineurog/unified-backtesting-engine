@@ -307,6 +307,48 @@ def test_warmup_greater_than_length_drops_everything():
     assert len(result.equity_curve.index) == 0
 
 
+def test_warmup_with_event_bars():
+    # Event bars use an integer RangeIndex (not a DatetimeIndex); the warm-up cutoff
+    # must be derived from the actual index type, not config.bar_type.
+    close = np.array([100.0, 110.0, 115.0, 120.0])
+    n = close.shape[0]
+    market_data = {
+        "A": MarketData(
+            open=close,
+            high=close + 0.5,
+            low=close - 0.5,
+            close=close,
+            volume=np.ones(n),
+            index=pd.RangeIndex(n),
+            bar_type="volume",
+        )
+    }
+    instruments = {"A": Instrument("A", asset_class="stocks", settlement_currency="USD")}
+    ledger = EventLedger(
+        [
+            _cash(0, 1000.0),
+            _fill(0, "A", 1, 10.0, 100.0),
+            _position(0, "A", 10.0),
+            _fill(1, "A", -1, 10.0, 110.0),
+            _position(1, "A", 0.0),
+            _fill(2, "A", 1, 5.0, 115.0),
+            _position(2, "A", 5.0),
+            _fill(3, "A", -1, 5.0, 120.0),
+            _position(3, "A", 0.0),
+        ]
+    )
+    config = BacktestConfig(
+        instrument=instruments["A"], base_currency="USD", bar_type="volume", warmup_bars=1
+    )
+    result = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments
+    )
+    # Trade 1 (entry bar 0) dropped; trade 2 (entry bar 2) kept.
+    assert len(result.trades) == 1
+    assert result.trades[0].entry_timestamp == 2
+    assert len(result.equity_curve.index) == 3
+
+
 # ---------------------------------------------------------------------------
 # Persistence: save / load round-trip (§7.3).
 # ---------------------------------------------------------------------------
@@ -342,3 +384,19 @@ def test_load_rejects_non_result(tmp_path):
         pickle.dump({"not": "a result"}, fh)
     with pytest.raises(DataShapeError):
         BacktestResult.load(path)
+
+
+def test_load_preserves_read_only_arrays(tmp_path):
+    # Pickle drops ndarray.flags.writeable; load() must re-apply it (§3 principle 5).
+    ledger, market_data, instruments, config = _single_instrument()
+    result = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments
+    )
+    path = tmp_path / "result.pkl"
+    result.save(path)
+    loaded = BacktestResult.load(path)
+
+    assert not loaded.equity_curve.equity.flags.writeable
+    assert not loaded.equity_curve_by_instrument["A"].equity.flags.writeable
+    with pytest.raises(ValueError):
+        loaded.equity_curve.equity[0] = 999.0

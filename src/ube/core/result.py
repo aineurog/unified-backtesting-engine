@@ -48,8 +48,9 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from ube.core.benchmark import BenchmarkCurve
@@ -169,7 +170,7 @@ class BacktestResult:
 
         if config.warmup_bars > 0:
             trades_view = _drop_warmup_trades(
-                trades_view, combined.index, config.bar_type, config.warmup_bars
+                trades_view, combined.index, config.warmup_bars
             )
             combined = _slice_curve(combined, config.warmup_bars)
             by_instrument = {
@@ -204,13 +205,22 @@ class BacktestResult:
 
     @classmethod
     def load(cls, path: str | Path) -> BacktestResult:
-        """Load a :class:`BacktestResult` previously written by :meth:`save`."""
+        """Load a :class:`BacktestResult` previously written by :meth:`save`.
+
+        Pickle does not preserve ``ndarray.flags.writeable``, so the read-only lock on
+        the derived-view arrays is re-applied here (§3 principle 5 — a loaded result is
+        frozen, same as a freshly built one).
+        """
         with open(path, "rb") as fh:
             obj = pickle.load(fh)
         if not isinstance(obj, cls):
             raise DataShapeError(
                 f"load({path}) did not produce a BacktestResult; got {type(obj).__name__}"
             )
+        _refreeze(obj.equity_curve)
+        _refreeze(obj.equity_curve_by_instrument)
+        _refreeze(obj.positions)
+        _refreeze(obj.benchmark)
         return obj
 
 
@@ -256,20 +266,51 @@ def _slice_curve(curve: EquityCurve, n: int) -> EquityCurve:
 def _drop_warmup_trades(
     trades_view: tuple[Trade, ...],
     index: pd.Index,
-    bar_type: str,
     warmup_bars: int,
 ) -> tuple[Trade, ...]:
     """Drop completed trades whose entry bar falls inside the warm-up window (§7.2).
 
     The warm-up window is the first ``warmup_bars`` bars of the combined grid; a trade
-    entering on a warm-up bar is excluded from statistics. For time bars the grid holds
-    nanosecond timestamps, for event bars integer bar indexes — both compare directly
-    against ``entry_timestamp``.
+    entering on a warm-up bar is excluded from statistics. The cutoff representation is
+    derived from the *actual* grid index (a tz-aware ``DatetimeIndex`` → nanosecond
+    timestamps, anything else → integer bar indexes) so it always matches how the
+    ledger's ``entry_timestamp`` was populated — independent of ``config.bar_type``.
     """
     if warmup_bars >= len(index):
         return ()
-    if bar_type == "time":
-        cutoff = int(cast(pd.DatetimeIndex, index).as_unit("ns").asi8[warmup_bars])  # type: ignore[attr-defined]
+    if isinstance(index, pd.DatetimeIndex):
+        asi8: np.ndarray = index.as_unit("ns").asi8  # type: ignore[attr-defined]
+        cutoff = int(asi8[warmup_bars])
     else:
         cutoff = int(index[warmup_bars])
     return tuple(t for t in trades_view if t.entry_timestamp >= cutoff)
+
+
+def _refreeze(obj: Any) -> None:
+    """Re-apply ``write=False`` to every derived-view array reachable from ``obj``.
+
+    Pickle drops ``ndarray.flags.writeable``, so a loaded result's derived-view arrays
+    come back writable; this restores the immutability guarantee (§3 principle 5). It
+    walks only the known array-bearing containers (``EquityCurve``/``Positions``/
+    ``BenchmarkCurve``) plus dict/tuple/list aggregations — never arbitrary ``__dict__``
+    attributes, which would descend into pandas internals that contain reference cycles.
+    The containers reached here are freshly deserialized (owned by the loaded result),
+    so locking them is safe — unlike construction, where caller-owned buffers must never
+    be frozen.
+    """
+    if isinstance(obj, np.ndarray):
+        obj.setflags(write=False)
+    elif isinstance(obj, EquityCurve):
+        obj.equity.setflags(write=False)
+    elif isinstance(obj, Positions):
+        obj.timestamps.setflags(write=False)
+        obj.position.setflags(write=False)
+    elif isinstance(obj, BenchmarkCurve):
+        obj.returns.setflags(write=False)
+        obj.equity.setflags(write=False)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _refreeze(value)
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            _refreeze(value)
