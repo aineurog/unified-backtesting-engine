@@ -837,6 +837,15 @@ def _build_equity(
         for iid in pc_ts
     }
 
+    # A held position with no market_data cannot be marked to market (§4.6 step 2) —
+    # fail loudly rather than silently dropping it from the combined equity (§4.8).
+    unmarketable = set(pc_ts) - set(mds)
+    if unmarketable:
+        raise DataShapeError(
+            "position_change events reference instruments with no market_data entry: "
+            f"{sorted(unmarketable)} — cannot mark to market"
+        )
+
     n = grid.shape[0]
     marks_base_sum = np.zeros(n, dtype=np.float64)
     per_instrument: dict[str, EquityCurve] = {}

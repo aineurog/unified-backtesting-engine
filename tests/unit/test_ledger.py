@@ -425,6 +425,20 @@ def test_equity_curve_empty_base_currency_raises_config():
         equity_curve(ledger, market_data, instruments, base_currency="")
 
 
+def test_equity_curve_position_without_market_data_raises():
+    # A held position with no market_data cannot be marked to market (§4.6 step 2) —
+    # it must surface as DataShapeError, not silently drop from the combined equity.
+    t0 = pd.Timestamp("2024-01-01T10:00", tz="UTC")
+    market_data = {"A": _time_bars([t0], [100.0])}
+    instruments = {
+        "A": Instrument("A", asset_class="stocks", settlement_currency="USD"),
+        "C": Instrument("C", asset_class="stocks", settlement_currency="USD"),
+    }
+    ledger = EventLedger([_position(t0, "A", 1.0), _position(t0, "C", 100.0)])
+    with pytest.raises(DataShapeError):
+        equity_curve(ledger, market_data, instruments, base_currency="USD")
+
+
 def test_fx_series_from_series_and_validation():
     s = pd.Series(
         [1.0, 1.1],
