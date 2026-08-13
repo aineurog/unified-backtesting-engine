@@ -53,7 +53,6 @@ def _time_bars(timestamps, closes):
         close=close,
         volume=np.ones(n),
         index=pd.DatetimeIndex(timestamps, tz="UTC"),
-        bar_type="time",
     )
 
 
@@ -132,6 +131,37 @@ def test_trades_are_derived_and_correct():
     assert t.entry_price == 100.0
     assert t.exit_price == 110.0
     assert t.gross_pnl == pytest.approx(100.0)
+
+
+def test_trades_view_applies_contract_multiplier():
+    # from_ledger must derive .trades with the same instruments map as the equity
+    # curves — otherwise a futures trade's notional/gross_pnl would use multiplier 1.0
+    # while the equity curve used the real multiplier (§4.6, §7.3).
+    instruments = {
+        "ES": Instrument(
+            "ES", asset_class="futures", contract_multiplier=50.0, settlement_currency="USD"
+        )
+    }
+    market_data = {"ES": _time_bars([_T0, _T1], [5000.0, 5100.0])}
+    ledger = EventLedger(
+        [
+            _fill(_T0, "ES", 1, 1.0, 5000.0),
+            _position(_T0, "ES", 1.0),
+            _fill(_T1, "ES", -1, 1.0, 5100.0),
+            _position(_T1, "ES", 0.0),
+        ]
+    )
+    config = BacktestConfig(instrument=instruments["ES"], base_currency="USD")
+    result = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments
+    )
+    (t,) = result.trades
+    assert t.entry_price == pytest.approx(5000.0)
+    assert t.exit_price == pytest.approx(5100.0)
+    assert t.entry_notional == pytest.approx(1.0 * 5000.0 * 50.0)
+    assert t.gross_pnl == pytest.approx(1.0 * (5100.0 - 5000.0) * 50.0)
+    # The equity curve marks to the same multiplier: 1 contract × 5000 × 50.
+    assert result.equity_curve.equity.tolist() == pytest.approx([250000.0, 0.0])
 
 
 def test_positions_are_derived_for_single_instrument():
@@ -305,48 +335,6 @@ def test_warmup_greater_than_length_drops_everything():
     result, _, _, _ = _two_trades(warmup_bars=4)
     assert result.trades == ()
     assert len(result.equity_curve.index) == 0
-
-
-def test_warmup_with_event_bars():
-    # Event bars use an integer RangeIndex (not a DatetimeIndex); the warm-up cutoff
-    # must be derived from the actual index type, not config.bar_type.
-    close = np.array([100.0, 110.0, 115.0, 120.0])
-    n = close.shape[0]
-    market_data = {
-        "A": MarketData(
-            open=close,
-            high=close + 0.5,
-            low=close - 0.5,
-            close=close,
-            volume=np.ones(n),
-            index=pd.RangeIndex(n),
-            bar_type="volume",
-        )
-    }
-    instruments = {"A": Instrument("A", asset_class="stocks", settlement_currency="USD")}
-    ledger = EventLedger(
-        [
-            _cash(0, 1000.0),
-            _fill(0, "A", 1, 10.0, 100.0),
-            _position(0, "A", 10.0),
-            _fill(1, "A", -1, 10.0, 110.0),
-            _position(1, "A", 0.0),
-            _fill(2, "A", 1, 5.0, 115.0),
-            _position(2, "A", 5.0),
-            _fill(3, "A", -1, 5.0, 120.0),
-            _position(3, "A", 0.0),
-        ]
-    )
-    config = BacktestConfig(
-        instrument=instruments["A"], base_currency="USD", bar_type="volume", warmup_bars=1
-    )
-    result = BacktestResult.from_ledger(
-        ledger, config, market_data=market_data, instruments=instruments
-    )
-    # Trade 1 (entry bar 0) dropped; trade 2 (entry bar 2) kept.
-    assert len(result.trades) == 1
-    assert result.trades[0].entry_timestamp == 2
-    assert len(result.equity_curve.index) == 3
 
 
 # ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ from ube.core.risk import (
 
 
 def _md(close, *, high=None, low=None, open_=None) -> MarketData:
-    """Event bars; ``high``/``low`` default to close ± 0.5 (OHLC invariants hold)."""
+    """Bars; ``high``/``low`` default to close ± 0.5 (OHLC invariants hold)."""
     close = np.asarray(close, dtype=float)
     n = close.shape[0]
     high = np.asarray(high, dtype=float) if high is not None else close + 0.5
@@ -44,8 +44,7 @@ def _md(close, *, high=None, low=None, open_=None) -> MarketData:
         low=low,
         close=close,
         volume=np.ones(n),
-        index=pd.RangeIndex(n),
-        bar_type="volume",
+        index=pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC"),
     )
 
 

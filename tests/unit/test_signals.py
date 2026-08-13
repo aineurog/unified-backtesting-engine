@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from ube.core.data import MarketData
-from ube.core.errors import ConfigError, InvalidSignalError
+from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
 from ube.core.signals import SIGNAL_COLUMNS, Signals, from_callable, from_target
 
 
@@ -25,7 +25,7 @@ def _assert_signals_equal(got: Signals, expected: Signals) -> None:
 
 
 def _bars(closes: list[float]) -> MarketData:
-    """Volume (event) bars with the given closes, for exercising ``from_callable``."""
+    """Bars with the given closes, for exercising ``from_callable``."""
     close = np.asarray(closes, dtype=float)
     n = close.shape[0]
     return MarketData(
@@ -34,8 +34,7 @@ def _bars(closes: list[float]) -> MarketData:
         low=close - 0.5,
         close=close,
         volume=np.ones(n),
-        index=pd.RangeIndex(n),
-        bar_type="volume",
+        index=pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC"),
     )
 
 
@@ -388,9 +387,9 @@ def test_from_callable_invalid_return_raises():
 
 
 def test_from_callable_empty_bars():
-    bars = _bars([])
-    sig = from_callable(lambda window: 0, bars)
-    assert sig.n_bars == 0
+    # Empty input is rejected up-front by MarketData (fail loudly).
+    with pytest.raises(DataShapeError):
+        from_callable(lambda window: 0, _bars([]))
 
 
 def test_from_callable_requires_market_data():

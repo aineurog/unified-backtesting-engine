@@ -6,18 +6,13 @@ import pandas as pd
 import pytest
 
 from ube.core.benchmark import BenchmarkConfig
-from ube.core.calendar import DataQualityConfig
 from ube.core.config import (
     OPPOSITE_SIGNAL_POLICIES,
     BacktestConfig,
     SignalConfig,
 )
 from ube.core.cost import CostModel
-from ube.core.errors import (
-    ConfigError,
-    IncompatibleConfigError,
-    UndeclaredConfigError,
-)
+from ube.core.errors import ConfigError, UndeclaredConfigError
 from ube.core.instrument import Instrument
 from ube.core.risk import RiskConfig, SizeModel
 
@@ -63,11 +58,9 @@ def test_signal_config_is_frozen():
 def test_defaults_match_spec():
     cfg = BacktestConfig(instrument=_inst())
     assert cfg.instrument.symbol == "BTC-USDT"
-    assert cfg.bar_type == "time"
     assert cfg.cost_model is None  # asset-class default resolved later
     assert cfg.risk == RiskConfig()  # all_in sizing, no exits
     assert cfg.signal == SignalConfig()
-    assert cfg.data_quality == DataQualityConfig()  # missing_bar="fail"
     assert cfg.benchmark == BenchmarkConfig()  # buy_and_hold
     assert cfg.engine == "auto"
     assert cfg.engine_overrides is None
@@ -85,11 +78,9 @@ def test_config_is_frozen():
 def test_accepts_explicit_composition():
     cfg = BacktestConfig(
         instrument=_inst(),
-        bar_type="time",
         cost_model=CostModel(commission=0.001),
         risk=RiskConfig(sizing=SizeModel(kind="fixed_fraction", value=0.1)),
         signal=SignalConfig(on_opposite_signal="reverse"),
-        data_quality=DataQualityConfig(missing_bar="skip"),
         benchmark=BenchmarkConfig(kind="equal_weight"),
         engine="vectorbt",
         base_currency="USD",
@@ -98,7 +89,6 @@ def test_accepts_explicit_composition():
     assert cfg.cost_model is not None
     assert cfg.risk.sizing.kind == "fixed_fraction"
     assert cfg.signal.on_opposite_signal == "reverse"
-    assert cfg.data_quality.missing_bar == "skip"
     assert cfg.benchmark.kind == "equal_weight"
     assert cfg.engine == "vectorbt"
     assert cfg.base_currency == "USD"
@@ -115,12 +105,6 @@ def test_requires_instrument_instance():
         BacktestConfig(instrument="BTC-USDT")  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("bad", ["volume_profile", "range", 1, None])
-def test_invalid_bar_type_raises(bad):
-    with pytest.raises(ConfigError):
-        BacktestConfig(instrument=_inst(), bar_type=bad)  # type: ignore[arg-type]
-
-
 def test_invalid_cost_model_raises():
     with pytest.raises(ConfigError):
         BacktestConfig(instrument=_inst(), cost_model="cheap")  # type: ignore[arg-type]
@@ -134,11 +118,6 @@ def test_invalid_risk_raises():
 def test_invalid_signal_raises():
     with pytest.raises(ConfigError):
         BacktestConfig(instrument=_inst(), signal="reverse")  # type: ignore[arg-type]
-
-
-def test_invalid_data_quality_raises():
-    with pytest.raises(ConfigError):
-        BacktestConfig(instrument=_inst(), data_quality="fail")  # type: ignore[arg-type]
 
 
 def test_invalid_benchmark_raises():
@@ -235,22 +214,5 @@ def test_validate_paper_trading_ok_with_policy():
     cfg.validate(paper_trading=True)  # must not raise
 
 
-def test_validate_incompatible_non_time_bar_with_non_default_missing_bar():
-    cfg = BacktestConfig(
-        instrument=_inst(),
-        bar_type="tick",
-        data_quality=DataQualityConfig(missing_bar="forward_fill"),
-    )
-    with pytest.raises(IncompatibleConfigError):
-        cfg.validate()
-
-
-def test_validate_non_time_bar_with_default_missing_bar_is_ok():
-    # The default "fail" policy is a no-op for event bars, so it is not a contradiction.
-    cfg = BacktestConfig(instrument=_inst(), bar_type="tick")
-    cfg.validate()  # must not raise
-
-
-def test_undeclared_and_incompatible_are_config_errors():
+def test_undeclared_is_a_config_error():
     assert issubclass(UndeclaredConfigError, ConfigError)
-    assert issubclass(IncompatibleConfigError, ConfigError)

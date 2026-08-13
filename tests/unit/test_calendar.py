@@ -1,6 +1,4 @@
-"""Tests for calendar-aware bar indexing and the missing-bar policy (§4.4, §4.7)."""
-
-from dataclasses import FrozenInstanceError
+"""Tests for calendar resolution and session awareness (§4.4, §4.5)."""
 
 import numpy as np
 import pandas as pd
@@ -9,25 +7,17 @@ import pytest
 from ube.core.calendar import (
     CALENDAR_ALWAYS_OPEN,
     AlwaysOpenCalendar,
-    DataQualityConfig,
     ExchangeCalendar,
-    apply_missing_bar_policy,
-    detect_gaps,
     resolve_calendar,
+    validate_in_session,
 )
 from ube.core.data import MarketData
-from ube.core.errors import (
-    CalendarMismatchError,
-    ConfigError,
-    DataError,
-    InvalidInstrumentError,
-    MissingBarError,
-)
+from ube.core.errors import CalendarMismatchError, DataError, InvalidInstrumentError
 from ube.core.instrument import Instrument
 
 
 def _bars(timestamps: list[str]) -> MarketData:
-    """Minute time bars with monotonically rising OHLC, indexed by the given UTC times."""
+    """Minute bars with monotonically rising OHLC, indexed by the given UTC times."""
     idx = pd.to_datetime(timestamps).tz_localize("UTC")
     n = len(idx)
     base = np.arange(1, n + 1, dtype=float)
@@ -38,20 +28,6 @@ def _bars(timestamps: list[str]) -> MarketData:
         close=base + 0.25,
         volume=np.full(n, 10.0),
         index=idx,
-        bar_type="time",
-    )
-
-
-def _event_bars(n: int = 4, bar_type: str = "volume") -> MarketData:
-    base = np.arange(1, n + 1, dtype=float)
-    return MarketData(
-        open=base,
-        high=base + 0.5,
-        low=base - 0.5,
-        close=base + 0.25,
-        volume=np.full(n, 10.0),
-        index=pd.RangeIndex(n),
-        bar_type=bar_type,
     )
 
 
@@ -113,122 +89,29 @@ def test_xnys_session_membership():
 
 
 # ---------------------------------------------------------------------------
-# DataQualityConfig (§4.7).
+# validate_in_session (§4.4) — the out-of-session check.
 # ---------------------------------------------------------------------------
 
 
-def test_data_quality_config_defaults_to_fail():
-    assert DataQualityConfig().missing_bar == "fail"
-
-
-def test_data_quality_config_is_frozen():
-    with pytest.raises(FrozenInstanceError):
-        DataQualityConfig().missing_bar = "skip"  # type: ignore[misc]
-
-
-def test_data_quality_config_rejects_unknown_policy():
-    with pytest.raises(ConfigError):
-        DataQualityConfig(missing_bar="nonsense")  # type: ignore[arg-type]
-
-
-# ---------------------------------------------------------------------------
-# Calendar-expected closures are excluded, not forward-filled (§4.4).
-# ---------------------------------------------------------------------------
-
-
-def test_weekend_closure_is_expected_gap_not_missing():
+def test_in_session_bars_pass_validation():
     cal = resolve_calendar("XNYS")
-    md = _bars(
-        [
-            "2024-01-05 20:58",  # Friday, last minutes of the session
-            "2024-01-05 20:59",
-            "2024-01-08 14:30",  # Monday open
-            "2024-01-08 14:31",
-        ]
-    )
-    report = detect_gaps(md, cal)
-    assert not report.out_of_session.any()
-    assert not report.unexpected_gap.any()
-    assert report.expected_gap.tolist() == [False, True, False]
-    # The weekend closure is not treated as a missing bar under any policy.
-    assert apply_missing_bar_policy(md, cal, DataQualityConfig("fail")).n_bars == 4
-    assert apply_missing_bar_policy(md, cal, DataQualityConfig("forward_fill")).n_bars == 4
-
-
-# ---------------------------------------------------------------------------
-# Genuine unexpected gap -> missing-bar policy (§4.7).
-# ---------------------------------------------------------------------------
-
-
-def test_unexpected_gap_fail_raises_missing_bar_error():
-    cal = resolve_calendar("XNYS")
-    md = _bars(["2024-01-08 14:30", "2024-01-08 14:31", "2024-01-08 14:33"])
-    report = detect_gaps(md, cal)
-    assert report.unexpected_gap.tolist() == [False, True]
-    assert report.missing_counts.tolist() == [0, 1]
-    assert report.has_missing
-    with pytest.raises(MissingBarError):
-        apply_missing_bar_policy(md, cal, DataQualityConfig("fail"))
-
-
-def test_unexpected_gap_skip_returns_unchanged():
-    cal = resolve_calendar("XNYS")
-    md = _bars(["2024-01-08 14:30", "2024-01-08 14:31", "2024-01-08 14:33"])
-    out = apply_missing_bar_policy(md, cal, DataQualityConfig("skip"))
-    assert out is md
-    assert out.n_bars == 3
-
-
-def test_unexpected_gap_forward_fill_inserts_synthetic_bar():
-    cal = resolve_calendar("XNYS")
-    md = _bars(["2024-01-08 14:30", "2024-01-08 14:31", "2024-01-08 14:33"])
-    out = apply_missing_bar_policy(md, cal, DataQualityConfig("forward_fill"))
-    assert out.n_bars == 4
-    assert out.index.tolist() == [
-        pd.Timestamp("2024-01-08 14:30:00+00:00"),
-        pd.Timestamp("2024-01-08 14:31:00+00:00"),
-        pd.Timestamp("2024-01-08 14:32:00+00:00"),
-        pd.Timestamp("2024-01-08 14:33:00+00:00"),
-    ]
-    # The synthetic bar carries the previous bar's price, with zero volume.
-    assert out.close[2] == out.close[1]
-    assert out.open[2] == out.open[1]
-    assert out.volume[2] == 0.0
-
-
-def test_missing_bar_error_is_a_data_error():
-    assert issubclass(MissingBarError, DataError)
-    assert issubclass(CalendarMismatchError, DataError)
-
-
-# ---------------------------------------------------------------------------
-# CalendarMismatchError — a bar at a closed timestamp (§15).
-# ---------------------------------------------------------------------------
+    md = _bars(["2024-01-08 14:30", "2024-01-08 14:31", "2024-01-08 15:00"])
+    validate_in_session(md, cal)  # must not raise
 
 
 def test_bar_at_closed_timestamp_raises_calendar_mismatch():
     cal = resolve_calendar("XNYS")
     # A clearly out-of-session bar: a Saturday timestamp.
-    md_sat = _bars(["2024-01-06 15:00", "2024-01-08 14:30"])
-    report = detect_gaps(md_sat, cal)
-    assert report.out_of_session.tolist() == [True, False]
+    md = _bars(["2024-01-06 15:00", "2024-01-08 14:30"])
     with pytest.raises(CalendarMismatchError):
-        apply_missing_bar_policy(md_sat, cal, DataQualityConfig("fail"))
+        validate_in_session(md, cal)
 
 
-# ---------------------------------------------------------------------------
-# Event bars bypass calendar logic entirely (§4.3).
-# ---------------------------------------------------------------------------
+def test_always_open_calendar_trivially_passes():
+    cal = resolve_calendar("24/7")
+    md = _bars(["2024-01-06 15:00", "2024-01-08 14:30"])
+    validate_in_session(md, cal)  # must not raise
 
 
-@pytest.mark.parametrize("bar_type", ["volume", "dollar", "tick"])
-def test_event_bars_are_a_no_op(bar_type):
-    cal = resolve_calendar("XNYS")
-    md = _event_bars(5, bar_type=bar_type)
-    report = detect_gaps(md, cal)
-    assert not report.has_missing
-    assert not report.unexpected_gap.any()
-    assert not report.out_of_session.any()
-    # Event bars are returned unchanged regardless of the policy.
-    assert apply_missing_bar_policy(md, cal, DataQualityConfig("fail")) is md
-    assert apply_missing_bar_policy(md, cal, DataQualityConfig("forward_fill")) is md
+def test_calendar_mismatch_error_is_a_data_error():
+    assert issubclass(CalendarMismatchError, DataError)

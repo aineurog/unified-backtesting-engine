@@ -20,7 +20,9 @@ any dependency on the calendar (item 03) and cost-model (item 05) modules:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from numbers import Real
 
 from ube.core.errors import InvalidInstrumentError
 
@@ -29,9 +31,17 @@ __all__ = ["Instrument", "ASSET_CLASSES"]
 # The asset classes the engine supports. The labels are locked by the per-asset-class
 # deterministic fixtures of §16 (``crypto_perp/``, ``futures/``, ``stocks/``,
 # ``forex/``, ``commodities/``) and the ``asset_class="crypto_perp"`` example of §4.5.
+# ``crypto_spot`` (spot crypto — no funding/borrow) is the perp's funding-free sibling.
 ASSET_CLASSES: frozenset[str] = frozenset(
-    {"crypto_perp", "futures", "stocks", "forex", "commodities"}
+    {"crypto_perp", "crypto_spot", "futures", "stocks", "forex", "commodities"}
 )
+
+
+def _is_positive_number(value: object) -> bool:
+    """True if ``value`` is a finite, strictly-positive real number (not a bool)."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return False
+    return math.isfinite(float(value)) and float(value) > 0.0
 
 
 @dataclass(frozen=True)
@@ -41,7 +51,7 @@ class Instrument:
     ``symbol`` and ``asset_class`` are required. Every asset-class-varying field is
     optional and defaults to ``None``; a ``None`` value means "apply the sensible
     asset-class default", which the cost/calendar modules resolve. This is not a
-    silently-guessed default (§4.8): the *asset class* is declared explicitly and
+    silently-guessed default (§4.7): the *asset class* is declared explicitly and
     drives the resolution.
 
     Attributes:
@@ -78,7 +88,11 @@ class Instrument:
                 f"unsupported asset_class={self.asset_class!r}; "
                 f"expected one of {sorted(ASSET_CLASSES)}"
             )
-        if self.tick_size is not None and self.tick_size <= 0:
-            raise InvalidInstrumentError("tick_size must be positive")
-        if self.contract_multiplier is not None and self.contract_multiplier <= 0:
-            raise InvalidInstrumentError("contract_multiplier must be positive")
+        if self.tick_size is not None and not _is_positive_number(self.tick_size):
+            raise InvalidInstrumentError("tick_size must be a positive finite number")
+        if self.contract_multiplier is not None and not _is_positive_number(
+            self.contract_multiplier
+        ):
+            raise InvalidInstrumentError(
+                "contract_multiplier must be a positive finite number"
+            )

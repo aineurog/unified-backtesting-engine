@@ -1,0 +1,10 @@
+{
+  "asset_class": "crypto_perp",
+  "borrow_model": null,
+  "calendar": "24/7",
+  "contract_multiplier": null,
+  "funding_model": null,
+  "settlement_currency": "USDT",
+  "symbol": "BTC-USDT",
+  "tick_size": 0.1
+}

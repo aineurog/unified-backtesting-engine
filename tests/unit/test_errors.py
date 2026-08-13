@@ -21,7 +21,6 @@ SUBCLASSES = {
         "IncompatibleConfigError",
     ),
     "DataError": (
-        "MissingBarError",
         "DataShapeError",
         "CalendarMismatchError",
         "FXRateUnavailableError",
@@ -36,17 +35,17 @@ SUBCLASSES = {
     ),
 }
 
-# Flattened list of all 16 classes, bases first.
+# Flattened list of all 15 classes, bases first.
 ALL_CLASSES = BASE_CATEGORIES + tuple(
     name for names in SUBCLASSES.values() for name in names
 )
 
 
-def test_total_class_count_is_sixteen():
-    assert len(ALL_CLASSES) == 16
+def test_total_class_count_is_fifteen():
+    assert len(ALL_CLASSES) == 15
 
 
-def test_all_sixteen_classes_are_importable():
+def test_all_fifteen_classes_are_importable():
     for name in ALL_CLASSES:
         assert hasattr(errors, name), f"ube.core.errors.{name} is missing"
         assert isinstance(getattr(errors, name), type)

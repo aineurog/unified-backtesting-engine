@@ -20,7 +20,9 @@ from ube.core.ledger import (
     Trade,
     equity_curve,
     equity_curve_by_instrument,
+    funding_payments,
     positions,
+    trade_table,
     trades,
 )
 
@@ -72,7 +74,6 @@ def _time_bars(timestamps, closes):
         close=close,
         volume=np.ones(n),
         index=pd.DatetimeIndex(timestamps, tz="UTC"),
-        bar_type="time",
     )
 
 
@@ -483,3 +484,237 @@ def test_derived_view_arrays_do_not_alias_ledger():
     # The derived array is independent of any internal buffer: mutating the source
     # position array (rebuilt from the ledger) must not affect the view.
     assert pos.position.tolist() == [1.0, 2.0]
+
+
+# ---------------------------------------------------------------------------
+# Exit reason (§4.6).
+# ---------------------------------------------------------------------------
+
+
+def test_fill_exit_reason_propagates_to_trade():
+    ledger = EventLedger(
+        [
+            _fill(0, "A", 1, 10.0, 100.0),
+            LedgerEvent(
+                EventType.FILL, 1, "A", side=-1, quantity=10.0, price=110.0,
+                exit_reason="atr_stop",
+            ),
+        ]
+    )
+    (t,) = trades(ledger)
+    assert t.exit_reason == "atr_stop"
+
+
+def test_fill_exit_reason_must_be_nonempty():
+    with pytest.raises(DataShapeError):
+        LedgerEvent(
+            EventType.FILL, 0, "A", side=1, quantity=1.0, price=1.0, exit_reason=""
+        )
+
+
+def test_entry_fill_without_reason_is_fine():
+    ledger = EventLedger(
+        [_fill(0, "A", 1, 1.0, 100.0), _fill(1, "A", -1, 1.0, 110.0)]
+    )
+    (t,) = trades(ledger)
+    assert t.exit_reason is None
+
+
+# ---------------------------------------------------------------------------
+# Contract multiplier → notional (§4.6).
+# ---------------------------------------------------------------------------
+
+
+def test_trades_applies_contract_multiplier():
+    instruments = {
+        "ES": Instrument("ES", asset_class="futures", contract_multiplier=50.0,
+                         settlement_currency="USD")
+    }
+    ledger = EventLedger(
+        [
+            _fill(0, "ES", 1, 1.0, 5000.0),
+            _fill(1, "ES", -1, 1.0, 5100.0),
+        ]
+    )
+    (t,) = trades(ledger, instruments=instruments)
+    # Notional = quantity × price × multiplier; price stays the raw quote.
+    assert t.entry_price == pytest.approx(5000.0)
+    assert t.exit_price == pytest.approx(5100.0)
+    assert t.entry_notional == pytest.approx(1.0 * 5000.0 * 50.0)
+    assert t.exit_notional == pytest.approx(1.0 * 5100.0 * 50.0)
+    assert t.gross_pnl == pytest.approx(1.0 * (5100.0 - 5000.0) * 50.0)
+
+
+def test_trades_missing_instrument_raises_when_instruments_supplied():
+    ledger = EventLedger([_fill(0, "ES", 1, 1.0, 5000.0), _fill(1, "ES", -1, 1.0, 5100.0)])
+    with pytest.raises(DataShapeError):
+        trades(ledger, instruments={})
+
+
+def test_equity_curve_applies_contract_multiplier():
+    t0 = pd.Timestamp("2024-01-01T10:00", tz="UTC")
+    market_data = {"ES": _time_bars([t0], [5000.0])}
+    instruments = {
+        "ES": Instrument("ES", asset_class="futures", contract_multiplier=50.0,
+                         settlement_currency="USD")
+    }
+    ledger = EventLedger([_position(t0, "ES", 1.0)])
+    curve = equity_curve(ledger, market_data, instruments, base_currency="USD")
+    assert curve.equity.tolist() == pytest.approx([1.0 * 5000.0 * 50.0])
+
+
+def test_trades_entry_fee_split_is_proportional_to_notional():
+    ledger = EventLedger(
+        [
+            _fill(0, "A", 1, 10.0, 100.0),
+            _commission(0, "A", 21.0),
+            _fill(1, "A", -1, 10.0, 110.0),
+        ]
+    )
+    (t,) = trades(ledger)
+    assert t.entry_fee == pytest.approx(21.0 * 1000.0 / 2100.0)
+    assert t.exit_fee == pytest.approx(21.0 * 1100.0 / 2100.0)
+    assert t.entry_fee + t.exit_fee == pytest.approx(21.0)
+
+
+# ---------------------------------------------------------------------------
+# Equity curve includes commission + funding as cash flows (§4.6).
+# ---------------------------------------------------------------------------
+
+
+def test_equity_curve_includes_commission_and_funding_as_cash_outflows():
+    t0 = pd.Timestamp("2024-01-01T10:00", tz="UTC")
+    market_data = {"A": _time_bars([t0], [100.0])}
+    instruments = {"A": Instrument("A", asset_class="stocks", settlement_currency="USD")}
+    ledger = EventLedger(
+        [
+            _cash(t0, 1000.0),
+            _commission(t0, "A", 10.0),
+            _funding(t0, "A", 5.0),   # cost paid
+        ]
+    )
+    curve = equity_curve(ledger, market_data, instruments, base_currency="USD")
+    assert curve.equity.tolist() == pytest.approx([1000.0 - 10.0 - 5.0])
+
+
+def test_equity_curve_received_funding_adds_cash():
+    t0 = pd.Timestamp("2024-01-01T10:00", tz="UTC")
+    market_data = {"A": _time_bars([t0], [100.0])}
+    instruments = {"A": Instrument("A", asset_class="stocks", settlement_currency="USD")}
+    ledger = EventLedger(
+        [
+            _cash(t0, 1000.0),
+            _funding(t0, "A", -3.0),  # received funding
+        ]
+    )
+    curve = equity_curve(ledger, market_data, instruments, base_currency="USD")
+    assert curve.equity.tolist() == pytest.approx([1000.0 + 3.0])
+
+
+# ---------------------------------------------------------------------------
+# funding_payments generator (§4.6, §24).
+# ---------------------------------------------------------------------------
+
+
+def test_funding_payments_generator():
+    events = funding_payments(
+        instrument_id="A",
+        timestamps=np.array([0, 1, 2, 3], dtype=np.int64),
+        notional=np.array([1000.0, 1000.0, 0.0, 1000.0]),
+        side=np.array([1, -1, 1, 1]),
+        funding_rate=0.001,
+        borrow_rate=0.002,
+        currency="USD",
+    )
+    # bar0: long  → 0.001 * 1000 = 1.0
+    # bar1: short → (0.001 + 0.002) * 1000 = 3.0
+    # bar2: flat  → skipped
+    # bar3: long  → 1.0
+    assert len(events) == 3
+    assert [e.amount for e in events] == pytest.approx([1.0, 3.0, 1.0])
+    assert [e.timestamp for e in events] == [0, 1, 3]
+    assert all(e.event_type is EventType.FUNDING_PAYMENT for e in events)
+    assert all(e.instrument_id == "A" and e.currency == "USD" for e in events)
+
+
+def test_funding_payments_empty_when_no_carry():
+    events = funding_payments(
+        instrument_id="A",
+        timestamps=np.array([0, 1], dtype=np.int64),
+        notional=np.array([0.0, 1000.0]),
+        side=np.array([1, 1]),
+        funding_rate=0.0,
+        borrow_rate=0.0,
+        currency="USD",
+    )
+    assert events == ()
+
+
+# ---------------------------------------------------------------------------
+# trade_table (§4.6).
+# ---------------------------------------------------------------------------
+
+
+def test_trade_table_closed_row():
+    t0 = pd.Timestamp("2024-01-01T10:00", tz="UTC")
+    t1 = pd.Timestamp("2024-01-01T11:00", tz="UTC")
+    market_data = {"A": _time_bars([t0, t1], [100.0, 110.0])}
+    instruments = {"A": Instrument("A", asset_class="stocks", settlement_currency="USD")}
+    ledger = EventLedger(
+        [
+            _cash(t0, 1000.0),                 # deposit
+            _fill(t0, "A", 1, 10.0, 100.0),    # buy 10 @ 100
+            _cash(t0, -1000.0),                # principal outflow
+            _commission(t0, "A", 5.0),         # entry fee
+            _position(t0, "A", 10.0),
+            LedgerEvent(EventType.FILL, _ns(t1), "A", side=-1, quantity=10.0,
+                        price=110.0, exit_reason="take_profit"),
+            _cash(t1, 1100.0),                 # principal inflow
+            _position(t1, "A", 0.0),
+        ]
+    )
+    df = trade_table(ledger, market_data, instruments, base_currency="USD",
+                     initial_capital=1000.0)
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["instrument_id"] == "A"
+    assert row["entry_price"] == pytest.approx(100.0)
+    assert row["exit_price"] == pytest.approx(110.0)
+    assert row["duration"] == pd.Timedelta(hours=1)
+    assert row["side"] == 1
+    assert row["status"] == "closed"
+    assert row["quantity"] == pytest.approx(10.0)
+    assert row["entry_notional"] == pytest.approx(1000.0)
+    assert row["trade_return_pct"] == pytest.approx(95.0 / 1000.0)
+    assert row["realized_pnl"] == pytest.approx(95.0)
+    assert row["cum_return_pct"] == pytest.approx(1095.0 / 1000.0 - 1.0)
+    assert row["balance"] == pytest.approx(1095.0)
+    assert row["reason"] == "take_profit"
+
+
+def test_trade_table_open_row():
+    t0 = pd.Timestamp("2024-01-01T10:00", tz="UTC")
+    t1 = pd.Timestamp("2024-01-01T11:00", tz="UTC")
+    market_data = {"A": _time_bars([t0, t1], [100.0, 110.0])}
+    instruments = {"A": Instrument("A", asset_class="stocks", settlement_currency="USD")}
+    ledger = EventLedger(
+        [
+            _cash(t0, 1000.0),
+            _fill(t0, "A", 1, 10.0, 100.0),
+            _cash(t0, -1000.0),
+            _position(t0, "A", 10.0),
+            # no close → still open at the end of the run
+        ]
+    )
+    df = trade_table(ledger, market_data, instruments, base_currency="USD",
+                     initial_capital=1000.0)
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["status"] == "open"
+    assert row["entry_price"] == pytest.approx(100.0)
+    assert row["exit_price"] == pytest.approx(110.0)  # marked to last close
+    assert row["duration"] is pd.NaT
+    assert row["reason"] is None
+    assert row["trade_return_pct"] == pytest.approx(0.10)  # (110-100)/100
+    assert row["realized_pnl"] == pytest.approx(0.0)
+    assert row["balance"] == pytest.approx(1100.0)

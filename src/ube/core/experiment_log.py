@@ -1,12 +1,12 @@
-"""Experiment log — sqlite-backed, content-addressable metadata for every run (§4.9).
+"""Experiment log — sqlite-backed, content-addressable metadata for every run (§4.8).
 
 Every backtest run, through any entry point, is *automatically* recorded: the resolved
 params, the engine, a :class:`DataReference` identifying the exact data that was run
-(instrument, bar type, date range, row count, and a SHA-256 ``content_hash``), the code
-version, and an optional result hash. The log is a local embedded sqlite database (WAL
+(instrument, date range, row count, and a SHA-256 ``content_hash``), the code version,
+and an optional result hash. The log is a local embedded sqlite database (WAL
 mode, §18) whose trial count — :meth:`ExperimentLog.count` — is the *true* number of
 attempts that the overfitting-correction statistics (PBO/DSR, §11) depend on. That is
-why logging is unconditional, not opt-in (§4.9: "logging happens as part of ``run()``").
+why logging is unconditional, not opt-in (§4.8: "logging happens as part of ``run()``").
 
 **This module is separate from diagnostic logging (§15, §16).** It does *not* call
 :mod:`logging` or ``print``; it writes only to sqlite. The standard diagnostic logger
@@ -35,7 +35,6 @@ column           type       meaning
 ``params``       TEXT       the resolved config, JSON text (deterministic)
 ``instrument``   TEXT       ``Instrument.symbol``
 ``asset_class``  TEXT       ``Instrument.asset_class``
-``bar_type``     TEXT       ``MarketData.bar_type``
 ``date_range_start`` TEXT   first bar timestamp (canonical string)
 ``date_range_end``   TEXT   last bar timestamp (canonical string)
 ``row_count``    INTEGER    number of bars
@@ -81,7 +80,7 @@ from typing import Any
 import numpy as np
 
 from ube.core.config import BacktestConfig
-from ube.core.data import BAR_TYPES, OHLCV_COLUMNS, MarketData
+from ube.core.data import OHLCV_COLUMNS, MarketData
 from ube.core.errors import (
     BacktestRuntimeError,
     ConfigError,
@@ -99,13 +98,13 @@ __all__ = [
     "DEFAULT_LOG_PATH",
 ]
 
-#: The number of head and tail rows hashed per OHLCV column (§4.9 content_hash window).
+#: The number of head and tail rows hashed per OHLCV column (§4.8 content_hash window).
 HASH_WINDOW: int = 16
 
-#: The default experiment-log path (§4.9); ``~`` is expanded at resolution time.
+#: The default experiment-log path (§4.8); ``~`` is expanded at resolution time.
 DEFAULT_LOG_PATH: str = "~/.backtest/experiments.db"
 
-#: The environment variable overriding the default path (§4.9).
+#: The environment variable overriding the default path (§4.8).
 _ENV_VAR: str = "BACKTEST_LOG_PATH"
 
 #: The distribution name read for ``code_version`` (matches ``pyproject.toml``).
@@ -119,7 +118,6 @@ _SELECT_COLUMNS: tuple[str, ...] = (
     "params",
     "instrument",
     "asset_class",
-    "bar_type",
     "date_range_start",
     "date_range_end",
     "row_count",
@@ -138,7 +136,6 @@ CREATE TABLE IF NOT EXISTS experiments (
     params           TEXT NOT NULL,
     instrument       TEXT NOT NULL,
     asset_class      TEXT NOT NULL,
-    bar_type         TEXT NOT NULL,
     date_range_start TEXT NOT NULL,
     date_range_end   TEXT NOT NULL,
     row_count        INTEGER NOT NULL,
@@ -159,13 +156,13 @@ _INSERT_SQL: str = (
 
 @dataclass(frozen=True)
 class DataReference:
-    """The content-addressable data reference for one run (§4.9).
+    """The content-addressable data reference for one run (§4.8).
 
     Identifies *exactly* which data was run: the instrument (symbol + asset class and
-    its asset-class metadata), the bar type, the first/last bar timestamp, the row
-    count, and a SHA-256 ``content_hash`` over a bounded head+tail window of each OHLCV
-    column. Two users who load "the same" data that diverges (an exchange restated
-    history, a file overwritten) get different hashes and can detect it immediately.
+    its asset-class metadata), the first/last bar timestamp, the row count, and a
+    SHA-256 ``content_hash`` over a bounded head+tail window of each OHLCV column. Two
+    users who load "the same" data that diverges (an exchange restated history, a file
+    overwritten) get different hashes and can detect it immediately.
 
     Immutable (frozen, §3 principle 5); holds only scalars/strings/immutable tuples, so
     there are no arrays to copy.
@@ -173,16 +170,13 @@ class DataReference:
     Attributes:
         instrument: The traded instrument — its ``symbol`` + ``asset_class`` are the
             identity recorded in the log (the remaining fields are asset-class metadata).
-        bar_type: One of :data:`~ube.core.data.BAR_TYPES` (``"time"``/``"volume"``/
-            ``"dollar"``/``"tick"``).
-        date_range: ``(first_bar, last_bar)`` timestamp, each as a canonical string
-            (ISO-8601 UTC for time bars, the decimal index for event bars).
+        date_range: ``(first_bar, last_bar)`` timestamp, each as a canonical ISO-8601
+            UTC string.
         row_count: The number of bars.
         content_hash: SHA-256 hex digest over the head+tail of each OHLCV column.
     """
 
     instrument: Instrument
-    bar_type: str
     date_range: tuple[str, str]
     row_count: int
     content_hash: str
@@ -193,8 +187,6 @@ class DataReference:
                 "DataReference.instrument must be an Instrument; "
                 f"got {type(self.instrument).__name__}"
             )
-        if self.bar_type not in BAR_TYPES:
-            raise ConfigError(f"bar_type={self.bar_type!r} is not one of {BAR_TYPES}")
         if not isinstance(self.date_range, tuple) or len(self.date_range) != 2:
             raise ConfigError("date_range must be a (start, end) 2-tuple of strings")
         if not all(isinstance(v, str) for v in self.date_range):
@@ -236,7 +228,6 @@ class DataReference:
         end = _index_repr(md.index[md.n_bars - 1])
         return cls(
             instrument=instrument,
-            bar_type=md.bar_type,
             date_range=(start, end),
             row_count=md.n_bars,
             content_hash=_compute_content_hash(md),
@@ -258,7 +249,6 @@ class ExperimentRecord:
     params: str
     instrument: str
     asset_class: str
-    bar_type: str
     date_range_start: str
     date_range_end: str
     row_count: int
@@ -285,7 +275,7 @@ class RecordInput:
 
 
 class ExperimentLog:
-    """A thin wrapper over a sqlite3 database recording one row per run (§4.9, §18).
+    """A thin wrapper over a sqlite3 database recording one row per run (§4.8, §18).
 
     Each instance owns one sqlite connection opened from its resolved path (see the
     module docstring for the precedence). The connection runs in WAL mode and the schema
@@ -340,7 +330,7 @@ class ExperimentLog:
         """Insert one run into the log (one INSERT, one transaction — §18).
 
         The future orchestrator calls this *unconditionally* at the end of every run
-        (§4.9); it is never opt-in. ``params`` is serialized deterministically from
+        (§4.8); it is never opt-in. ``params`` is serialized deterministically from
         ``config``; ``code_version`` auto-detects the installed package version unless an
         override is supplied; ``timestamp`` defaults to the current UTC time.
 
@@ -520,7 +510,6 @@ class ExperimentLog:
             params,
             dr.instrument.symbol,
             dr.instrument.asset_class,
-            dr.bar_type,
             dr.date_range[0],
             dr.date_range[1],
             dr.row_count,
@@ -536,7 +525,7 @@ class ExperimentLog:
 
 
 def _resolve_path(path: str | Path | None) -> Path:
-    """Resolve the log path per §4.9: explicit > env var > default, expanding ``~``."""
+    """Resolve the log path per §4.8: explicit > env var > default, expanding ``~``."""
     if path is not None:
         candidate = str(path)
     else:
@@ -553,7 +542,7 @@ def _index_repr(value: object) -> str:
 
 
 def _compute_content_hash(md: MarketData) -> str:
-    """SHA-256 over the head+tail (``HASH_WINDOW`` rows) of each OHLCV column (§4.9).
+    """SHA-256 over the head+tail (``HASH_WINDOW`` rows) of each OHLCV column (§4.8).
 
     Each column's contribution is ``<column name bytes> + head bytes + tail bytes``, in
     fixed OHLCV order; the float64 arrays are hashed as raw little-endian bytes. The
@@ -571,7 +560,7 @@ def _compute_content_hash(md: MarketData) -> str:
 
 
 def _config_to_json(config: BacktestConfig) -> str:
-    """Serialize a ``BacktestConfig`` to a deterministic JSON string (§4.9 ``params``).
+    """Serialize a ``BacktestConfig`` to a deterministic JSON string (§4.8 ``params``).
 
     ``dataclasses.asdict`` recursively flattens the nested frozen sub-configs; a
     JSON-safe ``default`` handles the remaining non-primitive leaves (timestamps, numpy
@@ -620,7 +609,7 @@ def _require_nonempty(value: str, name: str) -> str:
 
 def _row_to_record(row: Sequence[Any]) -> ExperimentRecord:
     """Project a raw sqlite row (in :data:`_SELECT_COLUMNS` order) to a record."""
-    result_hash = row[12]
+    result_hash = row[11]
     return ExperimentRecord(
         run_id=row[0],
         timestamp=row[1],
@@ -628,11 +617,10 @@ def _row_to_record(row: Sequence[Any]) -> ExperimentRecord:
         params=row[3],
         instrument=row[4],
         asset_class=row[5],
-        bar_type=row[6],
-        date_range_start=row[7],
-        date_range_end=row[8],
-        row_count=row[9],
-        content_hash=row[10],
-        code_version=row[11],
+        date_range_start=row[6],
+        date_range_end=row[7],
+        row_count=row[8],
+        content_hash=row[9],
+        code_version=row[10],
         result_hash=result_hash if result_hash is None else str(result_hash),
     )

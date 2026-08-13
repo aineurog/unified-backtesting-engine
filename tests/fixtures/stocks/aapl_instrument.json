@@ -1,0 +1,10 @@
+{
+  "asset_class": "stocks",
+  "borrow_model": null,
+  "calendar": "XNYS",
+  "contract_multiplier": null,
+  "funding_model": null,
+  "settlement_currency": "USD",
+  "symbol": "AAPL",
+  "tick_size": 0.01
+}

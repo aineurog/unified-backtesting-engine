@@ -69,7 +69,37 @@ def test_non_positive_contract_multiplier_raises(bad):
 
 
 def test_asset_classes_match_fixture_labels():
-    assert {"crypto_perp", "futures", "stocks", "forex", "commodities"} == ASSET_CLASSES
+    assert {
+        "crypto_perp",
+        "crypto_spot",
+        "futures",
+        "stocks",
+        "forex",
+        "commodities",
+    } == ASSET_CLASSES
+
+
+def test_crypto_spot_asset_class_is_supported():
+    ins = Instrument("BTC-USDT", asset_class="crypto_spot")
+    assert ins.asset_class == "crypto_spot"
+
+
+@pytest.mark.parametrize("bad", ["foo", object()])
+def test_non_numeric_tick_size_raises(bad):
+    with pytest.raises(InvalidInstrumentError):
+        Instrument("X", asset_class="crypto_perp", tick_size=bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_non_finite_tick_size_raises(bad):
+    with pytest.raises(InvalidInstrumentError):
+        Instrument("X", asset_class="crypto_perp", tick_size=bad)
+
+
+@pytest.mark.parametrize("bad", ["foo", float("nan"), float("inf")])
+def test_bad_contract_multiplier_raises(bad):
+    with pytest.raises(InvalidInstrumentError):
+        Instrument("X", asset_class="futures", contract_multiplier=bad)  # type: ignore[arg-type]
 
 
 def test_invalid_instrument_error_is_a_config_error():

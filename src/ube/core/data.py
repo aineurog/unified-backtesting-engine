@@ -9,14 +9,14 @@ internal form (one door in, one canonical form out — §5.1):
 4. list of records — ``[{"open": ..., "high": ...}, ...]``.
 
 ``column_map`` and ``timestamp_col`` let users keep their own column names. Everything
-lands in a frozen ``MarketData`` with a tz-aware UTC ``DatetimeIndex`` (time bars) or an
-integer ``RangeIndex`` (event bars), columns ``open/high/low/close/volume``, sorted and
-unique.
+lands in a frozen ``MarketData`` with a tz-aware UTC ``DatetimeIndex`` (every bar — time
+or event-driven — carries the timestamp at which each bar formed), columns
+``open/high/low/close/volume``, sorted and unique.
 
-This module only *standardizes* — it never fetches data and never resamples (the bar
-type is metadata, not a resampling instruction — §4.3). Structural validation raises the
-§15 ``DataError`` subtypes (chiefly ``DataShapeError``); semantic correctness
-(adjustments, bad ticks) is the user's responsibility and is not validated (§5.1).
+This module only *standardizes* — it never fetches data and never resamples. Structural
+validation raises the §15 ``DataError`` subtypes (chiefly ``DataShapeError``); semantic
+correctness (adjustments, bad ticks) is the user's responsibility and is not validated
+(§5.1).
 """
 
 from __future__ import annotations
@@ -33,30 +33,16 @@ from ube.core.errors import DataShapeError
 
 __all__ = [
     "MarketData",
-    "BAR_TYPES",
-    "EVENT_BAR_TYPES",
     "OHLC_COLUMNS",
     "VOLUME_COLUMN",
     "OHLCV_COLUMNS",
 ]
-
-# §4.3 — bar types are metadata on the data, not a resampling instruction.
-BAR_TYPES: tuple[str, ...] = ("time", "volume", "dollar", "tick")
-EVENT_BAR_TYPES: tuple[str, ...] = ("volume", "dollar", "tick")
 
 OHLC_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close")
 VOLUME_COLUMN: str = "volume"
 OHLCV_COLUMNS: tuple[str, ...] = OHLC_COLUMNS + (VOLUME_COLUMN,)
 
 _DEFAULT_TIMESTAMP_COL: str = "timestamp"
-
-
-def _validate_bar_type(bar_type: str) -> str:
-    if bar_type not in BAR_TYPES:
-        raise DataShapeError(
-            f"unsupported bar_type={bar_type!r}; expected one of {BAR_TYPES}"
-        )
-    return bar_type
 
 
 def _canonical_to_source(column_map: Mapping[str, str] | None) -> dict[str, str]:
@@ -142,9 +128,8 @@ class MarketData:
         low: float64 array of low prices.
         close: float64 array of close prices.
         volume: float64 array of volumes (``NaN`` where volume was not provided).
-        index: tz-aware UTC ``DatetimeIndex`` for time bars; integer ``RangeIndex`` for
-            event bars.
-        bar_type: One of ``"time"``, ``"volume"``, ``"dollar"``, ``"tick"``.
+        index: tz-aware UTC ``DatetimeIndex`` (every bar carries the timestamp at
+            which each bar formed).
     """
 
     open: np.ndarray
@@ -153,16 +138,15 @@ class MarketData:
     close: np.ndarray
     volume: np.ndarray
     index: pd.Index
-    bar_type: str
 
     def __post_init__(self) -> None:
-        bar_type = _validate_bar_type(self.bar_type)
-
         open_ = _coerce_numeric(self.open, "open")
         high = _coerce_numeric(self.high, "high")
         low = _coerce_numeric(self.low, "low")
         close = _coerce_numeric(self.close, "close")
         n = open_.shape[0]
+        if n == 0:
+            raise DataShapeError("no bars provided (empty input)")
         for name, arr in (("high", high), ("low", low), ("close", close)):
             if arr.shape[0] != n:
                 raise DataShapeError(
@@ -177,19 +161,19 @@ class MarketData:
         index = self.index
         if len(index) != n:
             raise DataShapeError(f"index has {len(index)} entries, expected {n}")
+        if not isinstance(index, pd.DatetimeIndex):
+            raise DataShapeError(
+                "bars require a DatetimeIndex — every bar carries the time at "
+                "which each bar formed"
+            )
         if not index.is_monotonic_increasing:
             raise DataShapeError("bar index is not sorted ascending")
         if index.has_duplicates:
             raise DataShapeError("bar index contains duplicate entries")
-        if bar_type == "time":
-            if not isinstance(index, pd.DatetimeIndex):
-                raise DataShapeError("time bars require a DatetimeIndex")
-            if index.tz is None:
-                raise DataShapeError("time-bar timestamps must be tz-aware")
-            if index.tz != UTC:
-                index = index.tz_convert("UTC")
-        elif index.inferred_type != "integer":
-            raise DataShapeError("event-bar index must be an integer index")
+        if index.tz is None:
+            raise DataShapeError("bar timestamps must be tz-aware")
+        if index.tz != UTC:
+            index = index.tz_convert("UTC")
 
         for arr in (open_, high, low, close, volume):
             arr.setflags(write=False)
@@ -200,7 +184,6 @@ class MarketData:
         object.__setattr__(self, "close", close)
         object.__setattr__(self, "volume", volume)
         object.__setattr__(self, "index", index)
-        object.__setattr__(self, "bar_type", bar_type)
 
     # -- properties -----------------------------------------------------------
 
@@ -210,16 +193,9 @@ class MarketData:
         return int(self.open.shape[0])
 
     @property
-    def is_time_bars(self) -> bool:
-        """True if ``bar_type == "time"``."""
-        return self.bar_type == "time"
-
-    @property
-    def timestamps(self) -> pd.DatetimeIndex | None:
-        """The tz-aware UTC ``DatetimeIndex`` for time bars, else ``None``."""
-        if self.bar_type == "time":
-            return cast(pd.DatetimeIndex, self.index)
-        return None
+    def timestamps(self) -> pd.DatetimeIndex:
+        """The tz-aware UTC ``DatetimeIndex`` (every bar carries a timestamp)."""
+        return cast(pd.DatetimeIndex, self.index)
 
     # -- constructors ---------------------------------------------------------
 
@@ -232,20 +208,18 @@ class MarketData:
         close: np.ndarray,
         volume: np.ndarray | None,
         timestamps: object | None,
-        bar_type: str,
     ) -> MarketData:
-        bar_type = _validate_bar_type(bar_type)
+        if len(open_) == 0:
+            raise DataShapeError("no bars provided (empty input)")
         if volume is None:
             volume = np.full(len(open_), np.nan, dtype=np.float64)
-        if bar_type in EVENT_BAR_TYPES:
-            index: pd.Index = pd.RangeIndex(len(open_))
-        else:
-            if timestamps is None:
-                raise DataShapeError(
-                    "time bars require timestamps (a timestamp column, an index, "
-                    "or timestamps=...)"
-                )
-            index = _parse_timestamps(timestamps)
+        if timestamps is None:
+            raise DataShapeError(
+                "bars require timestamps (a timestamp column, an index, "
+                "or timestamps=...) — every bar carries the time at which "
+                "each bar formed"
+            )
+        index = _parse_timestamps(timestamps)
         return cls(
             open=open_,
             high=high,
@@ -253,7 +227,6 @@ class MarketData:
             close=close,
             volume=volume,
             index=index,
-            bar_type=bar_type,
         )
 
     @classmethod
@@ -262,7 +235,6 @@ class MarketData:
         df: pd.DataFrame,
         column_map: Mapping[str, str] | None,
         timestamps: object | None,
-        bar_type: str,
     ) -> MarketData:
         source = _canonical_to_source(column_map)
         missing = [c for c in OHLC_COLUMNS if source[c] not in df.columns]
@@ -275,7 +247,7 @@ class MarketData:
         low = df[source["low"]].to_numpy()
         close = df[source["close"]].to_numpy()
         volume = df[source["volume"]].to_numpy() if source["volume"] in df.columns else None
-        return cls._construct(open_, high, low, close, volume, timestamps, bar_type)
+        return cls._construct(open_, high, low, close, volume, timestamps)
 
     @classmethod
     def from_dataframe(
@@ -284,22 +256,23 @@ class MarketData:
         *,
         column_map: Mapping[str, str] | None = None,
         timestamp_col: str | None = None,
-        bar_type: str = "time",
     ) -> MarketData:
         """Standardize a pandas ``DataFrame`` (§5.1 shape 1).
 
         ``timestamp_col`` names the column holding bar boundaries; when ``None``, the
-        ``DataFrame`` index is used (relevant for time bars only — event bars ignore it).
+        ``DataFrame`` index is used (every bar carries a timestamp).
         """
         if not isinstance(df, pd.DataFrame):
             raise DataShapeError("from_dataframe expects a pandas DataFrame")
+        if df.empty:
+            raise DataShapeError("no bars provided (empty DataFrame)")
         if timestamp_col is not None:
             if timestamp_col not in df.columns:
                 raise DataShapeError(f"timestamp column {timestamp_col!r} not found")
             timestamps: object | None = df[timestamp_col]
         else:
             timestamps = df.index
-        return cls._extract(df, column_map=column_map, timestamps=timestamps, bar_type=bar_type)
+        return cls._extract(df, column_map=column_map, timestamps=timestamps)
 
     @classmethod
     def from_array(
@@ -307,23 +280,23 @@ class MarketData:
         arr: object,
         *,
         timestamps: object | None = None,
-        bar_type: str = "time",
     ) -> MarketData:
-        """Standardize a 2-D numpy array of shape ``(n_bars, 5)`` (§5.1 shape 2).
+        """Standardize a 2-D numpy array (§5.1 shape 2).
 
-        Columns are fixed: ``[open, high, low, close, volume]``. Time bars additionally
-        require ``timestamps`` (a tz-aware datetime sequence).
+        Accepts shape ``(n_bars, 5)`` with columns ``[open, high, low, close, volume]``
+        or ``(n_bars, 4)`` with columns ``[open, high, low, close]`` (volume filled with
+        ``NaN``). ``timestamps`` (a tz-aware datetime sequence) is required.
         """
         a = np.asarray(arr)
-        if a.ndim != 2 or a.shape[1] != 5:
+        if a.ndim != 2 or a.shape[1] not in (4, 5):
             raise DataShapeError(
-                "numpy input must be 2-D with shape (n_bars, 5) "
+                "numpy input must be 2-D with shape (n_bars, 4) "
+                "[open, high, low, close] or (n_bars, 5) "
                 "[open, high, low, close, volume]; "
                 f"got shape {a.shape}"
             )
-        return cls._construct(
-            a[:, 0], a[:, 1], a[:, 2], a[:, 3], a[:, 4], timestamps, bar_type
-        )
+        volume = a[:, 4] if a.shape[1] == 5 else None
+        return cls._construct(a[:, 0], a[:, 1], a[:, 2], a[:, 3], volume, timestamps)
 
     @classmethod
     def from_dict(
@@ -332,11 +305,10 @@ class MarketData:
         *,
         column_map: Mapping[str, str] | None = None,
         timestamp_col: str | None = None,
-        bar_type: str = "time",
     ) -> MarketData:
         """Standardize a dict of columns (§5.1 shape 3).
 
-        Time bars take their timestamps from ``timestamp_col`` (default ``"timestamp"``).
+        Bars take their timestamps from ``timestamp_col`` (default ``"timestamp"``).
         """
         if not isinstance(data, Mapping):
             raise DataShapeError("from_dict expects a mapping of column name -> values")
@@ -344,8 +316,10 @@ class MarketData:
             df = pd.DataFrame(dict(data))
         except ValueError as exc:
             raise DataShapeError("columns have mismatched lengths") from exc
+        if df.empty:
+            raise DataShapeError("no bars provided (empty input)")
         timestamps = _timestamp_from_columns(df, timestamp_col)
-        return cls._extract(df, column_map=column_map, timestamps=timestamps, bar_type=bar_type)
+        return cls._extract(df, column_map=column_map, timestamps=timestamps)
 
     @classmethod
     def from_records(
@@ -354,20 +328,21 @@ class MarketData:
         *,
         column_map: Mapping[str, str] | None = None,
         timestamp_col: str | None = None,
-        bar_type: str = "time",
     ) -> MarketData:
         """Standardize a list of record dicts (§5.1 shape 4).
 
-        Time bars take their timestamps from ``timestamp_col`` (default ``"timestamp"``).
+        Bars take their timestamps from ``timestamp_col`` (default ``"timestamp"``).
         """
         if isinstance(records, (str, bytes)) or not isinstance(records, Sequence):
             raise DataShapeError("from_records expects a sequence of record dicts")
+        if len(records) == 0:
+            raise DataShapeError("no bars provided (empty records)")
         try:
             df = pd.DataFrame(list(records))
         except ValueError as exc:
             raise DataShapeError("records could not be aligned into columns") from exc
         timestamps = _timestamp_from_columns(df, timestamp_col)
-        return cls._extract(df, column_map=column_map, timestamps=timestamps, bar_type=bar_type)
+        return cls._extract(df, column_map=column_map, timestamps=timestamps)
 
     @classmethod
     def standardize(
@@ -376,22 +351,22 @@ class MarketData:
         *,
         column_map: Mapping[str, str] | None = None,
         timestamp_col: str | None = None,
-        bar_type: str = "time",
+        timestamps: object | None = None,
     ) -> MarketData:
         """Dispatch on the input shape and standardize to a canonical ``MarketData``."""
         if isinstance(data, pd.DataFrame):
             return cls.from_dataframe(
-                data, column_map=column_map, timestamp_col=timestamp_col, bar_type=bar_type
+                data, column_map=column_map, timestamp_col=timestamp_col
             )
         if isinstance(data, np.ndarray):
-            return cls.from_array(data, bar_type=bar_type)
+            return cls.from_array(data, timestamps=timestamps)
         if isinstance(data, Mapping):
             return cls.from_dict(
-                data, column_map=column_map, timestamp_col=timestamp_col, bar_type=bar_type
+                data, column_map=column_map, timestamp_col=timestamp_col
             )
         if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
             return cls.from_records(
-                data, column_map=column_map, timestamp_col=timestamp_col, bar_type=bar_type
+                data, column_map=column_map, timestamp_col=timestamp_col
             )
         raise DataShapeError(f"unsupported input type {type(data).__name__}")
 
@@ -415,7 +390,6 @@ class MarketData:
         object.__setattr__(sliced, "close", self.close[:n])
         object.__setattr__(sliced, "volume", self.volume[:n])
         object.__setattr__(sliced, "index", self.index[:n])
-        object.__setattr__(sliced, "bar_type", self.bar_type)
         return sliced
 
     def to_dataframe(self) -> pd.DataFrame:

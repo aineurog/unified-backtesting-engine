@@ -79,14 +79,13 @@ def test_data_reference_from_market_data_fields():
     ref = _ref(5)
     assert ref.instrument.symbol == "BTC-USDT"
     assert ref.instrument.asset_class == "crypto_perp"
-    assert ref.bar_type == "time"
     assert ref.row_count == 5
     assert ref.date_range[0] == "2024-01-01T00:00:00+00:00"
     assert ref.date_range[1] == "2024-01-01T04:00:00+00:00"
     assert isinstance(ref.content_hash, str) and len(ref.content_hash) == 64
 
 
-def test_data_reference_event_bars():
+def test_data_reference_from_array_with_timestamps():
     n = 5
     arr = np.column_stack(
         [
@@ -97,12 +96,12 @@ def test_data_reference_event_bars():
             np.arange(1, n + 1, dtype=float),
         ]
     )
+    ts = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
     ref = DataReference.from_market_data(
-        MarketData.from_array(arr, bar_type="volume"), _inst()
+        MarketData.from_array(arr, timestamps=ts), _inst()
     )
-    assert ref.bar_type == "volume"
     assert ref.row_count == 5
-    assert ref.date_range == ("0", "4")
+    assert ref.date_range == ("2024-01-01T00:00:00+00:00", "2024-01-01T04:00:00+00:00")
 
 
 def test_data_reference_is_frozen():
@@ -112,7 +111,9 @@ def test_data_reference_is_frozen():
 
 
 def test_data_reference_empty_market_data_raises():
-    empty = MarketData.from_array(np.empty((0, 5)), bar_type="volume")
+    # A zero-bar view (head(0)) is the one public path to an empty MarketData now that
+    # the constructors reject empty input; DataReference must still refuse it.
+    empty = _md(1).head(0)
     with pytest.raises(DataShapeError):
         DataReference.from_market_data(empty, _inst())
 
@@ -224,7 +225,6 @@ def test_record_get_list_count_roundtrip(tmp_path):
     assert rec.engine == "vectorbt"
     assert rec.instrument == "BTC-USDT"
     assert rec.asset_class == "crypto_perp"
-    assert rec.bar_type == "time"
     assert rec.row_count == 5
     assert rec.result_hash == "abc123"
 
@@ -290,11 +290,9 @@ def test_params_json_roundtrip(tmp_path):
     assert params["instrument"]["symbol"] == "BTC-USDT"
     assert params["instrument"]["asset_class"] == "crypto_perp"
     assert params["engine"] == "vectorbt"
-    assert params["bar_type"] == "time"
     assert params["warmup_bars"] == 0
     assert params["base_currency"] is None
     assert params["risk"]["sizing"]["kind"] == "all_in"
-    assert params["data_quality"]["missing_bar"] == "fail"
 
 
 def test_params_deterministic(tmp_path):

@@ -1,0 +1,10 @@
+{
+  "asset_class": "futures",
+  "borrow_model": null,
+  "calendar": "CMES",
+  "contract_multiplier": 50.0,
+  "funding_model": null,
+  "settlement_currency": "USD",
+  "symbol": "ES",
+  "tick_size": 0.25
+}

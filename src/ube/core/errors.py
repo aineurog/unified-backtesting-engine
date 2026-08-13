@@ -25,10 +25,6 @@ class DataError(Exception):
     """Data missing, malformed, or inconsistent."""
 
 
-class MissingBarError(DataError):
-    """A bar is missing where the calendar says one should exist."""
-
-
 class DataShapeError(DataError):
     """Structural data validation failed."""
 

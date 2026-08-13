@@ -1,20 +1,19 @@
-"""BacktestConfig and its sub-configs — the canonical input contract (§7, §4.8).
+"""BacktestConfig and its sub-configs — the canonical input contract (§7, §4.7).
 
 :class:`BacktestConfig` is the single object that fully describes one backtest run. It
 is *composed* (§7.2) from the independently-defaultable sub-configs built earlier in
 Phase 1 — :class:`~ube.core.instrument.Instrument`,
 :class:`~ube.core.cost.CostModel`, :class:`~ube.core.risk.RiskConfig`,
-:class:`~ube.core.calendar.DataQualityConfig`,
 :class:`~ube.core.benchmark.BenchmarkConfig` — plus a few scalar fields. It is frozen
 (immutable after construction, §3 principle 5) and self-validating.
 
 :class:`SignalConfig` is new here: it carries the paper-trading position-change policy
-(``on_opposite_signal``, §9.3). It is *explicit-over-default* (§4.8): the field defaults
+(``on_opposite_signal``, §9.3). It is *explicit-over-default* (§4.7): the field defaults
 to ``None`` ("undeclared") and :meth:`BacktestConfig.validate(paper_trading=True)` raises
 :class:`~ube.core.errors.UndeclaredConfigError` if it is still unset — a paper-trading
 run has no safe default position-change policy.
 
-Explicit-over-default fields (§4.8) are *not* silently defaulted at construction:
+Explicit-over-default fields (§4.7) are *not* silently defaulted at construction:
 ``base_currency`` stays ``None`` unless declared, and ``signal.on_opposite_signal`` stays
 ``None`` unless declared. :meth:`BacktestConfig.validate` is what enforces them for the
 run modes that need them (portfolio / paper trading), because the run orchestrator (which
@@ -35,10 +34,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ube.core.benchmark import BenchmarkConfig
-from ube.core.calendar import DataQualityConfig
 from ube.core.cost import CostModel
-from ube.core.data import BAR_TYPES
-from ube.core.errors import ConfigError, IncompatibleConfigError, UndeclaredConfigError
+from ube.core.errors import ConfigError, UndeclaredConfigError
 from ube.core.instrument import Instrument
 from ube.core.risk import RiskConfig
 
@@ -46,13 +43,8 @@ __all__ = [
     "OppositeSignalPolicy",
     "OPPOSITE_SIGNAL_POLICIES",
     "SignalConfig",
-    "BarType",
     "BacktestConfig",
 ]
-
-#: The bar-type literal (§4.3); the values are the single source of truth in
-#: :data:`ube.core.data.BAR_TYPES`.
-BarType = Literal["time", "volume", "dollar", "tick"]
 
 #: The paper-trading position-change policies (§9.3).
 OppositeSignalPolicy = Literal["reverse", "exit_only", "ignore"]
@@ -63,13 +55,13 @@ OPPOSITE_SIGNAL_POLICIES: tuple[str, ...] = ("reverse", "exit_only", "ignore")
 
 @dataclass(frozen=True)
 class SignalConfig:
-    """Signal-related configuration, chiefly the position-change policy (§9.3, §4.8).
+    """Signal-related configuration, chiefly the position-change policy (§9.3, §4.7).
 
     Attributes:
         on_opposite_signal: What to do when a signal arrives opposite to the current
             position during paper trading: ``"reverse"`` (close and flip),
             ``"exit_only"`` (close and go flat), or ``"ignore"`` (hold). ``None`` means
-            "undeclared" (§4.8) — a paper-trading run must declare it, enforced by
+            "undeclared" (§4.7) — a paper-trading run must declare it, enforced by
             :meth:`BacktestConfig.validate(paper_trading=True)`.
     """
 
@@ -91,22 +83,18 @@ class BacktestConfig:
     """The canonical input contract for one backtest run (§7.2).
 
     Composed from the Phase-1 sub-configs; every field is either required, or has a
-    sensible asset-class-aware default (§7.1). Explicit-over-default fields (§4.8) —
+    sensible asset-class-aware default (§7.1). Explicit-over-default fields (§4.7) —
     ``base_currency`` and ``signal.on_opposite_signal`` — are *not* silently defaulted:
     they stay ``None`` until declared, and :meth:`validate` enforces them for the run
     modes that need them.
 
     Attributes:
         instrument: The traded instrument (asset-class metadata, §4.5). Required.
-        bar_type: The bar aggregation — one of :data:`~ube.core.data.BAR_TYPES`. This is
-            metadata, not a resampling instruction (§4.3). Default ``"time"``.
         cost_model: Optional explicit cost model; ``None`` means "resolve the asset-class
             default" (via :func:`~ube.core.cost.resolve_cost_model`), §7.1/§7.2.
         risk: Sizing + exits (default :class:`~ube.core.risk.RiskConfig` — ``all_in``
             sizing, no exits, §7.1).
         signal: Signal-related config (default :class:`SignalConfig`).
-        data_quality: Missing-bar policy for time bars (default
-            :class:`~ube.core.calendar.DataQualityConfig`, ``missing_bar="fail"``).
         benchmark: Benchmark config (default
             :class:`~ube.core.benchmark.BenchmarkConfig`, ``buy_and_hold``, §7.1).
         engine: Engine adapter to use (default ``"auto"`` — first installed). Must be a
@@ -116,7 +104,7 @@ class BacktestConfig:
             adapters exist in Phase 1). Stored as a copy (immutability rule).
         date_range: Optional ``(start, end)`` bound; stored as-is (a 2-tuple). ``start``
             and ``end`` must be comparable (``start <= end``) when both are present.
-        base_currency: The explicit portfolio base currency (§4.6, §4.8). ``None`` =
+        base_currency: The explicit portfolio base currency (§4.6, §4.7). ``None`` =
             "undeclared"; required for portfolio runs, optional for single-instrument
             runs (§7.1). Never silently defaulted.
         warmup_bars: Number of leading bars to exclude from the derived views and
@@ -124,11 +112,9 @@ class BacktestConfig:
     """
 
     instrument: Instrument
-    bar_type: BarType = "time"
     cost_model: CostModel | None = None
     risk: RiskConfig = RiskConfig()
     signal: SignalConfig = SignalConfig()
-    data_quality: DataQualityConfig = DataQualityConfig()
     benchmark: BenchmarkConfig = BenchmarkConfig()
     engine: str = "auto"
     engine_overrides: Mapping[str, Any] | None = None
@@ -142,8 +128,6 @@ class BacktestConfig:
                 "BacktestConfig.instrument must be an Instrument; "
                 f"got {type(self.instrument).__name__}"
             )
-        if self.bar_type not in BAR_TYPES:
-            raise ConfigError(f"bar_type={self.bar_type!r} is not one of {BAR_TYPES}")
         if self.cost_model is not None and not isinstance(self.cost_model, CostModel):
             raise ConfigError(
                 "BacktestConfig.cost_model must be a CostModel or None; "
@@ -158,11 +142,6 @@ class BacktestConfig:
             raise ConfigError(
                 "BacktestConfig.signal must be a SignalConfig; "
                 f"got {type(self.signal).__name__}"
-            )
-        if not isinstance(self.data_quality, DataQualityConfig):
-            raise ConfigError(
-                "BacktestConfig.data_quality must be a DataQualityConfig; "
-                f"got {type(self.data_quality).__name__}"
             )
         if not isinstance(self.benchmark, BenchmarkConfig):
             raise ConfigError(
@@ -206,7 +185,7 @@ class BacktestConfig:
             )
 
     def validate(self, *, portfolio: bool = False, paper_trading: bool = False) -> None:
-        """Validate cross-field constraints for a run mode (§4.8).
+        """Validate cross-field constraints for a run mode (§4.7).
 
         Field-level type/value errors are already raised at construction (raising
         :class:`~ube.core.errors.ConfigError`). This method checks the two
@@ -215,18 +194,11 @@ class BacktestConfig:
         explicit flags:
 
         * ``portfolio=True`` with ``base_currency`` unset raises
-          :class:`~ube.core.errors.UndeclaredConfigError` (§4.8/§7.1 — a portfolio run
+          :class:`~ube.core.errors.UndeclaredConfigError` (§4.7/§7.1 — a portfolio run
           needs an explicit base currency to normalize multi-currency PnL).
         * ``paper_trading=True`` with ``signal.on_opposite_signal`` unset raises
-          :class:`~ube.core.errors.UndeclaredConfigError` (§9.3/§4.8 — the
+          :class:`~ube.core.errors.UndeclaredConfigError` (§9.3/§4.7 — the
           position-change policy has no safe default).
-
-        It also enforces the one genuine field incompatibility:
-
-        * A non-time ``bar_type`` combined with a non-default ``data_quality.missing_bar``
-          raises :class:`~ube.core.errors.IncompatibleConfigError` (§4.7/§4.3 — the
-          missing-bar policy applies only to time bars, so declaring a non-default
-          policy for an event-driven bar type is a contradiction).
 
         Args:
             portfolio: Whether this is a multi-instrument/portfolio run.
@@ -234,21 +206,14 @@ class BacktestConfig:
 
         Raises:
             UndeclaredConfigError: A required explicit-over-default field is unset.
-            IncompatibleConfigError: Two declared fields contradict each other.
         """
         if portfolio and self.base_currency is None:
             raise UndeclaredConfigError(
                 "base_currency is required for a portfolio run but was not declared "
-                "(§4.8 — never silently assume a base currency)"
+                "(§4.7 — never silently assume a base currency)"
             )
         if paper_trading and self.signal.on_opposite_signal is None:
             raise UndeclaredConfigError(
                 "signal.on_opposite_signal is required for paper trading but was not "
-                "declared (§9.3/§4.8 — the position-change policy has no safe default)"
-            )
-        if self.bar_type != "time" and self.data_quality.missing_bar != "fail":
-            raise IncompatibleConfigError(
-                f"bar_type={self.bar_type!r} is incompatible with "
-                f"data_quality.missing_bar={self.data_quality.missing_bar!r}: the "
-                "missing-bar policy applies only to time bars (§4.7/§4.3)"
+                "declared (§9.3/§4.7 — the position-change policy has no safe default)"
             )

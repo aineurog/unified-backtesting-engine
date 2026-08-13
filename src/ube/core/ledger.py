@@ -15,9 +15,8 @@ Design summary
   principle 6). Every event carries a ``timestamp`` (a bar boundary) and an
   ``instrument_id`` so portfolio backtests can filter by instrument (§4.6).
 * **``timestamp`` representation.** Stored as ``int``: nanoseconds since the Unix epoch
-  (UTC) for time bars, or the integer bar index for event bars. This is the one
-  representation that makes the §4.6 "union of timestamps + forward-fill" derivation
-  uniform for both bar models. Time-bar ``DatetimeIndex`` inputs are normalized to
+  (UTC). This is the one representation that makes the §4.6 "union of timestamps +
+  forward-fill" derivation uniform. ``DatetimeIndex`` inputs are normalized to
   nanosecond resolution via ``.as_unit("ns")`` before int64 math (pandas 3.x stores
   tz-aware indexes at microsecond resolution — see contract-decisions item 03).
 * **Append-only container.** :class:`EventLedger` only appends; entries are frozen and
@@ -28,7 +27,7 @@ Design summary
   an inherently sequential fold (round-trip semantics); ``positions`` and the
   mark-to-market equity derivation are vectorized ``searchsorted``/``cumsum``
   operations — no per-bar Python loops (§3 principle 1).
-* **Multi-currency normalization (§4.6, §4.8).** The aggregation takes an explicit
+* **Multi-currency normalization (§4.6, §4.7).** The aggregation takes an explicit
   ``base_currency``. Each instrument's mark value is in its ``Instrument.
   settlement_currency`` and is converted to ``base_currency`` via caller-supplied
   historical FX rates (``fx_rates``, a ``Mapping`` keyed by currency pair). There is no
@@ -39,13 +38,14 @@ Design summary
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import cast
 
 import numpy as np
 import pandas as pd
+from numpy.typing import ArrayLike
 
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, FXRateUnavailableError
@@ -54,6 +54,7 @@ from ube.core.instrument import Instrument
 __all__ = [
     "EventType",
     "EVENT_TYPES",
+    "EXIT_REASONS",
     "LedgerEvent",
     "EventLedger",
     "FXSeries",
@@ -64,6 +65,8 @@ __all__ = [
     "positions",
     "equity_curve",
     "equity_curve_by_instrument",
+    "funding_payments",
+    "trade_table",
 ]
 
 
@@ -87,6 +90,22 @@ class EventType(StrEnum):
 
 #: All event types, in a stable order for iteration/testing.
 EVENT_TYPES: tuple[EventType, ...] = tuple(EventType)
+
+#: Canonical exit-reason strings stamped on a closing ``fill`` (§4.6). The field is a
+#: free string (like ``signal_evaluated.action``), not a closed enum, so a future exit
+#: kind doesn't require a ledger change; these are the recognized values.
+EXIT_REASONS: frozenset[str] = frozenset(
+    {
+        "signal",
+        "take_profit",
+        "atr_stop",
+        "trailing_stop",
+        "chandelier",
+        "time_exit",
+        "end_of_run",
+        "manual",
+    }
+)
 
 #: Float tolerance for "position is flat" checks in the trade fold.
 _EPS: float = 1e-12
@@ -161,9 +180,9 @@ def _require_nonneg(value: object, name: str) -> None:
 class LedgerEvent:
     """One immutable ledger entry, discriminated by :attr:`event_type` (§4.6).
 
-    Every event carries :attr:`timestamp` (bar boundary: int64 ns since epoch for time
-    bars, integer bar index for event bars) and :attr:`instrument_id` (§4.6 — every
-    ledger entry is tagged by instrument). The remaining fields are type-specific and
+    Every event carries :attr:`timestamp` (bar boundary: int64 ns since the Unix epoch)
+    and :attr:`instrument_id` (§4.6 — every ledger entry is tagged by instrument). The
+    remaining fields are type-specific and
     default to ``None``/``False``; each event type requires its own subset (validated
     here, raising :class:`~ube.core.errors.DataShapeError` on a malformed entry):
 
@@ -176,8 +195,10 @@ class LedgerEvent:
 
     ``fill``
         ``side`` (±1), ``quantity`` (positive magnitude — direction is ``side``),
-        ``price`` (> 0), optional ``notional`` (≥ 0), and ``gap_fill`` — the §4.6 flag
-        marking a fill that jumped the requested level.
+        ``price`` (> 0), optional ``notional`` (≥ 0), optional ``exit_reason`` (the
+        §4.6 reason a *closing* fill was generated — entry fills leave it ``None``),
+        and ``gap_fill`` — the §4.6 flag marking a fill that jumped the requested
+        level.
 
     ``funding_payment``
         ``amount`` (signed — negative funding is *received*), ``currency``.
@@ -197,7 +218,7 @@ class LedgerEvent:
 
     Attributes:
         event_type: The discriminated event type.
-        timestamp: Bar-boundary timestamp (int64 ns since epoch UTC, or bar index).
+        timestamp: Bar-boundary timestamp (int64 ns since the Unix epoch, UTC).
         instrument_id: Instrument the event belongs to (§4.6 tagging).
         action: ``signal_evaluated`` payload.
         order_id: ``order_submitted`` payload (also the link for ``fill``).
@@ -211,6 +232,8 @@ class LedgerEvent:
         rollover_from: Expiring futures contract symbol.
         rollover_to: Incoming futures contract symbol.
         position_after: Resulting signed position quantity.
+        exit_reason: Why a closing ``fill`` was generated (§4.6); ``None`` for entry
+            fills and non-fill events.
     """
 
     event_type: EventType
@@ -229,6 +252,7 @@ class LedgerEvent:
     rollover_from: str | None = None
     rollover_to: str | None = None
     position_after: float | None = None
+    exit_reason: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.timestamp, bool) or not isinstance(self.timestamp, (int, np.integer)):
@@ -251,6 +275,8 @@ class LedgerEvent:
             _require_price(self.price)
             if self.notional is not None:
                 _require_nonneg(self.notional, "notional")
+            if self.exit_reason is not None:
+                _require_str(self.exit_reason, "exit_reason")
         elif t is EventType.FUNDING_PAYMENT:
             _require_finite(self.amount, "amount")
             _require_str(self.currency, "currency")
@@ -423,6 +449,13 @@ class Trade:
         commission: Total commissions allocated to the trade (≥ 0).
         funding: Net funding allocated to the trade (signed; negative = received).
         net_pnl: ``gross_pnl - commission - funding``.
+        entry_notional: Gross entry value, ``quantity × entry_price × contract_multiplier``.
+        exit_notional: Gross exit value, ``quantity × exit_price × contract_multiplier``.
+        entry_fee: Commission allocated to the entry leg (split ∝ leg notional).
+        exit_fee: Commission allocated to the exit leg.
+        status: Always ``"closed"`` — this dataclass only carries completed round trips
+            (open rows live only in :func:`trade_table`).
+        exit_reason: The closing fill's ``exit_reason`` (§4.6), or ``None``.
     """
 
     instrument_id: str
@@ -436,6 +469,12 @@ class Trade:
     commission: float
     funding: float
     net_pnl: float
+    entry_notional: float = 0.0
+    exit_notional: float = 0.0
+    entry_fee: float = 0.0
+    exit_fee: float = 0.0
+    status: str = "closed"
+    exit_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -475,8 +514,7 @@ class EquityCurve:
     """A derived equity curve over a bar grid (§4.6).
 
     Attributes:
-        index: The grid — a tz-aware UTC ``DatetimeIndex`` (time bars) or ``RangeIndex``
-            (event bars).
+        index: The grid — a tz-aware UTC ``DatetimeIndex``.
         equity: float64[n] values in ``base_currency``, aligned to ``index``.
     """
 
@@ -515,6 +553,8 @@ class _MutableTrade:
     exit_timestamp: int = 0
     commission: float = 0.0
     funding: float = 0.0
+    exit_reason: str | None = None
+    multiplier: float = 1.0
 
 
 @dataclass
@@ -527,9 +567,25 @@ class _FoldState:
 
 def _freeze_trade(mt: _MutableTrade) -> Trade:
     """Convert a completed round-trip accumulator into an immutable :class:`Trade`."""
-    entry_price = abs(mt.entry_notional) / mt.entry_units if mt.entry_units > 0.0 else 0.0
-    exit_price = abs(mt.exit_notional) / mt.exit_units if mt.exit_units > 0.0 else 0.0
+    entry_price = (
+        abs(mt.entry_notional) / (mt.entry_units * mt.multiplier)
+        if mt.entry_units > 0.0
+        else 0.0
+    )
+    exit_price = (
+        abs(mt.exit_notional) / (mt.exit_units * mt.multiplier)
+        if mt.exit_units > 0.0
+        else 0.0
+    )
     gross_pnl = -(mt.entry_notional + mt.exit_notional)
+    entry_notional = abs(mt.entry_notional)
+    exit_notional = abs(mt.exit_notional)
+    total_notional = entry_notional + exit_notional
+    if total_notional > 0.0:
+        entry_fee = mt.commission * entry_notional / total_notional
+        exit_fee = mt.commission - entry_fee
+    else:
+        entry_fee = exit_fee = 0.0
     return Trade(
         instrument_id=mt.instrument_id,
         side=mt.side,
@@ -542,11 +598,26 @@ def _freeze_trade(mt: _MutableTrade) -> Trade:
         commission=mt.commission,
         funding=mt.funding,
         net_pnl=gross_pnl - mt.commission - mt.funding,
+        entry_notional=entry_notional,
+        exit_notional=exit_notional,
+        entry_fee=entry_fee,
+        exit_fee=exit_fee,
+        status="closed",
+        exit_reason=mt.exit_reason,
     )
 
 
-def _process_fill(state: _FoldState, out: list[Trade], event: LedgerEvent) -> None:
-    """Fold one ``fill`` event into round-trip trades (sequential, per instrument)."""
+def _process_fill(
+    state: _FoldState,
+    out: list[Trade],
+    event: LedgerEvent,
+    multiplier: float = 1.0,
+) -> None:
+    """Fold one ``fill`` event into round-trip trades (sequential, per instrument).
+
+    ``multiplier`` is the instrument's ``contract_multiplier`` (§4.6): notional is
+    ``quantity × price × multiplier``.
+    """
     iid = event.instrument_id
     q = float(cast(int, event.side)) * float(cast(float, event.quantity))
     p = float(cast(float, event.price))
@@ -558,7 +629,9 @@ def _process_fill(state: _FoldState, out: list[Trade], event: LedgerEvent) -> No
             prev = state.current.get(iid)
             if prev is not None and (prev.entry_units > 0.0 or prev.exit_units > 0.0):
                 out.append(_freeze_trade(prev))
-            mt = _MutableTrade(iid, 1 if remaining > 0.0 else -1, event.timestamp)
+            mt = _MutableTrade(
+                iid, 1 if remaining > 0.0 else -1, event.timestamp, multiplier=multiplier
+            )
             state.current[iid] = mt
         else:
             mt = state.current[iid]
@@ -570,7 +643,7 @@ def _process_fill(state: _FoldState, out: list[Trade], event: LedgerEvent) -> No
         if (remaining > 0.0) == (mt.side > 0):
             # Same direction as the open round trip: add to entry.
             mt.entry_units += abs(remaining)
-            mt.entry_notional += remaining * p
+            mt.entry_notional += remaining * p * multiplier
             pos += remaining
             remaining = 0.0
         else:
@@ -579,7 +652,9 @@ def _process_fill(state: _FoldState, out: list[Trade], event: LedgerEvent) -> No
             close_units = min(abs(remaining), open_units)
             close_q = -float(mt.side) * close_units
             mt.exit_units += close_units
-            mt.exit_notional += close_q * p
+            mt.exit_notional += close_q * p * multiplier
+            if event.exit_reason is not None:
+                mt.exit_reason = event.exit_reason
             pos += close_q
             remaining -= close_q
             if abs(mt.entry_units - mt.exit_units) < _EPS:
@@ -588,32 +663,15 @@ def _process_fill(state: _FoldState, out: list[Trade], event: LedgerEvent) -> No
     state.position[iid] = pos
 
 
-def trades(ledger: EventLedger) -> tuple[Trade, ...]:
-    """Fold fills/commissions/funding into per-instrument round-trip trades (§4.6).
+def _fold_trades(
+    ledger: EventLedger, instruments: Mapping[str, Instrument] | None
+) -> tuple[tuple[Trade, ...], dict[str, _MutableTrade]]:
+    """Run the sequential fill fold once (§4.6).
 
-    Events are folded in append order. A round trip opens on the first fill after a flat
-    position, accumulates same-direction fills into a volume-weighted entry and
-    opposite-direction fills into a volume-weighted exit, and closes when the position
-    returns to flat (a flip through zero closes the old trade and opens a new one).
-    ``commission`` and ``funding_payment`` events are allocated to the open trade (or,
-    if the position is already flat, the most-recently-closed trade); a cost with no
-    associated round trip is not represented here (it still lives in the ledger and
-    affects equity via ``cash_movement``).
-
-    Only *closed* round trips are emitted; an open position at the end of the run is a
-    position (see :func:`positions`), not a trade. The fold is inherently sequential
-    (round-trip semantics are path-dependent); it is the one sanctioned non-vectorized
-    part of this module (§3 principle 1).
-
-    Args:
-        ledger: The append-only event ledger.
-
-    Returns:
-        The completed round-trip trades, in the order their entries occurred.
+    Returns the completed round-trip trades (in entry order) and the per-instrument
+    open accumulators (positions still held at the end of the run, keyed by
+    ``instrument_id``).
     """
-    if not isinstance(ledger, EventLedger):
-        raise DataShapeError("trades() expects an EventLedger")
-
     state = _FoldState(position={}, current={})
     out: list[Trade] = []
 
@@ -621,7 +679,7 @@ def trades(ledger: EventLedger) -> tuple[Trade, ...]:
         t = event.event_type
         iid = event.instrument_id
         if t is EventType.FILL:
-            _process_fill(state, out, event)
+            _process_fill(state, out, event, _contract_multiplier(instruments, iid))
         elif t is EventType.COMMISSION or t is EventType.FUNDING_PAYMENT:
             mt = state.current.get(iid)
             if mt is not None:
@@ -635,7 +693,42 @@ def trades(ledger: EventLedger) -> tuple[Trade, ...]:
         if mt.exit_units > 0.0 and abs(mt.entry_units - mt.exit_units) < _EPS:
             out.append(_freeze_trade(mt))
 
-    return tuple(out)
+    return tuple(out), state.current
+
+
+def trades(
+    ledger: EventLedger, instruments: Mapping[str, Instrument] | None = None
+) -> tuple[Trade, ...]:
+    """Fold fills/commissions/funding into per-instrument round-trip trades (§4.6).
+
+    Events are folded in append order. A round trip opens on the first fill after a flat
+    position, accumulates same-direction fills into a volume-weighted entry and
+    opposite-direction fills into a volume-weighted exit, and closes when the position
+    returns to flat (a flip through zero closes the old trade and opens a new one).
+    ``commission`` and ``funding_payment`` events are allocated to the open trade (or,
+    if the position is already flat, the most-recently-closed trade); a cost with no
+    associated round trip is not represented here (it still lives in the ledger and
+    affects equity via the cash-flow aggregation).
+
+    Notional is ``quantity × price × contract_multiplier`` (§4.6): ``instruments``
+    supplies the multiplier (default ``1.0`` when ``None``). Only *closed* round trips
+    are emitted; an open position at the end of the run is a position (see
+    :func:`positions`), not a trade — use :func:`trade_table` for open rows. The fold is
+    inherently sequential (round-trip semantics are path-dependent); it is the one
+    sanctioned non-vectorized part of this module (§3 principle 1).
+
+    Args:
+        ledger: The append-only event ledger.
+        instruments: Optional ``instrument_id -> Instrument`` mapping supplying
+            ``contract_multiplier``; ``None`` treats every multiplier as ``1.0``.
+
+    Returns:
+        The completed round-trip trades, in the order their entries occurred.
+    """
+    if not isinstance(ledger, EventLedger):
+        raise DataShapeError("trades() expects an EventLedger")
+    closed, _ = _fold_trades(ledger, instruments)
+    return closed
 
 
 # ---------------------------------------------------------------------------
@@ -725,10 +818,8 @@ def _asi8(index: pd.DatetimeIndex) -> np.ndarray:
 
 
 def _timestamps_ns(md: MarketData) -> np.ndarray:
-    """The bar-boundary axis of ``md`` as int64 (ns for time bars, bar index otherwise)."""
-    if md.is_time_bars:
-        return _asi8(cast(pd.DatetimeIndex, md.index))
-    return md.index.to_numpy(dtype=np.int64)
+    """The bar-boundary axis of ``md`` as int64 nanoseconds since the Unix epoch."""
+    return _asi8(md.timestamps)
 
 
 def _settlement_currency(
@@ -749,9 +840,35 @@ def _settlement_currency(
     if sc is None:
         raise FXRateUnavailableError(
             f"instrument {instrument_id!r} has no settlement_currency; cannot "
-            f"normalize to base_currency {base_currency!r} (§4.8 — never assume)"
+            f"normalize to base_currency {base_currency!r} (§4.7 — never assume)"
         )
     return sc
+
+
+def _contract_multiplier(
+    instruments: Mapping[str, Instrument] | None, instrument_id: str
+) -> float:
+    """The contract multiplier for ``instrument_id`` (default ``1.0`` — §4.6).
+
+    ``instruments=None`` means "no instrument metadata supplied" → the safe default
+    ``1.0`` (back-compat with a bare ``trades(ledger)``). When supplied but missing the
+    entry — or holding a non-``Instrument`` value — fail loudly rather than silently
+    assume ``1.0`` for what might be a futures contract (§4.7).
+    """
+    if instruments is None:
+        return 1.0
+    instr = instruments.get(instrument_id)
+    if instr is None:
+        raise DataShapeError(
+            f"instrument_id {instrument_id!r} has no Instrument entry (its "
+            "contract_multiplier is required to size notional)"
+        )
+    if not isinstance(instr, Instrument):
+        raise DataShapeError(
+            f"instruments[{instrument_id!r}] must be an Instrument; "
+            f"got {type(instr).__name__}"
+        )
+    return 1.0 if instr.contract_multiplier is None else float(instr.contract_multiplier)
 
 
 def _fx_rate_at(
@@ -766,7 +883,7 @@ def _fx_rate_at(
     (e.g. ``"EURUSD"``), and its value is *units of base currency per one unit of the
     quoted currency*. When ``from_currency == base_currency`` the identity (``1.0``) is
     returned without any lookup. A missing pair, or a grid timestamp preceding the first
-    rate entry, raises :class:`~ube.core.errors.FXRateUnavailableError` (§4.8 — never a
+    rate entry, raises :class:`~ube.core.errors.FXRateUnavailableError` (§4.7 — never a
     silent 1:1 assumption).
     """
     if from_currency == base_currency:
@@ -782,7 +899,7 @@ def _fx_rate_at(
     if (idx < 0).any():
         raise FXRateUnavailableError(
             f"FX rate for pair {key!r} has no entry on/before one or more grid "
-            "timestamps (cannot normalize — never assume a rate, §4.8)"
+            "timestamps (cannot normalize — never assume a rate, §4.7)"
         )
     return fx.rate[idx]
 
@@ -810,13 +927,6 @@ def _build_equity(
             raise DataShapeError(f"market_data[{iid!r}] must be a MarketData")
         mds[iid] = md
 
-    bar_types = {md.bar_type for md in mds.values()}
-    if len(bar_types) > 1:
-        raise DataShapeError(
-            "combined equity curve requires a uniform bar_type across instruments; "
-            f"got {sorted(bar_types)}"
-        )
-
     # Combined grid: sorted union of all instruments' bar boundaries (§4.6 step 1).
     grid = np.unique(np.concatenate([_timestamps_ns(md) for md in mds.values()]))
 
@@ -838,7 +948,7 @@ def _build_equity(
     }
 
     # A held position with no market_data cannot be marked to market (§4.6 step 2) —
-    # fail loudly rather than silently dropping it from the combined equity (§4.8).
+    # fail loudly rather than silently dropping it from the combined equity (§4.7).
     unmarketable = set(pc_ts) - set(mds)
     if unmarketable:
         raise DataShapeError(
@@ -869,20 +979,26 @@ def _build_equity(
         clipped = np.clip(cidx, 0, None)
         close_grid = np.where(valid, close[clipped], 0.0)
 
-        mark_local = pos_grid * close_grid  # settlement-currency value
+        mult = _contract_multiplier(instruments, iid)
+        mark_local = pos_grid * close_grid * mult  # settlement-currency value
 
         # Convert to base currency (§4.6 step 3).
         sc = _settlement_currency(instruments, iid, base_currency)
         mark_base = mark_local * _fx_rate_at(sc, base_currency, fx_rates, grid)
 
         marks_base_sum += mark_base
-        per_instrument[iid] = EquityCurve(index=_grid_index(bar_types, grid), equity=mark_base)
+        per_instrument[iid] = EquityCurve(index=_grid_index(grid), equity=mark_base)
 
     # Base-currency cash: cumulative sum of converted cash movements (§4.6 step 4).
     cash_ts: list[int] = []
     cash_base: list[float] = []
     for event in ledger:
-        if event.event_type is EventType.CASH_MOVEMENT:
+        et = event.event_type
+        if (
+            et is EventType.CASH_MOVEMENT
+            or et is EventType.COMMISSION
+            or et is EventType.FUNDING_PAYMENT
+        ):
             amount = cast(float, event.amount)
             currency = cast(str, event.currency)
             rate = _fx_rate_at(
@@ -891,8 +1007,11 @@ def _build_equity(
                 fx_rates,
                 np.asarray([event.timestamp], dtype=np.int64),
             )
+            # cash_movement is signed (inflow positive); commission (amount ≥ 0) and
+            # funding_payment (signed, positive = paid) are *costs* → cash outflows.
+            sign = 1.0 if et is EventType.CASH_MOVEMENT else -1.0
             cash_ts.append(event.timestamp)
-            cash_base.append(amount * float(rate[0]))
+            cash_base.append(sign * amount * float(rate[0]))
 
     cash_grid = np.zeros(n, dtype=np.float64)
     if cash_ts:
@@ -905,15 +1024,13 @@ def _build_equity(
         cidx = np.searchsorted(cts, grid, side="right") - 1
         cash_grid = np.where(cidx >= 0, cum[np.clip(cidx, 0, cum.shape[0] - 1)], 0.0)
 
-    combined = EquityCurve(index=_grid_index(bar_types, grid), equity=cash_grid + marks_base_sum)
+    combined = EquityCurve(index=_grid_index(grid), equity=cash_grid + marks_base_sum)
     return combined, per_instrument
 
 
-def _grid_index(bar_types: set[str], grid: np.ndarray) -> pd.Index:
-    """Reconstruct the public index for the grid from the (uniform) bar type."""
-    if "time" in bar_types:
-        return cast(pd.Index, pd.to_datetime(grid, unit="ns", utc=True).as_unit("ns"))
-    return pd.RangeIndex(grid.shape[0])
+def _grid_index(grid: np.ndarray) -> pd.DatetimeIndex:
+    """Reconstruct the public tz-aware UTC ``DatetimeIndex`` for the grid."""
+    return pd.to_datetime(grid, unit="ns", utc=True).as_unit("ns")
 
 
 def equity_curve(
@@ -941,14 +1058,14 @@ def equity_curve(
     ``"<settlement><base>"`` (e.g. ``"EURUSD"``), where each rate is *units of base per
     one unit of settlement*. ``settlement_currency == base_currency`` needs no entry. A
     missing pair — or an instrument without a ``settlement_currency`` — raises
-    :class:`~ube.core.errors.FXRateUnavailableError` (§4.8: never silently assume or
+    :class:`~ube.core.errors.FXRateUnavailableError` (§4.7: never silently assume or
     leave unconverted).
 
     Args:
         ledger: The append-only event ledger.
         market_data: ``instrument_id -> MarketData`` (bars used for mark-to-market).
         instruments: ``instrument_id -> Instrument`` (provides ``settlement_currency``).
-        base_currency: The explicit portfolio base currency (§4.8).
+        base_currency: The explicit portfolio base currency (§4.7).
         fx_rates: Optional historical FX rates keyed by currency pair.
 
     Returns:
@@ -978,7 +1095,7 @@ def equity_curve_by_instrument(
         ledger: The append-only event ledger.
         market_data: ``instrument_id -> MarketData``.
         instruments: ``instrument_id -> Instrument``.
-        base_currency: The explicit portfolio base currency (§4.8).
+        base_currency: The explicit portfolio base currency (§4.7).
         fx_rates: Optional historical FX rates keyed by currency pair.
 
     Returns:
@@ -988,3 +1105,316 @@ def equity_curve_by_instrument(
         ledger, market_data, instruments, base_currency, fx_rates or {}
     )
     return per_instrument
+
+
+# ---------------------------------------------------------------------------
+# Carry funding generator (single cost-event stream — §4.6, §24).
+# ---------------------------------------------------------------------------
+
+
+def funding_payments(
+    *,
+    instrument_id: str,
+    timestamps: ArrayLike,
+    notional: ArrayLike,
+    side: ArrayLike,
+    funding_rate: ArrayLike = 0.0,
+    borrow_rate: ArrayLike = 0.0,
+    currency: str,
+) -> tuple[LedgerEvent, ...]:
+    """Generate ``funding_payment`` events from a per-bar carry rate series (§4.6, §24).
+
+    This is the *single* generator that books carry (funding/swap + short borrow) into
+    the ledger — there is no other monetary path for carry. The rates are per-bar
+    fractions of notional (a scalar broadcasts to a constant series); the §24 rate
+    time-series is resampled onto the bar grid by the caller and passed here. Phase 2
+    replaces the bar-grid schedule with calendar-aware (8h / daily / at-close) events,
+    emitting the same event type.
+
+    ``notional`` is the non-negative open value per bar, ``side`` is ``+1``/``-1``/``0``,
+    and ``timestamps`` are int64-ns bar boundaries aligned to them (all length-``n``).
+    One event is emitted per bar where the position is open *and* the accrued carry is
+    non-zero. ``amount`` is signed (positive = paid, negative = received), matching the
+    ``cost.carrying_cost`` sign convention ``(funding + borrow × (side < 0)) × notional``.
+
+    Args:
+        instrument_id: Instrument the carry accrues against (§4.6 tagging).
+        timestamps: int64-ns bar boundaries, one per open bar.
+        notional: Open notional (≥ 0) per bar, in the settlement currency.
+        side: Direction per bar, ``+1`` long / ``-1`` short / ``0`` flat.
+        funding_rate: Per-bar funding/swap rate (fraction of notional), or a scalar.
+        borrow_rate: Per-bar short-side borrow rate (fraction of notional), or a scalar.
+        currency: Currency the accrual is denominated in.
+
+    Returns:
+        The ``funding_payment`` events, in bar order (empty if no carry accrued).
+    """
+    _require_str(instrument_id, "instrument_id")
+    _require_str(currency, "currency")
+    ts = _coerce_int1d(timestamps, "timestamps")
+    n = _coerce_float1d(notional, "notional")
+    if ts.shape[0] != n.shape[0]:
+        raise DataShapeError(
+            f"timestamps ({ts.shape[0]}) and notional ({n.shape[0]}) lengths differ"
+        )
+
+    def _series(values: object, name: str) -> np.ndarray:
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.ndim == 0:
+            arr = np.full(n.shape[0], float(arr))
+        if arr.ndim > 1 or arr.shape[0] != n.shape[0]:
+            raise DataShapeError(
+                f"{name} must be a scalar or length {n.shape[0]}; got shape {arr.shape}"
+            )
+        return arr
+
+    s = _series(side, "side")
+    f = _series(funding_rate, "funding_rate")
+    b = _series(borrow_rate, "borrow_rate")
+
+    cost = (f + b * (s < 0.0)) * n
+    idx = np.nonzero((n > 0.0) & (cost != 0.0))[0]
+    return tuple(
+        LedgerEvent(
+            EventType.FUNDING_PAYMENT,
+            int(ts[i]),
+            instrument_id,
+            amount=float(cost[i]),
+            currency=currency,
+        )
+        for i in idx
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trades table (closed + open rows, joined with the equity curve — §4.6).
+# ---------------------------------------------------------------------------
+
+#: The trade-table column order (§4.6). ``_pct`` columns are fractions (``0.05`` = 5%).
+_TRADE_TABLE_COLUMNS: tuple[str, ...] = (
+    "instrument_id",
+    "entry_datetime",
+    "entry_price",
+    "exit_datetime",
+    "exit_price",
+    "duration",
+    "side",
+    "status",
+    "quantity",
+    "entry_notional",
+    "position_size_pct",
+    "trade_return_pct",
+    "realized_pnl",
+    "realized_pnl_pct",
+    "cum_return_pct",
+    "balance",
+    "entry_fee_pct",
+    "exit_fee_pct",
+    "reason",
+)
+
+
+def _as_ts(t: int) -> pd.Timestamp:
+    """int64-ns timestamp → tz-aware UTC ``Timestamp``."""
+    return pd.to_datetime(t, unit="ns", utc=True)
+
+
+def _rate_at(
+    from_currency: str,
+    base_currency: str,
+    fx_rates: Mapping[str, FXSeries],
+    ts_ns: int,
+) -> float:
+    """The scalar FX rate converting ``from_currency`` → ``base_currency`` at ``ts_ns``."""
+    return float(
+        _fx_rate_at(
+            from_currency,
+            base_currency,
+            fx_rates,
+            np.asarray([ts_ns], dtype=np.int64),
+        )[0]
+    )
+
+
+def _closed_row(
+    trade: Trade,
+    equity_at: Callable[[int], float],
+    settlement_of: Callable[[str], str],
+    base_currency: str,
+    fx_rates: Mapping[str, FXSeries],
+    start: float,
+) -> dict[str, object]:
+    sc = settlement_of(trade.instrument_id)
+    entry_equity = equity_at(trade.entry_timestamp)
+    exit_equity = equity_at(trade.exit_timestamp)
+    entry_fx = _rate_at(sc, base_currency, fx_rates, trade.entry_timestamp)
+    exit_fx = _rate_at(sc, base_currency, fx_rates, trade.exit_timestamp)
+    entry_notional_base = trade.entry_notional * entry_fx
+    net_pnl_base = trade.net_pnl * exit_fx
+    return {
+        "instrument_id": trade.instrument_id,
+        "entry_datetime": _as_ts(trade.entry_timestamp),
+        "entry_price": trade.entry_price,
+        "exit_datetime": _as_ts(trade.exit_timestamp),
+        "exit_price": trade.exit_price,
+        "duration": pd.to_timedelta(
+            trade.exit_timestamp - trade.entry_timestamp, unit="ns"
+        ),
+        "side": trade.side,
+        "status": "closed",
+        "quantity": trade.quantity,
+        "entry_notional": trade.entry_notional,
+        "position_size_pct": entry_notional_base / entry_equity if entry_equity else 0.0,
+        "trade_return_pct": trade.net_pnl / trade.entry_notional
+        if trade.entry_notional
+        else 0.0,
+        "realized_pnl": net_pnl_base,
+        "realized_pnl_pct": net_pnl_base / entry_equity if entry_equity else 0.0,
+        "cum_return_pct": exit_equity / start - 1.0 if start else 0.0,
+        "balance": exit_equity,
+        "entry_fee_pct": trade.entry_fee / trade.entry_notional
+        if trade.entry_notional
+        else 0.0,
+        "exit_fee_pct": trade.exit_fee / trade.exit_notional
+        if trade.exit_notional
+        else 0.0,
+        "reason": trade.exit_reason,
+    }
+
+
+def _open_row(
+    mt: _MutableTrade,
+    market_data: Mapping[str, MarketData],
+    instruments: Mapping[str, Instrument],
+    equity_at: Callable[[int], float],
+    settlement_of: Callable[[str], str],
+    base_currency: str,
+    fx_rates: Mapping[str, FXSeries],
+    start: float,
+) -> dict[str, object]:
+    iid = mt.instrument_id
+    md = market_data.get(iid)
+    if md is None or md.n_bars == 0:
+        raise DataShapeError(
+            f"open position for {iid!r} has no market_data to mark; cannot build an "
+            "open trade row"
+        )
+    mult = _contract_multiplier(instruments, iid)
+    entry_price = (
+        abs(mt.entry_notional) / (mt.entry_units * mt.multiplier)
+        if mt.entry_units > 0.0
+        else 0.0
+    )
+    remaining_units = mt.entry_units - mt.exit_units
+    mark = float(md.close[-1])
+    last_ts = int(_asi8(md.timestamps)[-1])
+    remaining_notional = remaining_units * entry_price * mult
+    unrealized = mt.side * remaining_units * (mark - entry_price) * mult
+
+    entry_equity = equity_at(mt.entry_timestamp)
+    last_equity = equity_at(last_ts)
+    sc = settlement_of(iid)
+    entry_fx = _rate_at(sc, base_currency, fx_rates, mt.entry_timestamp)
+
+    return {
+        "instrument_id": iid,
+        "entry_datetime": _as_ts(mt.entry_timestamp),
+        "entry_price": entry_price,
+        "exit_datetime": _as_ts(last_ts),
+        "exit_price": mark,
+        "duration": pd.NaT,
+        "side": mt.side,
+        "status": "open",
+        "quantity": remaining_units,
+        "entry_notional": remaining_notional,
+        "position_size_pct": remaining_notional * entry_fx / entry_equity
+        if entry_equity
+        else 0.0,
+        "trade_return_pct": unrealized / remaining_notional
+        if remaining_notional
+        else 0.0,
+        "realized_pnl": 0.0,
+        "realized_pnl_pct": 0.0,
+        "cum_return_pct": last_equity / start - 1.0 if start else 0.0,
+        "balance": last_equity,
+        "entry_fee_pct": mt.commission / remaining_notional
+        if remaining_notional
+        else 0.0,
+        "exit_fee_pct": 0.0,
+        "reason": None,
+    }
+
+
+def trade_table(
+    ledger: EventLedger,
+    market_data: Mapping[str, MarketData],
+    instruments: Mapping[str, Instrument],
+    *,
+    base_currency: str,
+    fx_rates: Mapping[str, FXSeries] | None = None,
+    initial_capital: float | None = None,
+) -> pd.DataFrame:
+    """One row per trade (closed *and* open), joined with the equity curve (§4.6).
+
+    Closed rows come from the same round-trip fold as :func:`trades`; open rows are the
+    positions still held at the end of the run, marked to their last close. Every row
+    carries the trade-level columns (entry/exit datetime+price, duration, side, status,
+    quantity, notional, fee split, reason) plus account-level columns derived from the
+    combined equity curve (``position_size_pct``, ``realized_pnl_pct``,
+    ``cum_return_pct``, ``balance``). The ``_pct`` columns are fractions (``0.05`` = 5%).
+
+    Per-trade monetary values are in the instrument's settlement currency; account-level
+    values are in ``base_currency`` (converted via ``fx_rates``). ``initial_capital``
+    defaults to the first point of the equity curve.
+
+    Args:
+        ledger: The append-only event ledger.
+        market_data: ``instrument_id -> MarketData`` (for mark-to-market and open rows).
+        instruments: ``instrument_id -> Instrument`` (multiplier + settlement currency).
+        base_currency: The portfolio base currency (§4.7).
+        fx_rates: Optional historical FX rates keyed by currency pair.
+        initial_capital: Optional account baseline for ``cum_return_pct``.
+
+    Returns:
+        A ``DataFrame`` with one row per trade, columns in :data:`_TRADE_TABLE_COLUMNS`.
+    """
+    if not isinstance(ledger, EventLedger):
+        raise DataShapeError("trade_table() expects an EventLedger")
+
+    fx = fx_rates or {}
+    closed, open_accumulators = _fold_trades(ledger, instruments)
+    combined, _ = _build_equity(ledger, market_data, instruments, base_currency, fx)
+
+    grid = _asi8(cast(pd.DatetimeIndex, combined.index))
+    equity = combined.equity
+    start = initial_capital if initial_capital is not None else float(equity[0])
+
+    def equity_at(t: int) -> float:
+        i = int(np.searchsorted(grid, t, side="right")) - 1
+        return 0.0 if i < 0 else float(equity[i])
+
+    def settlement_of(iid: str) -> str:
+        return _settlement_currency(instruments, iid, base_currency)
+
+    rows: list[dict[str, object]] = []
+    for trade in closed:
+        rows.append(
+            _closed_row(trade, equity_at, settlement_of, base_currency, fx, start)
+        )
+    for mt in open_accumulators.values():
+        if abs(mt.entry_units - mt.exit_units) <= _EPS:
+            continue
+        rows.append(
+            _open_row(
+                mt,
+                market_data,
+                instruments,
+                equity_at,
+                settlement_of,
+                base_currency,
+                fx,
+                start,
+            )
+        )
+
+    return pd.DataFrame(rows, columns=_TRADE_TABLE_COLUMNS)

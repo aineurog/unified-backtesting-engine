@@ -8,7 +8,7 @@ fully precomputed so an adapter can inject them into the engine's native stop/ta
 mechanism (``sl_stop``/``tp_stop`` for vectorbt, a Sizer/order wrapper for backtrader, an
 Actor for NautilusTrader). The *fill simulation* — did the bar actually fill at the
 level, at what price, with what slippage — is the engine's job (§8); this module only
-produces deterministic levels and the deterministic *trigger rule* (§4.8/§9) that must
+produces deterministic levels and the deterministic *trigger rule* (§4.7/§9) that must
 be identical across backtest and paper trading.
 
 The starting set (§8): ATR stop (fixed multiple + trailing), percentage trailing stop,
@@ -60,7 +60,7 @@ __all__ = [
     "scale_out_plan",
 ]
 
-#: The TP/SL trigger rule (§4.8/§9): ``"touched"`` = the bar's high/low reached the
+#: The TP/SL trigger rule (§4.7/§9): ``"touched"`` = the bar's high/low reached the
 #: level intra-bar; ``"close"`` = only the bar's close is compared. Must match between
 #: backtest and paper trading.
 Trigger = Literal["touched", "close"]
@@ -128,7 +128,7 @@ class TakeProfit:
     Attributes:
         percent: Distance above (long) / below (short) entry, as a fraction.
         scale_out: Fraction of the position to exit when hit, in ``(0, 1]`` (§6.4).
-        trigger: The §4.8 trigger rule.
+        trigger: The §4.7 trigger rule.
     """
 
     percent: float
@@ -152,7 +152,7 @@ class ATRStop:
 
     Attributes:
         mult: ATR multiple.
-        trigger: The §4.8 trigger rule.
+        trigger: The §4.7 trigger rule.
         trailing: Whether to ratchet the stop in the favourable direction.
         period: ATR lookback, used when ``atr`` (the aux_data reference) is ``None``.
         atr: Optional ``aux_data`` name (§5.2); resolved by the caller into an
@@ -183,7 +183,7 @@ class TrailingStop:
 
     Attributes:
         percent: Trailing distance off the peak/trough, as a fraction.
-        trigger: The §4.8 trigger rule.
+        trigger: The §4.7 trigger rule.
     """
 
     percent: float
@@ -225,7 +225,7 @@ class ChandelierExit:
 
     Attributes:
         mult: ATR multiple.
-        trigger: The §4.8 trigger rule.
+        trigger: The §4.7 trigger rule.
         period: ATR lookback, used when ``atr`` is ``None``.
         atr: Optional ``aux_data`` name (§5.2); resolved by the caller.
     """
@@ -470,7 +470,7 @@ def is_triggered(
     close: object,
     direction: _AboveBelow,
 ) -> np.ndarray:
-    """Apply the §4.8/§9 trigger rule to a level array (pure, vectorized).
+    """Apply the §4.7/§9 trigger rule to a level array (pure, vectorized).
 
     ``direction`` says whether the level lies above or below the price (a long target /
     short stop is "above"; a long stop / short target is "below"). For ``"touched"`` the
@@ -544,7 +544,7 @@ def exit_triggered(
 ) -> np.ndarray:
     """Whether ``cfg`` fires at each bar (level + trigger rule), for any exit type.
 
-    A bool array aligned to the bar index; the deterministic trigger rule of §4.8/§9 is
+    A bool array aligned to the bar index; the deterministic trigger rule of §4.7/§9 is
     applied via :func:`is_triggered` (for a time exit, the mask is used directly).
     """
     if isinstance(cfg, TimeExit):

@@ -108,7 +108,7 @@ def resolve_cost_model(instrument: Instrument | None = None) -> CostModel:
     short-side borrow / hard-to-borrow fees, together with a resolution of an
     ``Instrument``'s ``funding_model`` / ``borrow_model`` string references — are
     filled in per asset class as adapters are built (Phase 2). Until then every
-    non-perp asset class resolves to zero-cost rather than a guessed number (§4.8).
+    non-perp asset class resolves to zero-cost rather than a guessed number (§4.7).
     """
     if instrument is None:
         return ZERO_COST

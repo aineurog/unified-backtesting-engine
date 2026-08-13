@@ -19,7 +19,7 @@ from ube.core.errors import ConfigError, DataShapeError
 
 
 def _bars(closes: list[float]) -> MarketData:
-    """Event bars with the given closes (monotonic OHLC invariants preserved)."""
+    """Bars with the given closes (monotonic OHLC invariants preserved)."""
     close = np.asarray(closes, dtype=float)
     n = close.shape[0]
     return MarketData(
@@ -28,8 +28,7 @@ def _bars(closes: list[float]) -> MarketData:
         low=close - 0.5,
         close=close,
         volume=np.ones(n),
-        index=pd.RangeIndex(n),
-        bar_type="volume",
+        index=pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC"),
     )
 
 
@@ -108,9 +107,9 @@ def test_buy_and_hold_single_bar():
 
 
 def test_buy_and_hold_empty():
-    curve = buy_and_hold_curve(_bars([]))
-    assert curve.n_bars == 0
-    assert curve.equity.size == 0 and curve.returns.size == 0
+    # Empty input is rejected up-front by MarketData (fail loudly).
+    with pytest.raises(DataShapeError):
+        buy_and_hold_curve(_bars([]))
 
 
 def test_buy_and_hold_requires_market_data():

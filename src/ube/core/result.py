@@ -27,7 +27,7 @@ Design notes:
   denominated in the lone instrument's ``settlement_currency`` (identity FX — the
   natural denomination, not a silently-guessed cross-currency rate). A portfolio run
   with no ``base_currency`` raises :class:`~ube.core.errors.UndeclaredConfigError`
-  (§4.8).
+  (§4.7).
 * **Warm-up.** When ``config.warmup_bars > 0`` (§7.2), the first N bars are sliced off
   ``equity_curve`` / ``equity_curve_by_instrument`` and completed trades whose entry bar
   falls inside the warm-up window are dropped. Flagging individual ledger events
@@ -79,7 +79,7 @@ class BacktestResult:
     """The frozen, canonical result of one backtest run (§7.3).
 
     Attributes:
-        run_id: A unique string identifier for the run (§4.9); defaulted to a fresh
+        run_id: A unique string identifier for the run (§4.8); defaulted to a fresh
             UUID4 by :meth:`from_ledger` when not supplied.
         ledger: The append-only event ledger — the single source of truth (§4.6).
         config: The :class:`~ube.core.config.BacktestConfig` this run was produced with.
@@ -157,7 +157,7 @@ class BacktestResult:
 
         base_currency = _resolve_base_currency(config, instruments)
 
-        trades_view = trades(ledger)
+        trades_view = trades(ledger, instruments=instruments)
         pc_ids = {e.instrument_id for e in ledger if e.event_type is EventType.POSITION_CHANGE}
         positions_view = positions(ledger) if len(pc_ids) <= 1 else None
 
@@ -232,7 +232,7 @@ class BacktestResult:
 def _resolve_base_currency(
     config: BacktestConfig, instruments: Mapping[str, Instrument]
 ) -> str:
-    """Resolve the currency the equity curves are denominated in (§4.6, §4.8).
+    """Resolve the currency the equity curves are denominated in (§4.6, §4.7).
 
     ``config.base_currency`` when declared; otherwise (single-instrument run) the lone
     instrument's ``settlement_currency`` (identity FX — the natural denomination). A
@@ -244,7 +244,7 @@ def _resolve_base_currency(
     if len(instruments) != 1:
         raise UndeclaredConfigError(
             "base_currency is required to derive the combined equity curve for a "
-            "portfolio run but was not declared on BacktestConfig (§4.8 — never "
+            "portfolio run but was not declared on BacktestConfig (§4.7 — never "
             "silently assume a base currency)"
         )
     only = next(iter(instruments.values()))
@@ -253,7 +253,7 @@ def _resolve_base_currency(
         raise UndeclaredConfigError(
             "a single-instrument run with no declared base_currency needs the "
             "instrument's settlement_currency to denominate the equity curve, but "
-            f"{only.symbol!r} has none (§4.8)"
+            f"{only.symbol!r} has none (§4.7)"
         )
     return settlement
 
@@ -271,10 +271,10 @@ def _drop_warmup_trades(
     """Drop completed trades whose entry bar falls inside the warm-up window (§7.2).
 
     The warm-up window is the first ``warmup_bars`` bars of the combined grid; a trade
-    entering on a warm-up bar is excluded from statistics. The cutoff representation is
-    derived from the *actual* grid index (a tz-aware ``DatetimeIndex`` → nanosecond
-    timestamps, anything else → integer bar indexes) so it always matches how the
-    ledger's ``entry_timestamp`` was populated — independent of ``config.bar_type``.
+    entering on a warm-up bar is excluded from statistics. The cutoff is derived from
+    the grid's own bar-boundary timestamps (a tz-aware ``DatetimeIndex`` → int64
+    nanoseconds since the epoch), matching how the ledger's ``entry_timestamp`` is
+    populated, so the two are directly comparable.
     """
     if warmup_bars >= len(index):
         return ()
