@@ -55,7 +55,10 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.mypy]
-python_version = "3.11"
+# Target 3.12 rather than the 3.11 minimum: numpy>=2.1's stubs use PEP 695
+# `type` statements, which need 3.12 grammar to parse. The 3.11 CI job still
+# enforces runtime compatibility, so this is type-check-only and harmless.
+python_version = "3.12"
 
 [[tool.mypy.overrides]]
 module = ["ube.core", "ube.core.*"]
