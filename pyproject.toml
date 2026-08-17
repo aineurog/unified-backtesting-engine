@@ -64,5 +64,22 @@ python_version = "3.12"
 module = ["ube.core", "ube.core.*"]
 strict = true
 
+# The vectorbt/backtrader adapters are bare stubs (their own Phase-2 work is deferred);
+# they intentionally do not yet implement the typed `run` override.
+[[tool.mypy.overrides]]
+module = [
+    "ube.adapters.vectorbt_adapter",
+    "ube.adapters.vectorbt_adapter.*",
+    "ube.adapters.backtrader_adapter",
+    "ube.adapters.backtrader_adapter.*",
+]
+disable_error_code = ["override"]
+
+# nautilus_trader ships compiled Cython (.pyd) modules without stubs. Treat the
+# package as dynamically-typed rather than requiring stubs it does not ship.
+[[tool.mypy.overrides]]
+module = ["nautilus_trader.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -531,7 +531,21 @@ def _resolve_path(path: str | Path | None) -> Path:
     else:
         env = os.environ.get(_ENV_VAR)
         candidate = env if env else DEFAULT_LOG_PATH
-    return Path(candidate).expanduser()
+    return _expand_home(candidate)
+
+
+def _expand_home(value: str) -> Path:
+    """Expand a leading ``~`` against ``$HOME`` when set, else the OS home directory.
+
+    ``Path.expanduser`` resolves ``~`` against ``USERPROFILE`` on Windows and ignores
+    ``$HOME``; honoring ``$HOME`` first keeps the §4.8 default predictable in shells
+    that export it (and matches POSIX ``~`` semantics everywhere).
+    """
+    if value == "~":
+        return Path(os.environ.get("HOME") or Path.home())
+    if value.startswith("~/"):
+        return Path(os.environ.get("HOME") or Path.home()) / value[2:]
+    return Path(value)
 
 
 def _index_repr(value: object) -> str:
