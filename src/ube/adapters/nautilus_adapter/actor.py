@@ -74,7 +74,6 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
-from ube.core.calendar import _asi8
 from ube.core.data import MarketData
 from ube.core.errors import EngineError
 from ube.core.risk.exits import (
@@ -143,7 +142,7 @@ class _Book:
     entry_price: float
     created_bar: int
     live: dict[str, _LiveExit]  # client_order_id -> exit order
-    close_exits: list[tuple[str, np.ndarray]]  # (reason, triggered mask)
+    close_exits: list[tuple[str, float, np.ndarray]]  # (reason, fraction, triggered mask)
 
 
 class UbeActor(Strategy):  # type: ignore[misc]
@@ -167,7 +166,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
         self._exits = exits
         self._vol = vol
 
-        ts_ns = _asi8(market_data.timestamps)
+        ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
         self._ts_to_index: dict[int, int] = {
             int(ts_ns[i]): i for i in range(market_data.n_bars)
         }
@@ -206,9 +205,10 @@ class UbeActor(Strategy):  # type: ignore[misc]
             self._book = None
 
         if self._book is not None and self._open_position() is not None:
-            reason = self._close_exit_fired(idx)
-            if reason is not None:
-                self._submit_close(reason)
+            fired = self._close_exit_fired(idx)
+            if fired is not None:
+                reason, fraction = fired
+                self._submit_close(reason, fraction)
                 self.signal_evaluated[idx] = f"exit_{reason}"
             else:
                 self._apply_signal(self._lookup_signal(bar), bar, idx)
@@ -221,12 +221,12 @@ class UbeActor(Strategy):  # type: ignore[misc]
         reason = self._fill_reasons.get(str(event.client_order_id))
         if reason is None:
             return
-        # Only a fill that actually closes the position carries the final reason;
-        # a scale-out partial fill leaves the position open and is not a closing fill.
-        if self._open_position() is None:
-            self.exit_reasons[str(event.client_order_id)] = reason
-            if event.position_id is not None:
-                self.position_reasons[str(event.position_id)] = reason
+        # Every exit-ordered fill is stamped (§4.6): a scale-out partial and the
+        # final closing fill both carry the reason. The fold's last-reason-wins rule
+        # keeps the round-trip attribution on the closing fill (ledger._process_fill).
+        self.exit_reasons[str(event.client_order_id)] = reason
+        if event.position_id is not None:
+            self.position_reasons[str(event.position_id)] = reason
 
     def on_order_rejected(self, event: OrderRejected) -> None:
         order = self.cache.order(client_order_id=event.client_order_id)
@@ -311,20 +311,34 @@ class UbeActor(Strategy):  # type: ignore[misc]
         except ValueError:
             return None
 
-    def _submit_close(self, reason: str) -> None:
+    def _submit_close(self, reason: str, fraction: float = 1.0) -> None:
+        """Submit a reduce-only market close of ``fraction`` of the remaining position.
+
+        A full close (``fraction >= 1.0`` — stops and time exits, §6.4) cancels the
+        exit book and closes the position outright. A scale-out partial
+        (``fraction < 1.0`` — a take-profit slice) closes only that slice with a
+        reduce-only market order and leaves the book alive so the sibling stops
+        keep protecting the remainder (§6.4).
+        """
         position = self._open_position()
         if position is None:
             return
-        self._cancel_live_exits()
+        remaining = float(position.quantity)
+        qty = self._scaled_quantity_from(remaining, fraction)
+        if qty is None or float(qty.as_double()) <= 0.0:
+            return
+        if fraction >= 1.0:
+            self._cancel_live_exits()
         order = self.order_factory.market(
             self.instrument_id,
             OrderSide.SELL if position.is_long else OrderSide.BUY,
-            position.quantity,
+            qty,
             reduce_only=True,
         )
         self.submit_order(order)
         self._fill_reasons[str(order.client_order_id)] = reason
-        self._book = None
+        if fraction >= 1.0:
+            self._book = None
 
     # -- exit book (plan §4.5 item 3) ----------------------------------------
 
@@ -350,7 +364,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
             reason = _EXIT_REASONS[type(cfg)]
             fraction = float(plan.fractions[j])
             if isinstance(cfg, TimeExit) or getattr(cfg, "trigger", None) == "close":
-                book.close_exits.append((reason, plan.triggered[j]))
+                book.close_exits.append((reason, fraction, plan.triggered[j]))
                 continue
             levels = exit_level(
                 cfg,
@@ -400,16 +414,27 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 )
         self._book = book
 
-    def _close_exit_fired(self, idx: int) -> str | None:
-        """§8 close-time risk exits (evaluated at the bar close, stop-leaning first)."""
+    def _close_exit_fired(self, idx: int) -> tuple[str, float] | None:
+        """§8 close-time risk exits (evaluated at the bar close, in configured order).
+
+        Returns the first exit whose triggered mask is set on this bar as its
+        ``(reason, fraction)`` and **pops** it — a fired close exit is consumed exactly
+        once. The pop matters because a scale-out partial closes only a fraction of the
+        position (the book stays alive) and must not re-fire on every later bar.
+
+        Returns:
+            The ``(reason, fraction)`` of the first fired close exit, or ``None``.
+        """
         if self._book is None:
             return None
         n = self._market_data.n_bars
         if idx <= self._book.entry_bar:
             return None
-        for reason, triggered in self._book.close_exits:
+        for i in range(len(self._book.close_exits)):
+            reason, fraction, triggered = self._book.close_exits[i]
             if idx < n and bool(triggered[idx]):
-                return reason
+                self._book.close_exits.pop(i)
+                return reason, fraction
         return None
 
     def _maintain_exits(self, bar: Bar, idx: int) -> None:

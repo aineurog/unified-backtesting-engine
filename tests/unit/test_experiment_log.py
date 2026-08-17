@@ -4,6 +4,7 @@ import importlib.metadata
 import json
 import sqlite3
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,13 @@ import pytest
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import BacktestRuntimeError, ConfigError, DataShapeError
-from ube.core.experiment_log import DataReference, ExperimentLog, RecordInput
+from ube.core.experiment_log import (
+    DataReference,
+    ExperimentLog,
+    RecordInput,
+    _expand_home,
+    _resolve_path,
+)
 from ube.core.instrument import Instrument
 
 # ---------------------------------------------------------------------------
@@ -374,3 +381,47 @@ def test_code_version_fallback_unknown(monkeypatch, tmp_path):
     log = ExperimentLog(path=tmp_path / "exp.db")
     _record(log, "run-1")
     assert log.get("run-1").code_version == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_path / _expand_home (§4.8): explicit > env var > default, `~` honors $HOME.
+# ---------------------------------------------------------------------------
+
+
+def test_expand_home_tilde_honors_home_env(monkeypatch):
+    monkeypatch.setenv("HOME", "C:/fake/home")
+    assert _expand_home("~") == Path("C:/fake/home")
+
+
+def test_expand_home_tilde_slash_appends_relative_path(monkeypatch):
+    monkeypatch.setenv("HOME", "C:/fake/home")
+    assert _expand_home("~/ube/exp.db") == Path("C:/fake/home/ube/exp.db")
+
+
+def test_expand_home_tilde_falls_back_when_home_unset(monkeypatch):
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    assert _expand_home("~") == Path.home()
+
+
+def test_expand_home_plain_path_is_unchanged():
+    assert _expand_home("relative/dir/exp.db") == Path("relative/dir/exp.db")
+    assert _expand_home("C:/abs/exp.db") == Path("C:/abs/exp.db")
+
+
+def test_resolve_path_explicit_wins_over_env(monkeypatch):
+    monkeypatch.setenv("BACKTEST_LOG_PATH", "C:/env/exp.db")
+    monkeypatch.setenv("HOME", "C:/fake/home")
+    assert _resolve_path("~/ube/exp.db") == Path("C:/fake/home/ube/exp.db")
+
+
+def test_resolve_path_env_var_when_no_explicit(monkeypatch):
+    monkeypatch.setenv("BACKTEST_LOG_PATH", "~/env/exp.db")
+    monkeypatch.setenv("HOME", "C:/fake/home")
+    assert _resolve_path(None) == Path("C:/fake/home/env/exp.db")
+
+
+def test_resolve_path_default_when_nothing_set(monkeypatch):
+    monkeypatch.delenv("BACKTEST_LOG_PATH", raising=False)
+    monkeypatch.setenv("HOME", "C:/fake/home")
+    assert _resolve_path(None) == Path("C:/fake/home/.backtest/experiments.db")

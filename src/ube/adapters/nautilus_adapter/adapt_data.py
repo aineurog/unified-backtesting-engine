@@ -27,7 +27,6 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 
 from ube.adapters.nautilus_adapter.instrument_map import NautilusInstrumentBuild
-from ube.core.calendar import _asi8
 from ube.core.data import MarketData
 from ube.core.errors import DataShapeError, InvalidSignalError
 from ube.core.signals import Signals
@@ -66,7 +65,9 @@ def derive_bar_period_ns(market_data: MarketData) -> int:
             f"cannot derive a bar period from {market_data.n_bars} bar(s); "
             "require at least two bars"
         )
-    deltas = np.diff(_asi8(market_data.timestamps))
+    deltas = np.diff(
+        market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    )
     return int(np.median(deltas[deltas > 0]))
 
 
@@ -125,7 +126,7 @@ def to_nautilus_bars(
     bar_type = build_bar_type(build.instrument_id, derive_bar_period_ns(market_data))
     price_precision = int(build.instrument.price_precision)
     size_precision = int(build.instrument.size_precision)
-    ts_ns = _asi8(market_data.timestamps)
+    ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
 
     bars: list[Bar] = []
     for i in range(market_data.n_bars):
@@ -171,7 +172,7 @@ def to_signal_map(
             f"signals cover {signals.n_bars} bars but market data has "
             f"{market_data.n_bars}; signal rows must be row-aligned with bars"
         )
-    ts_ns = _asi8(market_data.timestamps)
+    ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
     return {
         int(ts_ns[i]): (
             bool(signals.long_entry[i]),
