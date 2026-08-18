@@ -1,0 +1,26 @@
+{
+  "asset_class": "crypto_perp",
+  "instrument": "BTC-USDT",
+  "strategy": "trivial_long_roundtrip",
+  "locked_at": "2026-08-18",
+  "tolerance": {
+    "final_equity_rtol": 1e-6
+  },
+  "engines": {
+    "vectorbt": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "backtrader": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "nautilus": {
+      "final_equity": 87535.35303,
+      "n_trades": 1,
+      "trades_hash": "a3fb860f15150ce2f67e027b22ac574ec76517322ccd4b31e54e40cd9d66ad81"
+    }
+  }
+}

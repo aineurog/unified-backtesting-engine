@@ -1,0 +1,26 @@
+{
+  "asset_class": "futures",
+  "instrument": "ES",
+  "strategy": "trivial_long_roundtrip",
+  "locked_at": "2026-08-18",
+  "tolerance": {
+    "final_equity_rtol": 1e-6
+  },
+  "engines": {
+    "vectorbt": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "backtrader": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "nautilus": {
+      "final_equity": 91725.0,
+      "n_trades": 1,
+      "trades_hash": "c7513482aec47c37d0a195a47f0c5ba31b961d454ea4dd9e1ec2771b7262adba"
+    }
+  }
+}

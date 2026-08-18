@@ -15,9 +15,10 @@ plan §3.1 / requirements §4.5 / §16:
 +----------------+------------------------+---------------------------------------------+
 
 Precision/increments come from the canonical ``tick_size`` / ``contract_multiplier``,
-with the reference ``constants.py`` values as fallback defaults. Fees are **always**
-``0.0`` here — they are set once from the core cost model in ``adapter.py`` (plan §5.3),
-never in this module.
+with the reference ``constants.py`` values as fallback defaults. Fees default to
+``0.0`` and are set from the ``maker_fee`` / ``taker_fee`` overrides — the adapter
+folds the core cost model's ``commission + slippage`` into both at construction
+(plan §5.3); this module never invents a fee.
 """
 
 from __future__ import annotations
@@ -168,6 +169,20 @@ def _margin(overrides: Mapping[str, Any]) -> tuple[Decimal, Decimal]:
     return margin_init, margin_init / Decimal("2")
 
 
+def _fees(overrides: Mapping[str, Any]) -> tuple[Decimal, Decimal]:
+    """Resolve ``(maker_fee, taker_fee)`` from the override fraction (default ``0``).
+
+    The override fees are *fractions of notional* charged per fill (plan §5.3): the
+    adapter folds ``cost_model.commission + slippage`` into both fees at construction,
+    so Nautilus's fill accounting reports the same per-fill cost as the core cost
+    model. A missing override defaults to ``0`` (zero-cost, §7.1).
+    """
+    return (
+        Decimal(str(overrides.get("maker_fee", 0.0))),
+        Decimal(str(overrides.get("taker_fee", 0.0))),
+    )
+
+
 def _symbol_id(canonical: Instrument, overrides: Mapping[str, Any]) -> tuple[InstrumentId, Symbol]:
     """Build the ``InstrumentId`` (canonical symbol verbatim on the synthetic venue)."""
     venue = Venue(str(overrides.get("venue", DEFAULT_VENUE)))
@@ -186,6 +201,7 @@ def _build_futures(
     instrument_id, raw_symbol = _symbol_id(canonical, overrides)
     price_precision, price_increment = _precision(canonical, overrides)
     margin_init, margin_maint = _margin(overrides)
+    maker_fee, taker_fee = _fees(overrides)
     _, quote = _base_quote(canonical)
     multiplier = canonical.contract_multiplier if canonical.contract_multiplier is not None else 1.0
     asset_class = (
@@ -207,8 +223,8 @@ def _build_futures(
         ts_init=0,
         margin_init=margin_init,
         margin_maint=margin_maint,
-        maker_fee=Decimal("0"),
-        taker_fee=Decimal("0"),
+        maker_fee=maker_fee,
+        taker_fee=taker_fee,
     )
     return instrument, instrument_id
 
@@ -220,6 +236,7 @@ def _build_crypto_perp(
     price_precision, price_increment = _precision(canonical, overrides)
     size_precision, size_increment = _size(canonical, overrides)
     margin_init, margin_maint = _margin(overrides)
+    maker_fee, taker_fee = _fees(overrides)
     base, quote = _base_quote(canonical)
     settlement = canonical.settlement_currency or quote
     instrument = CryptoPerpetual(
@@ -239,8 +256,8 @@ def _build_crypto_perp(
         lot_size=Quantity.from_int(1),
         margin_init=margin_init,
         margin_maint=margin_maint,
-        maker_fee=Decimal("0"),
-        taker_fee=Decimal("0"),
+        maker_fee=maker_fee,
+        taker_fee=taker_fee,
     )
     return instrument, instrument_id
 
@@ -251,6 +268,7 @@ def _build_equity(
     instrument_id, raw_symbol = _symbol_id(canonical, overrides)
     price_precision, price_increment = _precision(canonical, overrides)
     margin_init, margin_maint = _margin(overrides)
+    maker_fee, taker_fee = _fees(overrides)
     _, quote = _base_quote(canonical)
     instrument = Equity(
         instrument_id=instrument_id,
@@ -263,8 +281,8 @@ def _build_equity(
         ts_init=0,
         margin_init=margin_init,
         margin_maint=margin_maint,
-        maker_fee=Decimal("0"),
-        taker_fee=Decimal("0"),
+        maker_fee=maker_fee,
+        taker_fee=taker_fee,
     )
     return instrument, instrument_id
 
@@ -276,6 +294,7 @@ def _build_currency_pair(
     price_precision, price_increment = _precision(canonical, overrides)
     size_precision, size_increment = _size(canonical, overrides)
     margin_init, margin_maint = _margin(overrides)
+    maker_fee, taker_fee = _fees(overrides)
     base, quote = _base_quote(canonical)
     instrument = CurrencyPair(
         instrument_id=instrument_id,
@@ -292,8 +311,8 @@ def _build_currency_pair(
         lot_size=Quantity.from_int(1),
         margin_init=margin_init,
         margin_maint=margin_maint,
-        maker_fee=Decimal("0"),
-        taker_fee=Decimal("0"),
+        maker_fee=maker_fee,
+        taker_fee=taker_fee,
     )
     return instrument, instrument_id
 
@@ -322,14 +341,16 @@ def build_instrument(
 
     The synthetic venue and per-asset-class Nautilus class follow plan §3.1; precision and
     increments come from the canonical ``tick_size`` / ``contract_multiplier`` (with
-    reference defaults as fallback). ``maker_fee`` / ``taker_fee`` are always ``0.0`` here —
-    fees are applied once from the core cost model in ``adapter.py``.
+    reference defaults as fallback). ``maker_fee`` / ``taker_fee`` are taken from the
+    overrides (default ``0.0``) — the adapter folds the core cost model's
+    ``commission + slippage`` into both (plan §5.3).
 
     Args:
         canonical: The canonical :class:`~ube.core.instrument.Instrument`.
         overrides: Validated
             :class:`~ube.adapters.nautilus_adapter.overrides.NautilusEngineOverrides`
-            (``venue``, ``price_precision``, ``size_precision``, ``leverage``).
+            (``venue``, ``price_precision``, ``size_precision``, ``leverage``,
+            ``maker_fee``, ``taker_fee``).
 
     Returns:
         The built Nautilus instrument plus its :class:`InstrumentId`.

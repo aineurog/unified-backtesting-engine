@@ -30,7 +30,7 @@ Behavior summary (each item maps to a plan §4.5 bullet):
   working risk orders are cancelled (reference ``_cancel_live_risk_orders``), so a stale
   TP cannot fill against a later position. On every bar while open, working exit
   orders are re-synchronised to the remaining position quantity (scale-outs) and native
-  stop triggers are moved to the next bar's precomputed level.
+  stop triggers are moved to the just-completed bar's precomputed level.
 * **exit_reason stamping** — the reason (``signal``, ``take_profit``, ``atr_stop``,
   ``trailing_stop``, ``chandelier``, ``time_exit``) is recorded per closing fill in
   :attr:`exit_reasons` (keyed by client-order id) so the adapter can stamp the ledger's
@@ -39,12 +39,14 @@ Behavior summary (each item maps to a plan §4.5 bullet):
 Trigger timing notes (probe-verified against Nautilus 1.221.0 backtest matching):
 
 * Orders submitted during ``on_bar(bar_i)`` become active for bar ``i+1`` matching; so a
-  touched stop is submitted at ``level[entry_bar + 1]`` and re-targeted to ``level[i+1]``
-  during each subsequent ``on_bar(bar_i)``. Because the canonical trailing/chandelier
-  level for bar ``j`` is defined on the completed-bar running extreme through ``j``, the
-  precomputed ``level[i+1]`` reproduces :func:`~ube.core.risk.exits.exit_triggered`
-  exactly (no net lookahead — the *value* is the one the reference per-bar rule uses for
-  bar ``i+1``).
+  touched stop is submitted at ``level[entry_bar]`` (the most recent level computable at
+  submission) and re-targeted to the precomputed ``level[i]`` during each subsequent
+  ``on_bar(bar_i)``. The venue rejects a stop whose trigger is already "in the market" at
+  submission/modify time, so the trigger can only ever be a level the *completed* history
+  supports — the precomputed arrays let each bar ratchet the trigger to the value the
+  reference per-bar rule would use for bar ``i``, evaluated one bar forward (the level for
+  bar ``i+1`` uses only data through bar ``i`` — no lookahead, matching the reference's
+  ATR "shifted one bar forward" note in ``strategy/core.py``).
 * Touched exits trigger before the bar's close-time work (§8: intra-bar precedes
   close-time). On the entry bar the position opens at the close, so the entry-bar trigger
   row is ignored (a stop is live from the next bar).
@@ -343,7 +345,6 @@ class UbeActor(Strategy):  # type: ignore[misc]
     # -- exit book (plan §4.5 item 3) ----------------------------------------
 
     def _setup_book(self, *, side: int, entry_bar: int, entry_price: float, size: Quantity) -> None:
-        n = self._market_data.n_bars
         plan = scale_out_plan(
             self._exits,
             market_data=self._market_data,
@@ -393,13 +394,14 @@ class UbeActor(Strategy):  # type: ignore[misc]
                     order=order, reason=reason, fraction=fraction
                 )
             else:
-                # ATRStop / TrailingStop / Chandelier: the trigger is the precomputed
-                # level of the NEXT bar to be matched (active from entry_bar+1).
-                target = (
-                    float(levels[entry_bar + 1])
-                    if entry_bar + 1 < n
-                    else float(levels[entry_bar])
-                )
+                # ATRStop / TrailingStop / Chandelier: a native stop_market whose trigger
+                # is placed at the level computable on the entry bar, then ratcheted by
+                # _maintain_exits on each later bar. The initial trigger must be *outside*
+                # the market at submission (the venue rejects a stop already "in the
+                # market", probe-verified on Nautilus 1.221.0), so the entry-bar level —
+                # not the next bar's — is used (levels[entry_bar + 1] only exists once
+                # bar entry_bar+1 has completed).
+                target = float(levels[entry_bar])
                 order = self.order_factory.stop_market(
                     self.instrument_id,
                     exit_side,
@@ -464,9 +466,14 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 self._book.live.pop(cid, None)
                 continue
             trigger = None
-            if live.levels is not None and idx + 1 < n:
-                trigger = self._fmt_price(float(live.levels[idx + 1]))
+            if live.levels is not None and idx < n:
+                trigger = self._fmt_price(float(live.levels[idx]))
             qty_same = float(order.quantity.as_double()) == float(new_qty.as_double())
+            trigger_same = trigger is not None and order.trigger_price is not None and (
+                float(order.trigger_price.as_double()) == float(trigger)
+            )
+            if qty_same and (trigger is None or trigger_same):
+                continue
             try:
                 if trigger is not None and not qty_same:
                     self.modify_order(order, quantity=new_qty, trigger_price=trigger)

@@ -19,6 +19,7 @@ from ube.adapters.nautilus_adapter.overrides import (
     DEFAULT_VENUE,
     validate_overrides,
 )
+from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidInstrumentError, InvalidSignalError
 from ube.core.signals import from_target
 from ube.testing.synthetic import PRESETS, synthetic_bars
@@ -568,6 +569,729 @@ def test_to_signal_map_length_mismatch_raises():
     sig = from_target([0, 1, 1])
     with pytest.raises(InvalidSignalError, match="row-aligned"):
         to_signal_map(md, sig)
+
+
+# ---------------------------------------------------------------------------
+# Step 6: end-to-end Nautilus runs — ledger fold + BacktestResult (§4.5, §4.6, §7.3).
+# ---------------------------------------------------------------------------
+
+
+def _bars_from_rows(rows, *, columns=("open", "high", "low", "close"), volume=100.0):
+    """Build a MarketData from ``"ts,open,high,low,close[,volume]"`` CSV-like rows.
+
+    The adaptive bar model splits a market fill into sub-fills whose quantity depends
+    on the bar's range and volume, so tests must not pin individual sub-fill sizes —
+    aggregate quantities are the stable contract. ``volume`` defaults to ``100.0``
+    (the synthetic-fixture convention) and is overridable per row via a 6th field.
+    """
+    import pandas as pd
+
+    arrays = {col: [] for col in columns}
+    timestamps = []
+    for row in rows:
+        parts = row.split(",")
+        timestamps.append(parts[0])
+        for i, col in enumerate(columns):
+            arrays[col].append(float(parts[i + 1]))
+    selected = (
+        np.full(len(rows), volume)
+        if len(rows[0].split(",")) <= 5
+        else np.asarray([float(r.split(",")[5]) for r in rows])
+    )
+    return MarketData(
+        open=np.asarray(arrays["open"]),
+        high=np.asarray(arrays["high"]),
+        low=np.asarray(arrays["low"]),
+        close=np.asarray(arrays["close"]),
+        volume=selected,
+        index=pd.DatetimeIndex(timestamps).as_unit("ns"),
+    )
+
+
+def _fills(result):
+    from ube.core.ledger import EventType
+
+    return [e for e in result.ledger if e.event_type is EventType.FILL]
+
+
+def _ledger_events(result, event_type):
+    return [e for e in result.ledger if e.event_type is event_type]
+
+
+def test_nautilus_full_loop_futures_signal_roundtrip():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.ledger import EventType
+
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
+    signals = from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+    result = NautilusAdapter().run(
+        md,
+        signals,
+        BacktestConfig(
+            instrument=PRESETS["futures"].instrument,
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+
+    fills = _fills(result)
+    assert len(fills) == 2
+    # Entry fills at the signal bar's close; the signal exit at the next close.
+    assert [(e.side, e.quantity, e.price, e.exit_reason) for e in fills] == [
+        (1, 20.0, 5002.5, None),
+        (-1, 20.0, 4989.5, "signal"),
+    ]
+    assert sum(e.quantity for e in fills[:-1]) == 20.0  # no scale-out partials
+    (trade,) = result.trades
+    assert trade.quantity == 20.0
+    assert trade.entry_price == 5002.5
+    assert trade.exit_price == 4989.5
+    assert trade.exit_reason == "signal"
+    assert trade.net_pnl == -13000.0  # 20 * multiplier 50 * (4989.5 - 5002.5)
+    # Self-financing equity (zero-cost model): last == starting + realized.
+    assert float(result.equity_curve.equity[0]) == 100000.0
+    assert float(result.equity_curve.equity[-1]) == 87000.0
+    assert not _ledger_events(result, EventType.COMMISSION)
+    assert not _ledger_events(result, EventType.FUNDING_PAYMENT)
+
+
+def test_nautilus_full_loop_flat_run_stays_flat():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.ledger import EventType
+
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
+    result = NautilusAdapter().run(
+        md,
+        from_target([0] * 12),
+        BacktestConfig(
+            instrument=PRESETS["futures"].instrument,
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+
+    assert _fills(result) == []
+    assert result.trades == ()
+    assert not _ledger_events(result, EventType.FILL)
+    assert (result.equity_curve.equity == 100000.0).all()
+
+
+def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.cost import CostModel
+    from ube.core.ledger import EventType
+
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    result = NautilusAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            cost_model=CostModel(commission=0.0005, slippage=0.0002, funding=0.0001),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+
+    fills = _fills(result)
+    assert len(fills) == 2
+    assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
+        (1, 1.652, 60535.9, None),
+        (-1, 1.652, 60693.9, "signal"),
+    ]
+    commissions = _ledger_events(result, EventType.COMMISSION)
+    fundings = _ledger_events(result, EventType.FUNDING_PAYMENT)
+    assert len(commissions) == 2
+    assert all(e.amount > 0.0 for e in commissions)  # commission + slippage, per fill
+    assert len(fundings) == 3  # three held bars between the entry and exit bars
+    assert all(e.amount > 0.0 for e in fundings)
+    (trade,) = result.trades
+    assert trade.exit_reason == "signal"
+    assert trade.net_pnl == pytest.approx(90.7002, rel=1e-4)  # gross less fees + funding
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.7002, rel=1e-6)
+
+
+def test_nautilus_full_loop_crypto_perp_short_pays_loss():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.cost import CostModel
+    from ube.core.ledger import EventType
+
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    result = NautilusAdapter().run(
+        md,
+        from_target([0, -1, -1, -1, 0, 0, 0, 0, 0, 0]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            cost_model=CostModel(commission=0.0005, slippage=0.0002, funding=0.0001),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+
+    fills = _fills(result)
+    assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
+        (-1, 1.652, 60535.9, None),
+        (1, 1.652, 60693.9, "signal"),
+    ]
+    (trade,) = result.trades
+    assert trade.side == -1
+    assert trade.net_pnl == pytest.approx(-431.3318, rel=1e-4)
+    assert len(_ledger_events(result, EventType.COMMISSION)) == 2
+    assert len(_ledger_events(result, EventType.FUNDING_PAYMENT)) == 3
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(99568.6682, rel=1e-6)
+
+
+def test_nautilus_cash_account_short_rejection_raises_engine_error():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import EngineError
+
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
+    with pytest.raises(EngineError, match="market order rejected by the venue"):
+        NautilusAdapter().run(
+            md,
+            from_target([0, -1, -1, -1, -1, -1]),
+            BacktestConfig(
+                instrument=PRESETS["stocks"].instrument,
+                engine_overrides={"account_type": "cash"},
+            ),
+        )
+
+
+# Reference mirror: rows 2026-08-03 12:00 -> 23:00 of the nautilus_trader
+# TRAILING_stop_test.csv feedstock with a 0.1% trailing stop.
+_TRAILING_REFERENCE_ROWS = [
+    "2026-08-03 12:00:00+00:00,65000.0,65005.0,64995.0,65000.0,1.0",
+    "2026-08-03 13:00:00+00:00,65064.99999999999,65078.01299999999,65051.986999999994,65064.99999999999,1.0",  # noqa: E501
+    "2026-08-03 14:00:00+00:00,65130.06499999999,65143.09101299998,65117.03898699999,65130.06499999999,1.0",  # noqa: E501
+    "2026-08-03 15:00:00+00:00,65195.19506499998,65208.234104012976,65182.15602598698,65195.19506499998,1.0",  # noqa: E501
+    "2026-08-03 16:00:00+00:00,65260.390260064974,65273.44233811698,65247.338182012965,65260.390260064974,1.0",  # noqa: E501
+    "2026-08-03 17:00:00+00:00,65325.650650325035,65338.715780455095,65312.585520194974,65325.650650325035,1.0",  # noqa: E501
+    "2026-08-03 18:00:00+00:00,65390.97630097535,65404.05449623554,65377.89810571516,65390.97630097535,1.0",  # noqa: E501
+    "2026-08-03 19:00:00+00:00,65456.36727727632,65469.45855073177,65443.276003820865,65456.36727727632,1.0",  # noqa: E501
+    "2026-08-03 20:00:00+00:00,65521.82364455359,65534.9280092825,65508.719279824676,65521.82364455359,1.0",  # noqa: E501
+    "2026-08-03 21:00:00+00:00,65587.34546819814,65600.46293729177,65574.2279991045,65587.34546819814,1.0",  # noqa: E501
+    "2026-08-03 22:00:00+00:00,65652.93281366632,65666.06340022906,65639.80222710359,65652.93281366632,1.0",  # noqa: E501
+    "2026-08-03 23:00:00+00:00,65455.97401522532,65469.06521002836,65442.88282042228,65455.97401522532,1.0",  # noqa: E501
+]
+
+
+def test_nautilus_reference_trailing_stop_mirror():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import RiskConfig, TrailingStop
+
+    data = _bars_from_rows(_TRAILING_REFERENCE_ROWS)
+    result = NautilusAdapter().run(
+        data,
+        from_target([1] * 12),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(TrailingStop(0.001),)),
+        ),
+    )
+
+    # Entry splits: all-in sizing on 100000 at ~65000 -> 1.538 BTC in two fills; the
+    # trailing stop is armed at the running peak * 0.999 and fires on the last (drop)
+    # bar — the reference journals its exit on this same 23:00 bar.
+    fills = _fills(result)
+    assert len(fills) == 4
+    assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
+        (1, 0.25, 65000.0, None),
+        (1, 1.288, 65000.1, None),
+        (-1, 0.25, 65600.4, "trailing_stop"),
+        (-1, 1.288, 65600.3, "trailing_stop"),
+    ]
+    (trade,) = result.trades
+    assert trade.exit_reason == "trailing_stop"
+    assert trade.entry_price == pytest.approx(65000.0837, abs=1e-3)
+    assert trade.exit_price == pytest.approx(65600.4, abs=1e-1)
+    assert trade.net_pnl == pytest.approx(712.2074, rel=1e-4)
+    assert float(result.equity_curve.equity[0]) == pytest.approx(99939.8891, abs=1e-3)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100712.2074, rel=1e-6)
+
+
+def test_nautilus_touched_take_profit_stamps_exit_reason():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import RiskConfig, TakeProfit
+
+    # Short TP: the 97.50 low on the third bar crosses entry*(1-0.02) = 98.0.
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 02:00:00+00:00,100.00,100.50,97.50,98.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([-1, -1, -1]),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,  # 1000-share lot via integer size
+            risk=RiskConfig(exit=(TakeProfit(0.02),)),
+        ),
+    )
+
+    fills = _fills(result)
+    assert [(e.side, e.quantity, e.price, e.exit_reason) for e in fills] == [
+        (-1, 25.0, 100.0, None),
+        (-1, 975.0, 99.99, None),
+        (1, 25.0, 98.0, "take_profit"),
+        (1, 975.0, 98.0, "take_profit"),
+    ]
+    (trade,) = result.trades
+    assert (trade.side, trade.exit_reason) == (-1, "take_profit")
+    assert trade.net_pnl == pytest.approx(1990.25, rel=1e-4)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(101990.25, rel=1e-6)
+
+
+def test_nautilus_trailing_and_chandelier_ratchet_without_lookahead():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import (
+        ChandelierExit,
+        RiskConfig,
+        TrailingStop,
+    )
+    from ube.core.risk.exits import atr, chandelier_level, trailing_stop_level
+
+    rows = [
+        "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
+        "2024-01-01 01:00:00+00:00,100.00,104.00,100.00,103.00",
+        "2024-01-01 02:00:00+00:00,103.00,103.00,101.00,102.00",
+    ]
+    data = _bars_from_rows(rows)
+
+    trailing = NautilusAdapter().run(
+        data,
+        from_target([1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,
+            risk=RiskConfig(exit=(TrailingStop(0.02),)),
+        ),
+    )
+    assert [(e.quantity, e.price, e.exit_reason) for e in _fills(trailing)[2:]] == [
+        (25.0, 101.92, "trailing_stop"),
+        (975.0, 101.91, "trailing_stop"),
+    ]
+    assert trailing_stop_level(TrailingStop(0.02), data, side=1, entry_bar=0)[2] == pytest.approx(
+        101.92, abs=1e-9
+    )
+
+    chandelier = NautilusAdapter().run(
+        data,
+        from_target([1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,
+            risk=RiskConfig(exit=(ChandelierExit(2),)),
+        ),
+    )
+    # Ratchet uses only connected bars: the level for bar 1 (104 - 2*ATR[1]) triggers
+    # on bar 2. The pre-fix lookahead used bar 2's own ATR (104 - 2*ATR[2] = 101.46).
+    assert [(e.quantity, e.price, e.exit_reason) for e in _fills(chandelier)[2:]] == [
+        (25.0, 101.57, "chandelier"),
+        (975.0, 101.56, "chandelier"),
+    ]
+    assert chandelier_level(
+        ChandelierExit(2), data, side=1, entry_bar=0, atr_series=atr(data)
+    )[1] == pytest.approx(101.5714, abs=1e-3)
+    assert (
+        chandelier_level(ChandelierExit(2), data, side=1, entry_bar=0, atr_series=atr(data))[2]
+        < 101.5
+    )  # lookahead would be here
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Actor — entries, flips, exits, trigger modes, scale-out, precedence.
+# ---------------------------------------------------------------------------
+
+
+def _fills_by_reason(result, reason):
+    return [e for e in _fills(result) if e.exit_reason == reason]
+
+
+def test_nautilus_actor_entry_sized_in_integer_contracts():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.ledger import EventType
+
+    # 100000 / 5000.0 close = 20 whole ES contracts (size precision 0).
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,5000.00,5008.00,4992.00,5000.00",
+            "2024-01-01 01:00:00+00:00,5000.00,5012.00,4990.00,5004.00",
+            "2024-01-01 02:00:00+00:00,5004.00,5015.00,4998.00,5010.00",
+        ],
+        volume=100.0,
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([1, 1, 1]),
+        BacktestConfig(instrument=PRESETS["futures"].instrument),
+    )
+    fills = _fills(result)
+    assert all(e.side == 1 and e.exit_reason is None for e in fills)
+    assert sum(e.quantity for e in fills) == pytest.approx(20.0, abs=1e-9)
+    assert result.trades == ()
+    (position_value,) = [
+        e.position_after
+        for e in result.ledger
+        if e.event_type is EventType.POSITION_CHANGE
+    ]
+    assert position_value == 20.0  # remains flat after entry, one contract block
+
+
+def test_nautilus_actor_same_bar_flip_closes_and_opens():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,102.00,99.90,101.00",
+            "2024-01-01 02:00:00+00:00,101.00,103.00,100.50,102.50",
+            "2024-01-01 03:00:00+00:00,102.50,103.50,100.00,101.00",
+            "2024-01-01 04:00:00+00:00,101.00,101.50,98.50,99.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([0, 1, 1, -1, 0]),
+        BacktestConfig(instrument=PRESETS["stocks"].instrument),
+    )
+
+    fills = _fills(result)
+    assert len(fills) == 8
+    entries = [e for e in fills if e.exit_reason is None]
+    signals = _fills_by_reason(result, "signal")
+    # Two entries (long + short) and two signal closes, each as a pair of fills.
+    assert len(entries) == 4 and len(signals) == 4
+    long_entry = sum(e.quantity for e in entries if e.side > 0)
+    short_entry = sum(e.quantity for e in entries if e.side < 0)
+    long_close = sum(e.quantity for e in signals if e.side < 0)
+    short_close = sum(e.quantity for e in signals if e.side > 0)
+    assert long_entry == pytest.approx(long_close, rel=1e-9)
+    assert short_entry == pytest.approx(short_close, rel=1e-9)
+    assert len(result.trades) == 2
+    assert all(t.exit_reason == "signal" for t in result.trades)
+    last_position = result.positions.position[-1]
+    assert last_position == 0.0  # flat again after the second signal close
+
+
+def test_nautilus_actor_atr_stop_touched_fills_at_trigger():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import ATRStop, RiskConfig
+    from ube.core.risk.exits import exit_level
+
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,101.00,99.50,100.50",
+            "2024-01-01 01:00:00+00:00,100.50,102.00,99.00,99.50",
+            "2024-01-01 02:00:00+00:00,99.50,100.00,95.00,95.50",
+            "2024-01-01 03:00:00+00:00,95.50,96.00,94.00,94.50",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,
+            risk=RiskConfig(exit=(ATRStop(2),)),
+        ),
+    )
+
+    fills = _fills(result)
+    assert len(fills) == 4
+    entries = [e for e in fills if e.exit_reason is None]
+    stops = _fills_by_reason(result, "atr_stop")
+    assert len(entries) == 2 and len(stops) == 2
+    assert all(e.side == 1 for e in entries)
+    assert all(e.side == -1 and round(e.price, 2) in (97.29, 97.28) for e in stops)  # trigger
+    (trade,) = result.trades
+    assert trade.exit_reason == "atr_stop"
+    assert trade.entry_price == pytest.approx(100.51, abs=1e-2)
+    assert trade.exit_price == pytest.approx(97.28, abs=1e-2)
+    assert trade.net_pnl == pytest.approx(-3213.35, rel=1e-3)
+    # The ratcheted trigger is the level on the last completed bar (no lookahead).
+    assert (
+        exit_level(ATRStop(2), market_data=data, side=1, entry_price=100.5, entry_bar=0)[1]
+        == pytest.approx(97.2857, abs=1e-3)
+    )
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(96786.65, rel=1e-6)
+
+
+def test_nautilus_actor_time_exit_closes_at_hold_bar():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.ledger import EventType
+    from ube.core.risk import RiskConfig, TimeExit
+
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,101.00,99.50,101.00",
+            "2024-01-01 02:00:00+00:00,101.00,102.00,100.50,102.00",
+            "2024-01-01 03:00:00+00:00,102.00,103.00,101.50,103.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,
+            risk=RiskConfig(exit=(TimeExit(2),)),
+        ),
+    )
+
+    fills = _fills(result)
+    assert len(fills) == 4
+    times = _fills_by_reason(result, "time_exit")
+    assert len(times) == 2
+    assert all(round(e.price, 2) in (102.0, 101.99) for e in times)  # hold bar's close
+    assert not _fills_by_reason(result, "signal")
+    (trade,) = result.trades
+    assert trade.exit_reason == "time_exit"
+    assert trade.net_pnl == pytest.approx(1980.5, rel=1e-3)
+    evaluated = {
+        int(e.timestamp): e.action
+        for e in result.ledger
+        if e.event_type is EventType.SIGNAL_EVALUATED
+    }
+    assert evaluated[int(data.timestamps.asi8[2])] == "exit_time_exit"
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(101980.5, rel=1e-6)
+
+
+def test_nautilus_actor_close_trigger_mode_ignores_intra_bar_touch():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.ledger import EventType
+    from ube.core.risk import RiskConfig, TakeProfit
+
+    # Bar 2's high (103.0) touches the target but its close (99.0) does not; only bar 3's
+    # close (103.0, above entry*1.02=102.51) may trigger a close-mode exit.
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,101.00,99.00,100.50",
+            "2024-01-01 02:00:00+00:00,100.50,103.00,99.00,99.00",
+            "2024-01-01 03:00:00+00:00,99.00,103.50,98.50,103.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([0, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,
+            risk=RiskConfig(exit=(TakeProfit(0.02, trigger="close"),)),
+        ),
+    )
+
+    fills = _fills(result)
+    assert len(fills) == 4
+    targets = _fills_by_reason(result, "take_profit")
+    assert len(targets) == 2
+    assert all(e.timestamp == int(data.timestamps.asi8[3]) for e in targets)  # bar 3, not 2
+    assert all(round(e.price, 2) in (103.0, 102.99) for e in targets)
+    (trade,) = result.trades
+    assert trade.exit_reason == "take_profit"
+    assert trade.net_pnl == pytest.approx(2468.1, rel=1e-3)
+    evaluated = {
+        int(e.timestamp): e.action
+        for e in result.ledger
+        if e.event_type is EventType.SIGNAL_EVALUATED
+    }
+    assert evaluated[int(data.timestamps.asi8[3])] == "exit_take_profit"
+
+
+def test_nautilus_actor_scale_out_take_profit_then_signal():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import RiskConfig, TakeProfit
+
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,101.00,99.00,100.50",
+            "2024-01-01 02:00:00+00:00,100.50,103.00,100.00,102.00",
+            "2024-01-01 03:00:00+00:00,102.00,103.00,101.50,102.50",
+            "2024-01-01 04:00:00+00:00,102.50,103.00,100.00,101.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([0, 1, 1, 1, 0]),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,
+            risk=RiskConfig(exit=(TakeProfit(0.02, scale_out=0.4),)),
+        ),
+    )
+
+    fills = _fills(result)
+    entry_total = sum(e.quantity for e in fills if e.exit_reason is None)
+    partials = [e for e in fills if e.exit_reason == "take_profit"]
+    signal_close = [e for e in fills if e.exit_reason == "signal"]
+    assert all(round(e.price, 2) == 102.51 for e in partials)  # target = last close * 1.02
+    assert sum(e.quantity for e in partials) == pytest.approx(entry_total * 0.4, rel=1e-9)
+    assert sum(e.quantity for e in signal_close) == pytest.approx(entry_total * 0.6, rel=1e-9)
+    (trade,) = result.trades
+    assert trade.exit_reason == "signal"  # the final (larger) close wins the round trip
+    assert trade.net_pnl == pytest.approx(1083.06, rel=1e-3)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(101083.06, rel=1e-6)
+
+
+def test_nautilus_actor_close_time_exit_precedes_close_time_signal():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.ledger import EventType
+    from ube.core.risk import RiskConfig, TimeExit
+
+    # Bar 2 both reaches the 2-bar time exit AND a long_exit signal. Close-time risk
+    # exits are evaluated before close-time signal actions (§8), so a single close with
+    # reason "time_exit" results, never a duplicate signal close.
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,101.00,99.50,101.00",
+            "2024-01-01 02:00:00+00:00,101.00,102.00,100.50,102.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([1, 1, 0]),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,
+            risk=RiskConfig(exit=(TimeExit(2),)),
+        ),
+    )
+
+    fills = _fills(result)
+    assert len(fills) == 4  # one entry pair + exactly one closing pair
+    assert not _fills_by_reason(result, "signal")
+    assert len(_fills_by_reason(result, "time_exit")) == 2
+    (trade,) = result.trades
+    assert trade.exit_reason == "time_exit"
+    assert trade.net_pnl == pytest.approx(1980.5, rel=1e-3)
+    evaluated = {
+        int(e.timestamp): e.action
+        for e in result.ledger
+        if e.event_type is EventType.SIGNAL_EVALUATED
+    }
+    assert evaluated[int(data.timestamps.asi8[2])] == "exit_time_exit"
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Error hardening — fail-fast inputs, engine exceptions wrapped (§15).
+# ---------------------------------------------------------------------------
+
+
+def test_nautilus_run_rejects_non_market_data_input():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import DataShapeError
+
+    cfg = BacktestConfig(instrument=PRESETS["futures"].instrument)
+    with pytest.raises(DataShapeError, match="MarketData"):
+        NautilusAdapter().run(object(), from_target([0] * 6), cfg)
+
+
+def test_nautilus_run_rejects_non_signals_input():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import InvalidSignalError
+
+    md = synthetic_bars(PRESETS["futures"], n_bars=6)
+    cfg = BacktestConfig(instrument=PRESETS["futures"].instrument)
+    with pytest.raises(InvalidSignalError, match="Signals"):
+        NautilusAdapter().run(md, object(), cfg)
+
+
+def test_nautilus_run_rejects_non_backtest_config():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.errors import ConfigError
+
+    md = synthetic_bars(PRESETS["futures"], n_bars=6)
+    with pytest.raises(ConfigError, match="BacktestConfig"):
+        NautilusAdapter().run(md, from_target([0] * 6), "not-a-config")  # type: ignore[arg-type]
+
+
+def test_nautilus_run_rejects_row_misaligned_signals():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import InvalidSignalError
+
+    md = synthetic_bars(PRESETS["futures"], n_bars=6)
+    cfg = BacktestConfig(instrument=PRESETS["futures"].instrument)
+    with pytest.raises(InvalidSignalError, match="row-aligned"):
+        NautilusAdapter().run(md, from_target([0, 1, 1]), cfg)
+
+
+def test_nautilus_run_rejects_single_bar_data():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import DataShapeError
+
+    md = synthetic_bars(PRESETS["futures"], n_bars=1)
+    cfg = BacktestConfig(instrument=PRESETS["futures"].instrument)
+    with pytest.raises(DataShapeError, match="at least two bars"):
+        NautilusAdapter().run(md, from_target([0]), cfg)
+
+
+def test_nautilus_run_rejects_contradictory_signal_entries():
+    from ube.core.errors import InvalidSignalError
+    from ube.core.signals import Signals
+
+    # Bar 2: both long_entry and short_entry True — rejected in the §6.1 validate
+    # phase at construction (before any engine work), naming the offending bar.
+    with pytest.raises(InvalidSignalError, match="bar 2"):
+        Signals.from_array(
+            np.array(
+                [
+                    [False, False, False, False],
+                    [True, False, False, False],
+                    [True, False, True, False],
+                    [False, False, False, False],
+                ]
+            )
+        )
+
+
+def test_nautilus_engine_exception_wrapped_preserves_cause(monkeypatch):
+    import ube.adapters.nautilus_adapter.adapter as adapter_mod
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import EngineError
+
+    md = synthetic_bars(PRESETS["futures"], n_bars=6)
+    cfg = BacktestConfig(instrument=PRESETS["futures"].instrument)
+
+    class _BoomEngine:
+        def __init__(self, config=None):
+            pass
+
+        def add_venue(self, *args, **kwargs):
+            pass
+
+        def add_instrument(self, *args, **kwargs):
+            pass
+
+        def add_data(self, *args, **kwargs):
+            pass
+
+        def add_strategy(self, *args, **kwargs):
+            pass
+
+        def run(self):
+            raise RuntimeError("engine exploded")
+
+        def dispose(self):
+            pass
+
+    monkeypatch.setattr(adapter_mod, "BacktestEngine", _BoomEngine)
+    with pytest.raises(EngineError, match="nautilus backtest failed") as excinfo:
+        NautilusAdapter().run(md, from_target([0, 1, 1, 0, 0, 0]), cfg)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)  # from original preserved
 
 
 def main() -> int:
