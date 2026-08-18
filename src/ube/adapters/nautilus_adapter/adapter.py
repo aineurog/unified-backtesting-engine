@@ -213,8 +213,12 @@ class NautilusAdapter(EngineAdapter):
         currency = Currency.from_str(settlement)
 
         try:
+            # ube reports failures through EngineError exceptions, not the Nautilus
+            # console log, so silence even ERROR chatter (e.g. the intentional
+            # cash-account short rejection in tests) that would otherwise pollute
+            # backtest output as a scary traceback.
             engine = BacktestEngine(
-                config=BacktestEngineConfig(logging=LoggingConfig(log_level="ERROR"))
+                config=BacktestEngineConfig(logging=LoggingConfig(log_level="OFF"))
             )
             engine.add_venue(
                 venue,

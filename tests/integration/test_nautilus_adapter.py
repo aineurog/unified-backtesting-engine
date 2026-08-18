@@ -1257,7 +1257,7 @@ def test_nautilus_run_rejects_contradictory_signal_entries():
         )
 
 
-def test_nautilus_engine_exception_wrapped_preserves_cause(monkeypatch):
+def test_nautilus_engine_exception_wrapped_preserves_cause():
     import ube.adapters.nautilus_adapter.adapter as adapter_mod
     from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
     from ube.core.config import BacktestConfig
@@ -1288,10 +1288,16 @@ def test_nautilus_engine_exception_wrapped_preserves_cause(monkeypatch):
         def dispose(self):
             pass
 
-    monkeypatch.setattr(adapter_mod, "BacktestEngine", _BoomEngine)
-    with pytest.raises(EngineError, match="nautilus backtest failed") as excinfo:
-        NautilusAdapter().run(md, from_target([0, 1, 1, 0, 0, 0]), cfg)
-    assert isinstance(excinfo.value.__cause__, RuntimeError)  # from original preserved
+    # Patch manually (no monkeypatch) so the module-level ``main()`` direct-run
+    # harness can execute this test too; restore in ``finally``.
+    original = adapter_mod.BacktestEngine
+    adapter_mod.BacktestEngine = _BoomEngine
+    try:
+        with pytest.raises(EngineError, match="nautilus backtest failed") as excinfo:
+            NautilusAdapter().run(md, from_target([0, 1, 1, 0, 0, 0]), cfg)
+        assert isinstance(excinfo.value.__cause__, RuntimeError)  # from original preserved
+    finally:
+        adapter_mod.BacktestEngine = original
 
 
 def main() -> int:

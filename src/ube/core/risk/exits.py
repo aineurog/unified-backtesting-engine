@@ -40,6 +40,7 @@ __all__ = [
     "Trigger",
     "TRIGGERS",
     "TakeProfit",
+    "StopLoss",
     "ATRStop",
     "TrailingStop",
     "TimeExit",
@@ -49,6 +50,7 @@ __all__ = [
     "RiskConfig",
     "atr",
     "take_profit_level",
+    "stop_loss_level",
     "atr_stop_level",
     "trailing_stop_level",
     "chandelier_level",
@@ -137,6 +139,32 @@ class TakeProfit:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "percent", _validate_positive(self.percent, "TakeProfit.percent"))
+        object.__setattr__(self, "scale_out", _validate_scale_out(self.scale_out))
+        object.__setattr__(self, "trigger", _validate_trigger(self.trigger))
+
+
+@dataclass(frozen=True)
+class StopLoss:
+    """Fixed stop-loss: a constant percentage off entry, mirroring ``TakeProfit`` (§8).
+
+    Stop price = ``entry * (1 - percent)`` for a long, ``entry * (1 + percent)`` for a
+    short — the loss side of a fixed-percent risk plan. A stop always exits the full
+    remaining position (``scale_out_fraction`` returns ``1.0``); ``scale_out`` is kept
+    on the dataclass for symmetry with :class:`TakeProfit` and is validated the same
+    way.
+
+    Attributes:
+        percent: Distance below (long) / above (short) entry, as a fraction.
+        scale_out: Fraction of the position to exit when hit (stops exit all).
+        trigger: The §4.7 trigger rule.
+    """
+
+    percent: float
+    scale_out: float = 1.0
+    trigger: Trigger = "touched"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "percent", _validate_positive(self.percent, "StopLoss.percent"))
         object.__setattr__(self, "scale_out", _validate_scale_out(self.scale_out))
         object.__setattr__(self, "trigger", _validate_trigger(self.trigger))
 
@@ -243,10 +271,11 @@ class ChandelierExit:
 
 
 #: The union of exit config types (§8).
-Exit = TakeProfit | ATRStop | TrailingStop | TimeExit | ChandelierExit
+Exit = TakeProfit | StopLoss | ATRStop | TrailingStop | TimeExit | ChandelierExit
 
 _EXIT_NAMES: tuple[str, ...] = (
     "TakeProfit",
+    "StopLoss",
     "ATRStop",
     "TrailingStop",
     "TimeExit",
@@ -255,7 +284,9 @@ _EXIT_NAMES: tuple[str, ...] = (
 
 
 def _is_exit(obj: object) -> TypeGuard[Exit]:
-    return isinstance(obj, (TakeProfit, ATRStop, TrailingStop, TimeExit, ChandelierExit))
+    return isinstance(
+        obj, (TakeProfit, StopLoss, ATRStop, TrailingStop, TimeExit, ChandelierExit)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +400,17 @@ def take_profit_level(
     s = _validate_side(side)
     entry = _validate_entry_price(entry_price)
     mult = 1.0 + cfg.percent if s > 0 else 1.0 - cfg.percent
+    return np.full(md.n_bars, entry * mult, dtype=np.float64)
+
+
+def stop_loss_level(
+    cfg: StopLoss, market_data: MarketData, *, side: object, entry_price: object
+) -> np.ndarray:
+    """Per-bar stop-loss level: a constant ``entry * (1 ∓ percent)`` (§8)."""
+    md = _require_market_data(market_data)
+    s = _validate_side(side)
+    entry = _validate_entry_price(entry_price)
+    mult = 1.0 - cfg.percent if s > 0 else 1.0 + cfg.percent
     return np.full(md.n_bars, entry * mult, dtype=np.float64)
 
 
@@ -493,6 +535,8 @@ def _exit_direction(cfg: Exit, side: int) -> _AboveBelow:
     """Whether an exit's level lies above or below the price, given the side."""
     if isinstance(cfg, TakeProfit):
         return "above" if side > 0 else "below"
+    if isinstance(cfg, StopLoss):
+        return "below" if side > 0 else "above"
     return "below" if side > 0 else "above"
 
 
@@ -513,6 +557,8 @@ def exit_level(
     """
     if isinstance(cfg, TakeProfit):
         return take_profit_level(cfg, market_data, side=side, entry_price=entry_price)
+    if isinstance(cfg, StopLoss):
+        return stop_loss_level(cfg, market_data, side=side, entry_price=entry_price)
     if isinstance(cfg, ATRStop):
         return atr_stop_level(
             cfg,

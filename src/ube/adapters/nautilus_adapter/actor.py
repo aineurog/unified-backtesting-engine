@@ -82,6 +82,7 @@ from ube.core.risk.exits import (
     ATRStop,
     ChandelierExit,
     Exit,
+    StopLoss,
     TakeProfit,
     TimeExit,
     TrailingStop,
@@ -101,6 +102,7 @@ _NO_SIGNAL: tuple[bool, bool, bool, bool] = (False, False, False, False)
 #: `RiskConfig.exit` type -> §4.6 exit_reason string.
 _EXIT_REASONS: dict[type, str] = {
     TakeProfit: "take_profit",
+    StopLoss: "stop_loss",
     ATRStop: "atr_stop",
     TrailingStop: "trailing_stop",
     ChandelierExit: "chandelier",
