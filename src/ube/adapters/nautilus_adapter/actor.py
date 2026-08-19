@@ -120,6 +120,7 @@ class UbeActorConfig(StrategyConfig):  # type: ignore[misc]
     instrument_id: InstrumentId
     bar_type: BarType
     signal_map: dict[int, tuple[bool, bool, bool, bool]]
+    asset_class: str = "crypto_perp"
 
     @property
     def signals(self) -> dict[int, tuple[bool, bool, bool, bool]]:
@@ -178,6 +179,9 @@ class UbeActor(Strategy):  # type: ignore[misc]
         self._instrument: Any = None
         self._book: _Book | None = None
         self._fill_reasons: dict[str, str] = {}
+        #: Shorting is not permitted on ``crypto_spot`` (reference ``strategy/signals.py``:
+        #: ``allow_short = not (market == "crypto" and asset_type == "spot")``).
+        self._allow_short = config.asset_class != "crypto_spot"
 
         #: Closing-fill client_order_id -> exit_reason (§4.6); read by the adapter.
         self.exit_reasons: dict[str, str] = {}
@@ -257,7 +261,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
             if lx or se:
                 self._submit_close("signal")
                 action = "close_long"
-                if se:
+                if se and self._allow_short:
                     self._open(-1, bar, idx)
                     action = "flip_short"
         elif position is not None and position.is_short:
@@ -271,7 +275,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
             if le:
                 self._open(1, bar, idx)
                 action = "buy"
-            elif se:
+            elif se and self._allow_short:
                 self._open(-1, bar, idx)
                 action = "sell"
 

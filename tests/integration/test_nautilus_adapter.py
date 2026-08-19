@@ -422,12 +422,21 @@ def test_build_instrument_returns_frozen_dataclass():
 
 
 def test_build_instrument_rejects_unsupported_asset_class():
+    import ube.core.instrument as instrument_mod
     from ube.adapters.nautilus_adapter.instrument_map import build_instrument
     from ube.core.instrument import Instrument
 
-    spot = Instrument("BTC-USDT", "crypto_spot", tick_size=0.01, settlement_currency="USDT")
-    with pytest.raises(InvalidInstrumentError, match="not supported"):
-        build_instrument(spot)
+    # Every core asset class is now mapped by the adapter, so fabricate one more
+    # to exercise the rejection path (manual patch so the module-level ``main()``
+    # direct-run harness can execute this test too; restore in ``finally``).
+    original = instrument_mod.ASSET_CLASSES
+    instrument_mod.ASSET_CLASSES = frozenset({*original, "bogus"})
+    try:
+        spot = Instrument("BTC-USDT", "bogus", tick_size=0.01, settlement_currency="USDT")
+        with pytest.raises(InvalidInstrumentError, match="not supported"):
+            build_instrument(spot)
+    finally:
+        instrument_mod.ASSET_CLASSES = original
 
 
 # ---------------------------------------------------------------------------

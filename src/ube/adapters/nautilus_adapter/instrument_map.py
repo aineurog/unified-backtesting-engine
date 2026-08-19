@@ -317,12 +317,14 @@ def _build_currency_pair(
     return instrument, instrument_id
 
 
-#: asset_class -> builder. ``crypto_spot`` maps to a ``CurrencyPair`` but has no fixture
-#: yet (plan §3.1: "later").
+#: asset_class -> builder. ``crypto_spot`` maps to a ``CurrencyPair`` (reference
+#: ``constants.py``: ("crypto", "spot") -> "CurrencyPair"); shorting is not permitted
+#: on it (the actor's ``_allow_short`` rule, mirroring the reference ``signals.py``).
 _BUILDERS: dict[str, Any] = {
     "futures": _build_futures,
     "commodities": _build_futures,
     "crypto_perp": _build_crypto_perp,
+    "crypto_spot": _build_currency_pair,
     "stocks": _build_equity,
     "forex": _build_currency_pair,
 }

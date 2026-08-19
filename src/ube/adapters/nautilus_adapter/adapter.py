@@ -185,6 +185,7 @@ class NautilusAdapter(EngineAdapter):
                 instrument_id=build.instrument_id,
                 bar_type=bar_type,
                 signal_map=signal_map,
+                asset_class=config.instrument.asset_class,
             ),
             market_data=data,
             sizing=config.risk.sizing,
