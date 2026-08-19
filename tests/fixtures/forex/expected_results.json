@@ -1,6 +1,6 @@
 {
-  "asset_class": "futures",
-  "instrument": "ES",
+  "asset_class": "forex",
+  "instrument": "EURUSD",
   "strategy": "trivial_long_roundtrip",
   "locked_at": "2026-08-19",
   "tolerance": {
@@ -18,9 +18,9 @@
       "trades_hash": ""
     },
     "nautilus": {
-      "final_equity": 91725.0,
+      "final_equity": 99999.981,
       "n_trades": 1,
-      "trades_hash": "99842545acbf574f52ed4f5e23c73fb5ddde279b672dcb1b1424bc36c209fee9"
+      "trades_hash": "3584d37cbac450f8e0e268db9653910ac12c806295a20b06cde34e6254bbdcc3"
     }
   }
 }

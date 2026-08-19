@@ -11,9 +11,9 @@ level, at what price, with what slippage — is the engine's job (§8); this mod
 produces deterministic levels and the deterministic *trigger rule* (§4.7/§9) that must
 be identical across backtest and paper trading.
 
-The starting set (§8): ATR stop (fixed multiple + trailing), percentage trailing stop,
-time exit, and chandelier exit. Derived series (ATR, running high/low) are computed from
-the bars internally (vectorized) when not supplied as ``atr_series`` (§5.2).
+The starting set (§8): static stop-loss, ATR stop (fixed multiple + trailing), percentage
+trailing stop, time exit, and chandelier exit. Derived series (ATR, running high/low) are
+computed from the bars internally (vectorized) when not supplied as ``atr_series`` (§5.2).
 
 Multi-level exits with scale-out (§6.4): :class:`RiskConfig.exit` is an ordered tuple of
 exits; ``TakeProfit`` carries a ``scale_out`` fraction (default ``1.0``) while stops
@@ -50,10 +50,10 @@ __all__ = [
     "RiskConfig",
     "atr",
     "take_profit_level",
-    "stop_loss_level",
     "atr_stop_level",
     "trailing_stop_level",
     "chandelier_level",
+    "stop_loss_level",
     "time_exit_mask",
     "exit_level",
     "is_triggered",
@@ -125,7 +125,7 @@ class TakeProfit:
 
     Target price = ``entry * (1 + percent)`` for a long, ``entry * (1 - percent)`` for a
     short. A positive ``percent`` is a profit target; a stop-loss is a different exit
-    (``ATRStop`` / ``TrailingStop``).
+    (``StopLoss`` / ``ATRStop`` / ``TrailingStop``).
 
     Attributes:
         percent: Distance above (long) / below (short) entry, as a fraction.
@@ -145,27 +145,25 @@ class TakeProfit:
 
 @dataclass(frozen=True)
 class StopLoss:
-    """Fixed stop-loss: a constant percentage off entry, mirroring ``TakeProfit`` (§8).
+    """Static stop-loss: a fixed distance from entry, never ratcheted (§8).
 
-    Stop price = ``entry * (1 - percent)`` for a long, ``entry * (1 + percent)`` for a
-    short — the loss side of a fixed-percent risk plan. A stop always exits the full
-    remaining position (``scale_out_fraction`` returns ``1.0``); ``scale_out`` is kept
-    on the dataclass for symmetry with :class:`TakeProfit` and is validated the same
-    way.
+    Long: ``stop = entry * (1 - percent)``; Short: ``stop = entry * (1 + percent)``.
+    Unlike :class:`TrailingStop` (which ratchets off the running peak/trough) and
+    :class:`ATRStop` (volatility-scaled), this is anchored to entry only and never
+    moves. A stop exits 100% of the remaining position (no ``scale_out``).
 
     Attributes:
-        percent: Distance below (long) / above (short) entry, as a fraction.
-        scale_out: Fraction of the position to exit when hit (stops exit all).
+        percent: Distance below (long) / above (short) entry, as a fraction of price.
         trigger: The §4.7 trigger rule.
     """
 
     percent: float
-    scale_out: float = 1.0
     trigger: Trigger = "touched"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "percent", _validate_positive(self.percent, "StopLoss.percent"))
-        object.__setattr__(self, "scale_out", _validate_scale_out(self.scale_out))
+        object.__setattr__(
+            self, "percent", _validate_positive(self.percent, "StopLoss.percent")
+        )
         object.__setattr__(self, "trigger", _validate_trigger(self.trigger))
 
 
@@ -406,7 +404,11 @@ def take_profit_level(
 def stop_loss_level(
     cfg: StopLoss, market_data: MarketData, *, side: object, entry_price: object
 ) -> np.ndarray:
-    """Per-bar stop-loss level: a constant ``entry * (1 ∓ percent)`` (§8)."""
+    """Per-bar static stop level: a constant ``entry * (1 ∓ percent)`` (§8).
+
+    Long: ``entry * (1 - percent)``; short: ``entry * (1 + percent)``. Unlike a trailing
+    or ATR stop, the level is anchored to entry and never moves.
+    """
     md = _require_market_data(market_data)
     s = _validate_side(side)
     entry = _validate_entry_price(entry_price)
@@ -535,8 +537,6 @@ def _exit_direction(cfg: Exit, side: int) -> _AboveBelow:
     """Whether an exit's level lies above or below the price, given the side."""
     if isinstance(cfg, TakeProfit):
         return "above" if side > 0 else "below"
-    if isinstance(cfg, StopLoss):
-        return "below" if side > 0 else "above"
     return "below" if side > 0 else "above"
 
 

@@ -12,7 +12,7 @@ Two pure translations, one direction (canonical in → Nautilus out):
 
 The ``BarType`` is derived from the **median positive inter-bar spacing** (requirements
 §4.9) — never a hard-coded minute label — so hourly/volume/event-driven bars feed
-through with the resolution the data actually carries (plan §5.1).
+through with the resolution the data actually carries (requirements §4.3).
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ _AGG_BY_NS: Sequence[tuple[BarAggregation, int]] = (
 
 
 def derive_bar_period_ns(market_data: MarketData) -> int:
-    """Median positive inter-bar spacing in nanoseconds (§4.9, plan §5.1).
+    """Median positive inter-bar spacing in nanoseconds (requirements §4.9).
 
     ``MarketData`` guarantees a sorted, unique, tz-aware UTC index, so every
     consecutive delta is strictly positive.

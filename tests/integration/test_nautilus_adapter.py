@@ -855,6 +855,41 @@ def test_nautilus_touched_take_profit_stamps_exit_reason():
     assert float(result.equity_curve.equity[-1]) == pytest.approx(101990.25, rel=1e-6)
 
 
+def test_nautilus_stop_loss_stamps_exit_reason():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import RiskConfig, StopLoss
+
+    # Long StopLoss(0.02): the 97.50 low on the third bar crosses entry*(1-0.02) = 98.0.
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 02:00:00+00:00,100.00,100.50,97.50,98.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,
+            risk=RiskConfig(exit=(StopLoss(0.02),)),
+        ),
+    )
+
+    fills = _fills(result)
+    assert [(e.side, e.quantity, e.price, e.exit_reason) for e in fills] == [
+        (1, 25.0, 100.0, None),
+        (1, 975.0, 100.01, None),
+        (-1, 25.0, 98.0, "stop_loss"),
+        (-1, 975.0, 97.99, "stop_loss"),
+    ]
+    (trade,) = result.trades
+    assert (trade.side, trade.exit_reason) == (1, "stop_loss")
+    assert trade.net_pnl == pytest.approx(-2019.5, rel=1e-4)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(97980.5, rel=1e-6)
+
+
 def test_nautilus_trailing_and_chandelier_ratchet_without_lookahead():
     from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
     from ube.core.config import BacktestConfig
@@ -1266,6 +1301,20 @@ def test_nautilus_run_rejects_contradictory_signal_entries():
         )
 
 
+def test_nautilus_run_rejects_short_on_crypto_spot():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import InvalidSignalError
+    from ube.core.instrument import Instrument
+
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=7, n_bars=6)
+    cfg = BacktestConfig(instrument=Instrument("BTC-USDT", asset_class="crypto_spot"))
+    # from_target([0, -1, ...]) emits short_entry at bar 1; spot is long-only, so the
+    # run fails fast (§4.5/§6.1) rather than silently dropping the short.
+    with pytest.raises(InvalidSignalError, match="long-only"):
+        NautilusAdapter().run(md, from_target([0, -1, -1, -1, -1, -1]), cfg)
+
+
 def test_nautilus_engine_exception_wrapped_preserves_cause():
     import ube.adapters.nautilus_adapter.adapter as adapter_mod
     from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
@@ -1307,6 +1356,70 @@ def test_nautilus_engine_exception_wrapped_preserves_cause():
         assert isinstance(excinfo.value.__cause__, RuntimeError)  # from original preserved
     finally:
         adapter_mod.BacktestEngine = original
+
+
+def test_nautilus_emits_order_submitted_events():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.ledger import EventType
+
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
+    signals = from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+    result = NautilusAdapter().run(
+        md,
+        signals,
+        BacktestConfig(
+            instrument=PRESETS["futures"].instrument,
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+
+    submitted = _ledger_events(result, EventType.ORDER_SUBMITTED)
+    # One entry order (long) + one signal-exit order (short); no risk exits in this run.
+    assert [(e.side, e.quantity) for e in submitted] == [(1, 20.0), (-1, 20.0)]
+    assert all(e.order_id for e in submitted)
+    # Submissions land on the two acting bars, in order.
+    assert submitted[0].timestamp < submitted[1].timestamp
+
+
+# ---------------------------------------------------------------------------
+# Step 8: engine-name resolution + lazy built-in registration (§7.1).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_engine_name_auto_with_nothing_registered_raises():
+    with pytest.raises(ConfigError, match="auto"):
+        ube.resolve_engine_name("auto")
+
+
+def test_resolve_engine_name_auto_returns_first_in_priority_order():
+    register_engine("nautilus", _FakeAdapter)
+    assert ube.resolve_engine_name("auto") == "nautilus"
+    register_engine("backtrader", _OtherAdapter)
+    assert ube.resolve_engine_name("auto") == "backtrader"
+
+
+def test_resolve_engine_name_normalizes_specific_name():
+    assert ube.resolve_engine_name("  NAUTILUS  ") == "nautilus"
+
+
+def test_resolve_engine_name_unknown_name_returns_normalized():
+    # Resolution only normalizes; whether the name is *registered* is get_engine's job.
+    assert ube.resolve_engine_name("  VeCtOrBt  ") == "vectorbt"
+
+
+def test_ensure_builtin_engines_registered_registers_nautilus():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+
+    ube.ensure_builtin_engines_registered()
+    assert ube.get_engine("nautilus") is NautilusAdapter
+    assert ube.resolve_engine_name("auto") == "nautilus"
+
+
+def test_ensure_builtin_engines_registered_is_idempotent():
+    ube.ensure_builtin_engines_registered()
+    ube.ensure_builtin_engines_registered()
+    assert registered_engines() == ("nautilus",)
 
 
 def main() -> int:

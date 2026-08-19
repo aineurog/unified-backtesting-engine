@@ -41,12 +41,14 @@ import pandas as pd
 
 from ube.core.data import MarketData
 from ube.core.errors import InvalidSignalError
+from ube.core.instrument import allows_short
 
 __all__ = [
     "SIGNAL_COLUMNS",
     "Signals",
     "from_target",
     "from_callable",
+    "validate_long_only",
 ]
 
 #: The four canonical signal columns in their canonical order (§6.1).
@@ -283,3 +285,27 @@ def from_callable(fn: Callable[[MarketData], int], bars: MarketData) -> Signals:
         window = bars.head(i + 1)
         targets.append(fn(window))
     return from_target(np.asarray(targets))
+
+
+def validate_long_only(signals: Signals, asset_class: str) -> None:
+    """Fail fast when a long-only asset class is asked to short (§4.5).
+
+    ``crypto_spot`` is long-only: a ``short_entry`` opens a position that cannot
+    exist and a ``short_exit`` closes one, so either is a configuration error —
+    raised here (before the engine runs, §4.7) rather than silently dropped by the
+    engine. The first offending bar is named, matching the §6.1 conflict rule.
+    """
+    if allows_short(asset_class):
+        return
+    if signals.short_entry.any():
+        i = int(np.argmax(signals.short_entry))
+        raise InvalidSignalError(
+            f"{asset_class} is long-only and cannot open a short position: "
+            f"short_entry is True at bar {i}"
+        )
+    if signals.short_exit.any():
+        i = int(np.argmax(signals.short_exit))
+        raise InvalidSignalError(
+            f"{asset_class} is long-only and cannot close a short position: "
+            f"short_exit is True at bar {i}"
+        )

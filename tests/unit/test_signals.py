@@ -8,7 +8,13 @@ import pytest
 
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
-from ube.core.signals import SIGNAL_COLUMNS, Signals, from_callable, from_target
+from ube.core.signals import (
+    SIGNAL_COLUMNS,
+    Signals,
+    from_callable,
+    from_target,
+    validate_long_only,
+)
 
 
 def _signals(**overrides: object) -> Signals:
@@ -204,6 +210,42 @@ def test_exit_conflict_names_the_bar():
 
 def test_invalid_signal_error_is_a_config_error():
     assert issubclass(InvalidSignalError, ConfigError)
+
+
+# ---------------------------------------------------------------------------
+# Long-only asset classes (§4.5, §6.1) — a short signal on spot is rejected.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_long_only_rejects_short_entry():
+    sig = _signals(short_entry=np.array([False, True, False]))
+    with pytest.raises(InvalidSignalError) as excinfo:
+        validate_long_only(sig, "crypto_spot")
+    message = str(excinfo.value)
+    assert "long-only" in message
+    assert "short_entry" in message
+    assert "bar 1" in message
+
+
+def test_validate_long_only_rejects_short_exit():
+    sig = _signals(short_exit=np.array([False, False, True]))
+    with pytest.raises(InvalidSignalError) as excinfo:
+        validate_long_only(sig, "crypto_spot")
+    message = str(excinfo.value)
+    assert "long-only" in message
+    assert "short_exit" in message
+    assert "bar 2" in message
+
+
+def test_validate_long_only_allows_short_on_margin_classes():
+    sig = _signals(short_entry=np.array([False, True, False]))
+    for asset_class in ("crypto_perp", "futures", "stocks", "forex", "commodities"):
+        validate_long_only(sig, asset_class)  # no raise
+
+
+def test_validate_long_only_is_noop_for_long_only_signals():
+    sig = _signals(long_entry=np.array([True, False, False]))
+    validate_long_only(sig, "crypto_spot")  # no raise
 
 
 # ---------------------------------------------------------------------------

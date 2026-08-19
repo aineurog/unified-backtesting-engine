@@ -6,6 +6,7 @@ from ube.adapters.base import (
     get_engine,
     register_engine,
     registered_engines,
+    resolve_engine_name,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "get_engine",
     "register_engine",
     "registered_engines",
+    "resolve_engine_name",
 ]

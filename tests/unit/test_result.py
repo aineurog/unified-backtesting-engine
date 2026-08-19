@@ -13,7 +13,7 @@ from ube.core.data import MarketData
 from ube.core.errors import DataShapeError, UndeclaredConfigError
 from ube.core.instrument import Instrument
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, Trade, equity_curve
-from ube.core.result import BacktestResult
+from ube.core.result import BacktestResult, result_hash
 
 # ---------------------------------------------------------------------------
 # Helpers.
@@ -388,3 +388,58 @@ def test_load_preserves_read_only_arrays(tmp_path):
     assert not loaded.equity_curve_by_instrument["A"].equity.flags.writeable
     with pytest.raises(ValueError):
         loaded.equity_curve.equity[0] = 999.0
+
+
+# ---------------------------------------------------------------------------
+# result_hash (§4.8, §16) — deterministic fingerprint of trades + equity.
+# ---------------------------------------------------------------------------
+
+
+def test_result_hash_is_stable_hex_digest():
+    ledger, market_data, instruments, config = _single_instrument()
+    result = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments, run_id="r"
+    )
+    digest = result_hash(result)
+    assert isinstance(digest, str)
+    assert len(digest) == 64
+    int(digest, 16)  # valid hex
+    assert result_hash(result) == digest
+
+
+def test_result_hash_changes_when_equity_changes():
+    ledger, market_data, instruments, config = _single_instrument()
+    a = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments
+    )
+    # Same ledger (same trades), different mark-to-market closes -> different equity.
+    shifted = {
+        k: MarketData(
+            open=v.open + 1.0,
+            high=v.high + 1.0,
+            low=v.low + 1.0,
+            close=v.close + 1.0,
+            volume=v.volume,
+            index=v.index,
+        )
+        for k, v in market_data.items()
+    }
+    b = BacktestResult.from_ledger(
+        ledger, config, market_data=shifted, instruments=instruments
+    )
+    assert a.trades == b.trades  # trades derive from the ledger, not the marks
+    assert result_hash(a) != result_hash(b)
+
+
+def test_result_hash_differs_across_different_runs():
+    ledger, market_data, instruments, config = _single_instrument()
+    one = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments
+    )
+    result_two, _, _, _ = _two_trades(0)
+    assert result_hash(one) != result_hash(result_two)
+
+
+def test_result_hash_rejects_non_result():
+    with pytest.raises(DataShapeError):
+        result_hash("not a result")  # type: ignore[arg-type]
