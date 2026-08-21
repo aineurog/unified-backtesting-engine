@@ -1,0 +1,26 @@
+{
+  "asset_class": "forex",
+  "instrument": "EURUSD",
+  "strategy": "trivial_long_roundtrip",
+  "locked_at": "2026-08-21",
+  "tolerance": {
+    "final_equity_rtol": 1e-06
+  },
+  "engines": {
+    "vectorbt": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "backtrader": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "nautilus": {
+      "final_equity": 99999.981,
+      "n_trades": 1,
+      "trades_hash": "c392aeb53a346b99c85982fd894c798dc3711da860c686f6637bf5737d79d24a"
+    }
+  }
+}

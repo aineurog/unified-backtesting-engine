@@ -73,6 +73,16 @@ def _validate_value(value: object, name: str = "SizeModel.value") -> float:
     return f
 
 
+def _validate_leverage(value: object) -> float:
+    """Validate ``leverage``: a finite multiplier strictly greater than zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"SizeModel.leverage must be a number; got {value!r}")
+    f = float(value)
+    if not math.isfinite(f) or f <= 0:
+        raise ConfigError(f"SizeModel.leverage must be finite and > 0; got {value!r}")
+    return f
+
+
 @dataclass(frozen=True)
 class SizeModel:
     """Frozen position-sizing model (§6.3).
@@ -87,6 +97,7 @@ class SizeModel:
 
     kind: SizeKind = "all_in"
     value: float | None = None
+    leverage: float = 1.0
 
     def __post_init__(self) -> None:
         if self.kind not in SIZE_KINDS:
@@ -101,6 +112,12 @@ class SizeModel:
             raise ConfigError(
                 f"sizing kind={self.kind!r} does not take a value; got {self.value!r}"
             )
+        # Leverage is an *exposure* multiplier (§3.2 single source of truth): it
+        # scales the allocated notional the same way the reference nautilus_trader
+        # strategy does (``leveraged_capital = capital * leverage``). The adapter
+        # derives the venue's margin capacity from it so the larger position is
+        # accepted; cash accounts ignore it (force 1.0 in the adapter).
+        object.__setattr__(self, "leverage", _validate_leverage(self.leverage))
 
 
 def _as_float(value: ArrayLike, name: str) -> np.ndarray:

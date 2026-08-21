@@ -2,9 +2,11 @@
 
 :class:`BacktestResult` is the canonical *output* of one backtest run. It is immutable
 after construction (§3 principle 5) and carries the event ledger (the single source of
-truth, §4.6) plus the derived views — ``trades``, ``positions``, ``equity_curve`` and
-``equity_curve_by_instrument`` — each computed **once** at construction from the ledger
-by the pure item-07 functions (:func:`~ube.core.ledger.trades`,
+truth, §4.6) plus the derived views — ``trades``, ``trade_table``, ``positions``,
+``equity_curve`` and ``equity_curve_by_instrument`` — each computed **once** at
+construction from the ledger by the pure item-07 functions
+(:func:`~ube.core.ledger.trades`,
+:func:`~ube.core.ledger.trade_table`,
 :func:`~ube.core.ledger.positions`,
 :func:`~ube.core.ledger.equity_curve`,
 :func:`~ube.core.ledger.equity_curve_by_instrument`) and cached. They are never
@@ -68,6 +70,7 @@ from ube.core.ledger import (
     equity_curve,
     equity_curve_by_instrument,
     positions,
+    trade_table,
     trades,
 )
 
@@ -84,6 +87,11 @@ class BacktestResult:
         ledger: The append-only event ledger — the single source of truth (§4.6).
         config: The :class:`~ube.core.config.BacktestConfig` this run was produced with.
         trades: The completed round-trip trades, derived once from the ledger (§4.6).
+        trade_table: The §4.6 trades table — one row per trade (closed *and* open), the
+            spec'd per-trade columns joined with the equity curve (``position_size_pct``,
+            ``trade_return_pct``, ``realized_pnl``/``realized_pnl_pct``,
+            ``cum_return_pct``, ``balance``, fee splits, ``reason``; the ``_pct`` columns
+            are fractions — ``0.05`` = 5%).
         positions: The combined position-over-time series when the ledger is
             single-instrument, else ``None`` (see the module docstring).
         equity_curve: The combined equity curve in ``base_currency`` (§4.6).
@@ -98,6 +106,7 @@ class BacktestResult:
     ledger: EventLedger
     config: BacktestConfig
     trades: tuple[Trade, ...]
+    trade_table: pd.DataFrame
     positions: Positions | None
     equity_curve: EquityCurve
     equity_curve_by_instrument: dict[str, EquityCurve]
@@ -158,6 +167,13 @@ class BacktestResult:
         base_currency = _resolve_base_currency(config, instruments)
 
         trades_view = trades(ledger, instruments=instruments)
+        trade_table_view = trade_table(
+            ledger,
+            market_data,
+            instruments,
+            base_currency=base_currency,
+            fx_rates=fx_rates,
+        )
         pc_ids = {e.instrument_id for e in ledger if e.event_type is EventType.POSITION_CHANGE}
         positions_view = positions(ledger) if len(pc_ids) <= 1 else None
 
@@ -172,6 +188,9 @@ class BacktestResult:
             trades_view = _drop_warmup_trades(
                 trades_view, combined.index, config.warmup_bars
             )
+            trade_table_view = _drop_warmup_table_rows(
+                trade_table_view, combined.index, config.warmup_bars
+            )
             combined = _slice_curve(combined, config.warmup_bars)
             by_instrument = {
                 iid: _slice_curve(curve, config.warmup_bars)
@@ -183,6 +202,7 @@ class BacktestResult:
             ledger=ledger,
             config=config,
             trades=trades_view,
+            trade_table=trade_table_view,
             positions=positions_view,
             equity_curve=combined,
             equity_curve_by_instrument=by_instrument,
@@ -228,6 +248,19 @@ class BacktestResult:
 # Module-private helpers.
 # ---------------------------------------------------------------------------
 
+#: Per-asset-class default settlement currency used only when neither
+#: ``config.base_currency`` nor ``Instrument.settlement_currency`` is declared (§4.7).
+#: Keeps the minimal ``ube.Instrument(symbol, asset_class=...)`` usage runnable
+#: without forcing a settlement currency on the caller.
+_DEFAULT_SETTLEMENT: Mapping[str, str] = {
+    "crypto_spot": "USDT",
+    "crypto_perp": "USDT",
+    "forex": "USD",
+    "futures": "USD",
+    "stocks": "USD",
+    "commodities": "USD",
+}
+
 
 def _resolve_base_currency(
     config: BacktestConfig, instruments: Mapping[str, Instrument]
@@ -241,6 +274,7 @@ def _resolve_base_currency(
     base = config.base_currency
     if base is not None:
         return base
+
     if len(instruments) != 1:
         raise UndeclaredConfigError(
             "base_currency is required to derive the combined equity curve for a "
@@ -250,11 +284,13 @@ def _resolve_base_currency(
     only = next(iter(instruments.values()))
     settlement = only.settlement_currency
     if settlement is None:
-        raise UndeclaredConfigError(
-            "a single-instrument run with no declared base_currency needs the "
-            "instrument's settlement_currency to denominate the equity curve, but "
-            f"{only.symbol!r} has none (§4.7)"
-        )
+        # No explicit settlement currency was declared. Rather than raise on the
+        # simplest-usage path (``ube.Instrument(symbol, asset_class=...)`` with no
+        # settlement), fall back to the asset-class default so the equity curve has a
+        # denomination. A single-instrument run keeps a 1:1 identity FX; this only
+        # picks the currency label. ``config.base_currency`` (when declared) still
+        # wins, and portfolio runs still require an explicit base (see above).
+        settlement = _DEFAULT_SETTLEMENT.get(only.asset_class, "USD")
     return settlement
 
 
@@ -286,20 +322,45 @@ def _drop_warmup_trades(
     return tuple(t for t in trades_view if t.entry_timestamp >= cutoff)
 
 
+def _drop_warmup_table_rows(
+    table: pd.DataFrame, index: pd.Index, warmup_bars: int
+) -> pd.DataFrame:
+    """Drop trades-table rows whose entry bar falls inside the warm-up window (§7.2).
+
+    Mirrors :func:`_drop_warmup_trades` for the §4.6 trades table, which also includes
+    open rows (those carry their entry bar in ``entry_datetime``). Rows are compared on
+    the tz-aware ``entry_datetime`` column against the same grid-derived cutoff.
+    """
+    if warmup_bars >= len(index):
+        return table.iloc[0:0]
+    if isinstance(index, pd.DatetimeIndex):
+        asi8: np.ndarray = index.as_unit("ns").asi8  # type: ignore[attr-defined]
+        cutoff = int(asi8[warmup_bars])
+    else:
+        cutoff = int(index[warmup_bars])
+    cutoff_ts = pd.Timestamp(cutoff, unit="ns", tz="UTC")
+    return table[table["entry_datetime"] >= cutoff_ts]
+
+
 def _refreeze(obj: Any) -> None:
     """Re-apply ``write=False`` to every derived-view array reachable from ``obj``.
 
     Pickle drops ``ndarray.flags.writeable``, so a loaded result's derived-view arrays
     come back writable; this restores the immutability guarantee (§3 principle 5). It
     walks only the known array-bearing containers (``EquityCurve``/``Positions``/
-    ``BenchmarkCurve``) plus dict/tuple/list aggregations — never arbitrary ``__dict__``
-    attributes, which would descend into pandas internals that contain reference cycles.
-    The containers reached here are freshly deserialized (owned by the loaded result),
-    so locking them is safe — unlike construction, where caller-owned buffers must never
-    be frozen.
+    ``BenchmarkCurve``/``pd.DataFrame``) plus dict/tuple/list aggregations — never
+    arbitrary ``__dict__`` attributes, which would descend into pandas internals that
+    contain reference cycles. The containers reached here are freshly deserialized
+    (owned by the loaded result), so locking them is safe — unlike construction, where
+    caller-owned buffers must never be frozen.
     """
     if isinstance(obj, np.ndarray):
         obj.setflags(write=False)
+    elif isinstance(obj, pd.DataFrame):
+        for column in obj.columns:
+            values = obj[column]._values
+            if isinstance(values, np.ndarray):
+                values.setflags(write=False)
     elif isinstance(obj, EquityCurve):
         obj.equity.setflags(write=False)
     elif isinstance(obj, Positions):

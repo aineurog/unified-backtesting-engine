@@ -20,14 +20,16 @@ Translation summary (plan §5.3):
 * **Carry** — ``funding`` / ``borrow`` rates have no native Nautilus equivalent, so
   the adapter derives ``funding_payment`` events directly from the core
   :func:`~ube.core.ledger.funding_payments` generator, aligned per bar (§24).
-* **Ledger fold** — the actor records ``signal_evaluated`` (per-bar action strings),
-  ``exit_reasons`` (closing-fill client_order_id → §4.6 reason) and
+* **Ledger fold** — the actor records ``signal_evaluated`` (per-bar action strings for
+  real entries/exits/flips only — holds are never emitted), ``order_submitted`` (one
+  entry per order the actor actually placed, carrying the order_id/side/quantity at the
+  submission bar), ``exit_reasons`` (closing-fill client_order_id → §4.6 reason) and
   ``position_reasons``; the adapter folds those plus the fills/positions reports into
-  ``LedgerEvent``\\ s sorted by timestamp — ``signal_evaluated``, ``fill`` (with the
-  closing fill's ``exit_reason``), ``commission``, ``position_change`` (reconstructed
-  from the fills' running net position, so scale-out partials move the position),
-  and ``funding_payment`` — preceded by a ``cash_movement`` book of the starting
-  balance at the first bar (§4.6 step 4).
+  ``LedgerEvent``\\ s sorted by timestamp — ``signal_evaluated``, ``order_submitted``,
+  ``fill`` (with the closing fill's ``exit_reason``), ``commission``,
+  ``position_change`` (reconstructed from the fills' running net position, so scale-out
+  partials move the position), and ``funding_payment`` — preceded by a ``cash_movement``
+  book of the starting balance at the first bar (§4.6 step 4).
 * **Result** — :meth:`~ube.core.result.BacktestResult.from_ledger` derives the
   ``trades`` / ``positions`` / ``equity_curve`` views once (§4.6).
 
@@ -94,10 +96,12 @@ from ube.core.signals import Signals
 __all__ = ["NautilusAdapter"]
 
 #: Stable sort rank per event type within a timestamp (so same-bar events fold in a
-#: canonical order: evaluation -> fills -> commissions -> positions -> carry).
+#: canonical order: evaluation -> order_submitted -> fills -> commissions ->
+#: positions -> carry).
 _KIND_RANK: dict[EventType, int] = {
     EventType.CASH_MOVEMENT: 0,
     EventType.SIGNAL_EVALUATED: 0,
+    EventType.ORDER_SUBMITTED: 0,
     EventType.FILL: 1,
     EventType.COMMISSION: 2,
     EventType.POSITION_CHANGE: 3,
@@ -114,7 +118,7 @@ class NautilusAdapter(EngineAdapter):
         signals: Signals,
         config: BacktestConfig,
         *,
-        aux_data: Mapping[str, MarketData] | None = None,
+        aux_data: Mapping[str, Any] | None = None,
     ) -> BacktestResult:
         """Run a backtest via NautilusTrader (§4.5).
 
@@ -123,9 +127,10 @@ class NautilusAdapter(EngineAdapter):
             signals: The 4-column entry/exit signals on the same bar grid as ``data``.
             config: The full :class:`~ube.core.config.BacktestConfig` (instrument, cost,
                 risk/exits, benchmark, engine overrides).
-            aux_data: Reserved for supplemental canonical data feeds (§4.1); the
-                Nautilus adapter currently derives ATR internally, so ``aux_data`` is
-                accepted and unused.
+            aux_data: Optional derived-series map referenced by name from exit configs
+                (§5.2) — e.g. ``{"atr_12h": <array>}`` for ``ATRStop(atr="atr_12h")``.
+                When a referenced name is absent the adapter computes ATR from ``data``.
+                A flat ``name -> array`` map for a single instrument.
 
         Returns:
             The canonical :class:`~ube.core.result.BacktestResult`.
@@ -174,11 +179,31 @@ class NautilusAdapter(EngineAdapter):
         fee_overrides.setdefault("maker_fee", rate)
         fee_overrides.setdefault("taker_fee", rate)
 
+        # Leverage (§3.2 single source of truth): it lives on ``SizeModel`` and is the
+        # exposure multiplier applied to the order quantity. The venue's margin capacity
+        # must cover that exposure, so the *effective* margin leverage is the larger of
+        # the sizing leverage and any ``engine_overrides["leverage"]`` (the legacy margin
+        # knob). When neither is set, ``_margin`` keeps its reference default (0.2 -> 5x).
+        sizing_leverage = float(config.risk.sizing.leverage)
+        override_leverage = float(overrides.get("leverage", 0.0) or 0.0)
+        margin_leverage = 0.0
+        if sizing_leverage > 1.0:
+            margin_leverage = sizing_leverage
+        if override_leverage > 0.0:
+            margin_leverage = max(margin_leverage, override_leverage)
+        if margin_leverage > 0.0:
+            fee_overrides["leverage"] = margin_leverage
+
         build = build_instrument(config.instrument, fee_overrides)
         instrument_id = str(build.instrument_id)
         bars, bar_type = to_nautilus_bars(data, build)
         signal_map = to_signal_map(data, signals)
         settlement = config.instrument.settlement_currency or "USD"
+
+        # Cash accounts cannot be leveraged: the reference nautilus_trader forces
+        # leverage to 1.0 for cash, so mirror that here (§3.2).
+        _acct = overrides.get("account_type", "margin")
+        actor_leverage = 1.0 if _acct == "cash" else sizing_leverage
 
         actor = UbeActor(
             UbeActorConfig(
@@ -190,6 +215,8 @@ class NautilusAdapter(EngineAdapter):
             market_data=data,
             sizing=config.risk.sizing,
             exits=config.risk.exit,
+            aux_atr=aux_data,
+            leverage=actor_leverage,
             vol=(
                 _volatility_estimate(data)
                 if config.risk.sizing.kind == "volatility_target"
@@ -303,7 +330,8 @@ class NautilusAdapter(EngineAdapter):
             int(bar_ts[0]),
         )
 
-        # Per-bar signal evaluations recorded by the actor (§6.1).
+        # Per-bar signal evaluations recorded by the actor (§6.1). Holds are never
+        # recorded by the actor, so only real entries/exits/flips reach the ledger.
         for bar_idx, action in actor.signal_evaluated.items():
             _add(
                 LedgerEvent(
@@ -313,6 +341,22 @@ class NautilusAdapter(EngineAdapter):
                     action=action,
                 ),
                 int(bar_ts[bar_idx]),
+            )
+
+        # One order_submitted per order the actor actually placed (§4.6): entries,
+        # scale-out partials, stop/target exits, and full closes. Submitted at the bar
+        # boundary (int(bar.ts_event)) and ordered before the resulting fills.
+        for order_id, (ts, side, quantity) in actor.order_submitted.items():
+            _add(
+                LedgerEvent(
+                    EventType.ORDER_SUBMITTED,
+                    ts,
+                    instrument_id,
+                    order_id=order_id,
+                    side=side,
+                    quantity=quantity,
+                ),
+                ts,
             )
 
         # Fills -> fill + cash-leg + commission events; position_change reconstructed

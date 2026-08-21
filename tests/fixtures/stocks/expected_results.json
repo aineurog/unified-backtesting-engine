@@ -1,0 +1,26 @@
+{
+  "asset_class": "stocks",
+  "instrument": "AAPL",
+  "strategy": "trivial_long_roundtrip",
+  "locked_at": "2026-08-21",
+  "tolerance": {
+    "final_equity_rtol": 1e-06
+  },
+  "engines": {
+    "vectorbt": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "backtrader": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "nautilus": {
+      "final_equity": 99987.29999999999,
+      "n_trades": 1,
+      "trades_hash": "5d88de00a4528fffc6bc5ed0c9ceae3fe473f4c3c9699e727bf71788ad0a824b"
+    }
+  }
+}

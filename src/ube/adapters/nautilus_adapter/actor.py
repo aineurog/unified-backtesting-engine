@@ -65,27 +65,32 @@ as a known divergence for the parity report.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
+import pandas as pd
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide, OrderType
 from nautilus_trader.model.events import OrderFilled, OrderRejected
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.orders.base import Order
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from ube.core.data import MarketData
-from ube.core.errors import EngineError
+from ube.core.errors import DataShapeError, EngineError
 from ube.core.risk.exits import (
     ATRStop,
     ChandelierExit,
     Exit,
+    ExitPlan,
     StopLoss,
     TakeProfit,
     TimeExit,
     TrailingStop,
+    atr,
     exit_level,
     scale_out_plan,
 )
@@ -159,15 +164,21 @@ class UbeActor(Strategy):  # type: ignore[misc]
         *,
         market_data: MarketData,
         atr_series: np.ndarray | None = None,
+        aux_atr: Mapping[str, Any] | None = None,
         sizing: SizeModel | None = None,
         exits: tuple[Exit, ...] = (),
         vol: np.ndarray | None = None,
+        leverage: float = 1.0,
     ) -> None:
         super().__init__(config)
         self.instrument_id = config.instrument_id
         self._market_data = market_data
         self._atr_series = atr_series
+        self._aux_atr = dict(aux_atr) if aux_atr is not None else None
         self._sizing = sizing if sizing is not None else SizeModel()
+        # Exposure multiplier (§3.2): the reference nautilus_trader strategy scales
+        # ``capital * leverage``; the adapter forces this to 1.0 for cash accounts.
+        self._leverage = float(leverage)
         self._exits = exits
         self._vol = vol
 
@@ -189,6 +200,9 @@ class UbeActor(Strategy):  # type: ignore[misc]
         self.position_reasons: dict[str, str] = {}
         #: bar index -> action string (dropdown for the ledger's signal_evaluated rows).
         self.signal_evaluated: dict[int, str] = {}
+        #: client_order_id -> (bar_ns, side ±1, quantity) for every order submitted;
+        #: folded into ``order_submitted`` ledger events (§4.6). Holds are not recorded.
+        self.order_submitted: dict[str, tuple[int, int, float]] = {}
         #: Set to a message if a market order was rejected (insufficient funds, §4.5).
         self.market_rejection: str | None = None
 
@@ -216,7 +230,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
             fired = self._close_exit_fired(idx)
             if fired is not None:
                 reason, fraction = fired
-                self._submit_close(reason, fraction)
+                self._submit_close(reason, fraction, ts=int(bar.ts_event))
                 self.signal_evaluated[idx] = f"exit_{reason}"
             else:
                 self._apply_signal(self._lookup_signal(bar), bar, idx)
@@ -252,6 +266,65 @@ class UbeActor(Strategy):  # type: ignore[misc]
 
     # -- entries + signal exits (plan §4.5 items 1-2) ------------------------
 
+    def _record_order(self, order: Order, ts: int) -> None:
+        """Remember an order so the fold can emit a §4.6 ``order_submitted`` event."""
+        side = 1 if order.side == OrderSide.BUY else -1
+        self.order_submitted[str(order.client_order_id)] = (
+            ts,
+            side,
+            float(order.quantity.as_double()),
+        )
+
+    def _resolve_exit_atr(self, cfg: Exit) -> np.ndarray | None:
+        """Resolve the ATR series for ``cfg`` (§5.2).
+
+        If the exit names an ``aux_data`` entry, it is resolved by :meth:`_atr_from_aux`
+        (a ``MarketData`` is the signal-timeframe OHLCV the library turns into ATR; an
+        array is used verbatim). Otherwise ATR is auto-computed over ``data`` at the
+        exit's ``period``. Returns ``None`` for exits that need no ATR (e.g.
+        ``TrailingStop``), letting the core level functions compute their running
+        extremes from the bars directly.
+        """
+        name = getattr(cfg, "atr", None)
+        if name and self._aux_atr and name in self._aux_atr:
+            return self._atr_from_aux(name, getattr(cfg, "period", 14))
+        period = getattr(cfg, "period", 14)
+        return atr(self._market_data, period)
+
+    def _atr_from_aux(self, name: str, period: int) -> np.ndarray:
+        """Compute ATR from an ``aux_data`` entry (§5.2), with no look-ahead bias.
+
+        The test only passes the *raw* signal-timeframe OHLCV as a
+        :class:`~ube.core.data.MarketData`; the adapter does the rest:
+
+        1. ATR(``period``) is computed over those aux bars (Wilder, causal — value at
+           bar ``h`` uses only bars through ``h``).
+        2. The series is shifted forward one aux bar, so a main bar inside hour ``h``
+           only ever sees the ATR of the *last completed* aux bar (``h-1``) — no
+           look-ahead into the bar being traded.
+        3. The aux ATR is forward-filled onto the (possibly finer) main bar grid so it
+           is row-aligned with ``data`` (length ``n_bars``).
+        """
+        value = self._aux_atr[name]
+        if isinstance(value, MarketData):
+            atr_aux = atr(value, period)  # causal Wilder ATR, aligned to aux bars
+            series = pd.Series(atr_aux, index=value.timestamps)
+            # No look-ahead: shift forward one aux bar (bar h uses ATR through h-1).
+            series = series.shift(1).fillna(series.iloc[0])
+            # Forward-fill the aux ATR onto the main bar grid (length == n_bars).
+            aligned = series.reindex(self._market_data.timestamps, method="ffill")
+            arr = aligned.to_numpy(dtype=np.float64)
+        else:
+            arr = np.asarray(value, dtype=np.float64)
+        if arr.shape[0] != self._market_data.n_bars:
+            raise DataShapeError(
+                f"aux_data[{name!r}] has {arr.shape[0]} bars but data has "
+                f"{self._market_data.n_bars}"
+            )
+        if not np.isfinite(arr).all() or (arr <= 0).any():
+            raise ConfigError("atr_series must be finite and positive")
+        return arr
+
     def _apply_signal(self, signals: tuple[bool, bool, bool, bool], bar: Bar, idx: int) -> None:
         le, lx, se, sx = signals
         position = self._open_position()
@@ -259,14 +332,14 @@ class UbeActor(Strategy):  # type: ignore[misc]
 
         if position is not None and position.is_long:
             if lx or se:
-                self._submit_close("signal")
+                self._submit_close("signal", ts=int(bar.ts_event))
                 action = "close_long"
                 if se and self._allow_short:
                     self._open(-1, bar, idx)
                     action = "flip_short"
         elif position is not None and position.is_short:
             if sx or le:
-                self._submit_close("signal")
+                self._submit_close("signal", ts=int(bar.ts_event))
                 action = "close_short"
                 if le:
                     self._open(1, bar, idx)
@@ -279,7 +352,8 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 self._open(-1, bar, idx)
                 action = "sell"
 
-        self.signal_evaluated[idx] = action
+        if action != "hold":
+            self.signal_evaluated[idx] = action
 
     def _open(self, side: int, bar: Bar, idx: int) -> None:
         price = float(bar.close)
@@ -296,18 +370,29 @@ class UbeActor(Strategy):  # type: ignore[misc]
             qty,
         )
         self.submit_order(order)
+        self._record_order(order, int(bar.ts_event))
         if self._exits:
-            self._setup_book(side=side, entry_bar=idx, entry_price=price, size=qty)
+            self._setup_book(
+                side=side,
+                entry_bar=idx,
+                entry_price=price,
+                size=qty,
+                entry_bar_ts=int(bar.ts_event),
+            )
 
     def _entry_quantity(self, price: float) -> Quantity | None:
         if price <= 0.0 or self._instrument is None:
             return None
         account = self.cache.account_for_venue(self.instrument_id.venue)
         balance = float(account.balance_total().as_double())
+        # Apply the sizing leverage as an exposure multiplier on the allocated
+        # capital, mirroring the reference nautilus_trader quantity formula
+        # (``leveraged_capital = capital * leverage`` -> ``qty = notional / price``).
+        leveraged_balance = balance * self._leverage
         units = np.asarray(
             size_position(
                 self._sizing,
-                capital=balance,
+                capital=leveraged_balance,
                 price=price,
                 n=1,
                 vol=self._vol,
@@ -319,7 +404,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
         except ValueError:
             return None
 
-    def _submit_close(self, reason: str, fraction: float = 1.0) -> None:
+    def _submit_close(self, reason: str, fraction: float = 1.0, ts: int | None = None) -> None:
         """Submit a reduce-only market close of ``fraction`` of the remaining position.
 
         A full close (``fraction >= 1.0`` — stops and time exits, §6.4) cancels the
@@ -344,20 +429,34 @@ class UbeActor(Strategy):  # type: ignore[misc]
             reduce_only=True,
         )
         self.submit_order(order)
+        if ts is not None:
+            self._record_order(order, ts)
         self._fill_reasons[str(order.client_order_id)] = reason
         if fraction >= 1.0:
             self._book = None
 
     # -- exit book (plan §4.5 item 3) ----------------------------------------
 
-    def _setup_book(self, *, side: int, entry_bar: int, entry_price: float, size: Quantity) -> None:
-        plan = scale_out_plan(
-            self._exits,
-            market_data=self._market_data,
-            side=side,
-            entry_price=entry_price,
-            entry_bar=entry_bar,
-            atr_series=self._atr_series,
+    def _setup_book(
+        self, *, side: int, entry_bar: int, entry_price: float, size: Quantity, entry_bar_ts: int
+    ) -> None:
+        # Resolve each exit's ATR series independently (§5.2): a named aux_data series
+        # if supplied, else ATR computed from the bars at the exit's period. Reuses the
+        # core scale_out_plan/exit_level helpers (calling, not modifying, core).
+        sub_plans = [
+            scale_out_plan(
+                (cfg,),
+                market_data=self._market_data,
+                side=side,
+                entry_price=entry_price,
+                entry_bar=entry_bar,
+                atr_series=self._resolve_exit_atr(cfg),
+            )
+            for cfg in self._exits
+        ]
+        plan = ExitPlan(
+            fractions=tuple(p.fractions[0] for p in sub_plans),
+            triggered=tuple(p.triggered[0] for p in sub_plans),
         )
         book = _Book(
             side=side,
@@ -379,7 +478,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 side=side,
                 entry_price=entry_price,
                 entry_bar=entry_bar,
-                atr_series=self._atr_series,
+                atr_series=self._resolve_exit_atr(cfg),
             )
             exit_side = OrderSide.SELL if side > 0 else OrderSide.BUY
             if isinstance(cfg, TakeProfit):
@@ -395,6 +494,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
                     reduce_only=True,
                 )
                 self.submit_order(order)
+                self._record_order(order, entry_bar_ts)
                 self._fill_reasons[str(order.client_order_id)] = reason
                 book.live[str(order.client_order_id)] = _LiveExit(
                     order=order, reason=reason, fraction=fraction
@@ -416,6 +516,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
                     reduce_only=True,
                 )
                 self.submit_order(order)
+                self._record_order(order, entry_bar_ts)
                 self._fill_reasons[str(order.client_order_id)] = reason
                 book.live[str(order.client_order_id)] = _LiveExit(
                     order=order, reason=reason, fraction=1.0, levels=levels

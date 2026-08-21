@@ -35,6 +35,9 @@ FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 PARITY_ASSETS = {
     "futures": ("futures", "ES", "es"),
     "crypto_perp": ("crypto_perp", "BTC-USDT", "btc_usdt"),
+    "commodities": ("commodities", "GC", "gc"),
+    "forex": ("forex", "EURUSD", "eurusd"),
+    "stocks": ("stocks", "AAPL", "aapl"),
 }
 
 LOCK_KEYS = ("final_equity", "n_trades", "trades_hash")

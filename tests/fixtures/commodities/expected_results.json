@@ -1,0 +1,26 @@
+{
+  "asset_class": "commodities",
+  "instrument": "GC",
+  "strategy": "trivial_long_roundtrip",
+  "locked_at": "2026-08-21",
+  "tolerance": {
+    "final_equity_rtol": 1e-06
+  },
+  "engines": {
+    "vectorbt": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "backtrader": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
+    },
+    "nautilus": {
+      "final_equity": 92040.0,
+      "n_trades": 1,
+      "trades_hash": "0076c6954939ef6d866be9c63bcb5c4f864b8d228bf534cb7f9beee2797eacc8"
+    }
+  }
+}

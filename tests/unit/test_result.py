@@ -186,6 +186,65 @@ def test_equity_curve_is_derived_and_correct():
     )
 
 
+def test_trade_table_columns_match_spec():
+    # §4.6: the trades table is the spec'd 19-column per-trade view, joined with the
+    # equity curve; the `_pct` columns are fractions (0.05 = 5%), not percentages.
+    ledger, market_data, instruments, config = _single_instrument()
+    result = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments
+    )
+    assert list(result.trade_table.columns) == [
+        "instrument_id",
+        "entry_datetime",
+        "entry_price",
+        "exit_datetime",
+        "exit_price",
+        "duration",
+        "side",
+        "status",
+        "quantity",
+        "entry_notional",
+        "position_size_pct",
+        "trade_return_pct",
+        "realized_pnl",
+        "realized_pnl_pct",
+        "cum_return_pct",
+        "balance",
+        "entry_fee_pct",
+        "exit_fee_pct",
+        "reason",
+    ]
+    (row,) = result.trade_table.to_dict("records")
+    assert row["instrument_id"] == "A"
+    assert row["side"] == 1
+    assert row["status"] == "closed"
+    assert row["quantity"] == 10.0
+    assert row["entry_price"] == 100.0
+    assert row["exit_price"] == 110.0
+    assert row["entry_notional"] == pytest.approx(1000.0)
+    # entry equity at t0 = cash 1000 + mark 10*100 = 2000.
+    assert row["position_size_pct"] == pytest.approx(1000.0 / 2000.0)
+    # trade return = net_pnl / entry_notional = 100 / 1000 = 0.1 (fraction).
+    assert row["trade_return_pct"] == pytest.approx(0.1)
+    assert row["realized_pnl"] == pytest.approx(100.0)
+    assert row["realized_pnl_pct"] == pytest.approx(100.0 / 2000.0)
+    # cum return = balance / initial_capital - 1 = 1000/2000 - 1 (fraction).
+    assert row["cum_return_pct"] == pytest.approx(-0.5)
+    assert row["balance"] == pytest.approx(1000.0)
+    assert row["entry_fee_pct"] == 0.0
+    assert row["exit_fee_pct"] == 0.0
+    assert row["reason"] is None
+
+
+def test_trade_table_has_one_row_per_closed_trade():
+    result, _, _, _ = _two_trades(warmup_bars=0)
+    assert len(result.trade_table) == 2
+    assert result.trade_table["entry_datetime"].tolist() == [
+        _T0.to_pydatetime(),
+        _T2.to_pydatetime(),
+    ]
+
+
 def test_metrics_defaults_to_none_and_benchmark_optional():
     ledger, market_data, instruments, config = _single_instrument()
     result = BacktestResult.from_ledger(
@@ -315,6 +374,9 @@ def test_warmup_slices_equity_and_drops_warmup_trades():
     # Trade 1 (entry at t0, bar 0) is dropped; trade 2 (entry at t2, bar 2) is kept.
     assert len(result.trades) == 1
     assert result.trades[0].entry_timestamp == _ns(_T2)
+    # The trades table is filtered by the same warm-up rule.
+    assert len(result.trade_table) == 1
+    assert result.trade_table["entry_datetime"].tolist() == [_T2.to_pydatetime()]
     # Equity is sliced to bars [t1, t2, t3].
     assert len(result.equity_curve.index) == 3
     # mark: t1=0, t2=5*115=575, t3=0 -> cash 1000 => [1000, 1575, 1000].
@@ -328,12 +390,14 @@ def test_warmup_slices_equity_and_drops_warmup_trades():
 def test_warmup_zero_keeps_everything():
     result, _, _, _ = _two_trades(warmup_bars=0)
     assert len(result.trades) == 2
+    assert len(result.trade_table) == 2
     assert len(result.equity_curve.index) == 4
 
 
 def test_warmup_greater_than_length_drops_everything():
     result, _, _, _ = _two_trades(warmup_bars=4)
     assert result.trades == ()
+    assert len(result.trade_table) == 0
     assert len(result.equity_curve.index) == 0
 
 
@@ -357,6 +421,9 @@ def test_save_load_round_trip(tmp_path):
     assert set(loaded.equity_curve_by_instrument) == set(
         result.equity_curve_by_instrument
     )
+    # The trades table round-trips and stays aligned with the trades view.
+    assert list(loaded.trade_table.columns) == list(result.trade_table.columns)
+    assert loaded.trade_table.to_dict("records") == result.trade_table.to_dict("records")
     assert loaded.config.base_currency == "USD"
     assert loaded.metrics is None
     # The loaded result is still frozen.
