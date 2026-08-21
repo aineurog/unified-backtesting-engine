@@ -80,7 +80,7 @@ from nautilus_trader.model.orders.base import Order
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from ube.core.data import MarketData
-from ube.core.errors import DataShapeError, EngineError
+from ube.core.errors import ConfigError, DataShapeError, EngineError
 from ube.core.risk.exits import (
     ATRStop,
     ChandelierExit,
@@ -305,7 +305,10 @@ class UbeActor(Strategy):  # type: ignore[misc]
         3. The aux ATR is forward-filled onto the (possibly finer) main bar grid so it
            is row-aligned with ``data`` (length ``n_bars``).
         """
-        value = self._aux_atr[name]
+        aux = self._aux_atr
+        if aux is None or name not in aux:
+            raise ConfigError(f"aux_data[{name!r}] was not supplied")
+        value = aux[name]
         if isinstance(value, MarketData):
             atr_aux = atr(value, period)  # causal Wilder ATR, aligned to aux bars
             series = pd.Series(atr_aux, index=value.timestamps)
