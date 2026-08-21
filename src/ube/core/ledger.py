@@ -1121,15 +1121,23 @@ def funding_payments(
     funding_rate: ArrayLike = 0.0,
     borrow_rate: ArrayLike = 0.0,
     currency: str,
+    interval_ns: int = 0,
 ) -> tuple[LedgerEvent, ...]:
-    """Generate ``funding_payment`` events from a per-bar carry rate series (§4.6, §24).
+    """Generate ``funding_payment`` events from a carry rate series (§4.6, §24).
 
     This is the *single* generator that books carry (funding/swap + short borrow) into
-    the ledger — there is no other monetary path for carry. The rates are per-bar
-    fractions of notional (a scalar broadcasts to a constant series); the §24 rate
-    time-series is resampled onto the bar grid by the caller and passed here. Phase 2
-    replaces the bar-grid schedule with calendar-aware (8h / daily / at-close) events,
-    emitting the same event type.
+    the ledger — there is no other monetary path for carry. The rates are fractions of
+    notional; the §24 rate time-series is resampled onto the bar grid by the caller and
+    passed here.
+
+    Scheduling (Phase-2 calendar-aware, §24):
+      * ``interval_ns == 0`` (legacy) — one event **per bar** where the position is open;
+        ``funding_rate`` / ``borrow_rate`` are interpreted as *per-bar* rates.
+      * ``interval_ns > 0`` — events are emitted only on bars whose timestamp falls on the
+        schedule anchored to the first bar's phase (i.e. every ``interval_ns``); the rates
+        are interpreted as the *per-period* (per-interval) rate and charged once per
+        period. This is the correct behaviour for e.g. crypto-perp funding every 8h, and
+        avoids the per-bar over-charge.
 
     ``notional`` is the non-negative open value per bar, ``side`` is ``+1``/``-1``/``0``,
     and ``timestamps`` are int64-ns bar boundaries aligned to them (all length-``n``).
@@ -1172,8 +1180,16 @@ def funding_payments(
     f = _series(funding_rate, "funding_rate")
     b = _series(borrow_rate, "borrow_rate")
 
+    # Calendar-aware scheduling (§24): charge only on interval-boundary bars. When no
+    # interval is set, every open bar accrues (legacy per-bar behaviour).
+    if interval_ns and interval_ns > 0:
+        phase = ts[0] % interval_ns
+        on_schedule = (ts % interval_ns) == phase
+    else:
+        on_schedule = np.ones(n.shape[0], dtype=bool)
+
     cost = (f + b * (s < 0.0)) * n
-    idx = np.nonzero((n > 0.0) & (cost != 0.0))[0]
+    idx = np.nonzero((n > 0.0) & (cost != 0.0) & on_schedule)[0]
     return tuple(
         LedgerEvent(
             EventType.FUNDING_PAYMENT,

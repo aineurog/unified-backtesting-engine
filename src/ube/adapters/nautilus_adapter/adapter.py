@@ -446,6 +446,12 @@ class NautilusAdapter(EngineAdapter):
                 dtype=np.float64,
             )
             step_ts, step_value = _step_timestamps(pc_ts, pc_val)
+            # Calendar-aware funding (§24): charge the per-period rate once per interval
+            # (default 8h) instead of per bar. ``funding`` is the per-period rate.
+            interval_hours = float(
+                config.engine_overrides.get("funding_interval_hours", 8.0)
+            )
+            interval_ns = int(interval_hours * 3600 * 1_000_000_000)
             for event in funding_payments(
                 instrument_id=instrument_id,
                 timestamps=bar_ts,
@@ -454,6 +460,7 @@ class NautilusAdapter(EngineAdapter):
                 funding_rate=funding,
                 borrow_rate=borrow,
                 currency=settlement,
+                interval_ns=interval_ns,
             ):
                 _add(event, int(event.timestamp))
 
@@ -505,6 +512,11 @@ def _resolve_atr_series(
     name = names.pop()
     if aux_data is None or name not in aux_data:
         return None  # absent → auto-compute ATR(period) (§5.2)
+    # A raw OHLCV MarketData aux is resolved into an ATR series by the actor itself
+    # (it computes ATR internally per-§5.2, with no look-ahead); don't coerce it to a
+    # plain array here. Precomputed 1-D series are forwarded straight through.
+    if isinstance(aux_data[name], MarketData):
+        return None
     series = np.asarray(aux_data[name], dtype=np.float64)
     if series.ndim != 1:
         raise ConfigError(f"aux_data[{name!r}] must be 1-D; got shape {series.shape}")

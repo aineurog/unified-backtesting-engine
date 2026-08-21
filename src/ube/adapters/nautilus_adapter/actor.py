@@ -183,6 +183,14 @@ class UbeActor(Strategy):  # type: ignore[misc]
         self._leverage = float(leverage)
         self._exits = exits
         self._vol = vol
+        # Self-sufficient volatility estimate for ``volatility_target`` sizing (§6.3): if
+        # the adapter didn't supply one, derive per-bar ATR/price from the main bars so
+        # trade execution can size dynamically on the entry bar's realized vol.
+        if self._sizing.kind == "volatility_target" and self._vol is None:
+            self._vol = atr(self._market_data) / self._market_data.close
+        # Fail fast: ATR-based exits require their named aux_data series, and that raw
+        # aux OHLCV must span the data/signal period (§5.2).
+        self._validate_aux()
 
         ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
         self._ts_to_index: dict[int, int] = {
@@ -278,19 +286,79 @@ class UbeActor(Strategy):  # type: ignore[misc]
             float(order.quantity.as_double()),
         )
 
+    def _validate_aux(self) -> None:
+        """Fail fast if an ATR-based exit cannot be satisfied by ``aux_data`` (§5.2).
+
+        ``ATRStop`` / ``ChandelierExit`` *require* a named ``aux_data`` series — there is
+        no auto-compute fallback for them (unlike the generic auto path). The named series
+        must be present, and if it is the raw signal-timeframe ``MarketData`` it must span
+        the data/signal period so its ATR is defined for every main bar (a leading gap
+        would leave main bars with no ATR; a trailing gap would leave stale ATR).
+        """
+        required = {
+            getattr(e, "atr", None)
+            for e in self._exits
+            if isinstance(e, (ATRStop, ChandelierExit))
+        }
+        required.discard(None)
+        if not required:
+            return
+        if self._aux_atr is None:
+            raise ConfigError(
+                "exits reference ATR series(es) "
+                f"{sorted(required)} but aux_data was not supplied; "
+                "ATR-based stops/chandelier require aux_data"
+            )
+        missing = required - set(self._aux_atr)
+        if missing:
+            raise ConfigError(
+                "exits reference ATR series(es) "
+                f"{sorted(missing)} that are absent from aux_data; "
+                "ATR-based stops/chandelier require the named aux_data series"
+            )
+        # Range consistency vs the data/signal grid. Signals are aligned to the main bar
+        # grid, so checking aux against ``market_data`` covers the signal range too.
+        main_ts = self._market_data.timestamps
+        main_start, main_end = main_ts[0], main_ts[-1]
+        main_step = main_ts[1] - main_ts[0] if len(main_ts) > 1 else pd.Timedelta(0)
+        for name in sorted(required):
+            value = self._aux_atr[name]
+            if not isinstance(value, MarketData):
+                continue  # precomputed arrays are length-checked in _atr_from_aux
+            aux_ts = value.timestamps
+            if aux_ts[0] > main_start + main_step:
+                raise DataShapeError(
+                    f"aux_data[{name!r}] starts at {aux_ts[0]} which is after the data "
+                    f"start {main_start}; the leading main bars would have no ATR "
+                    "(aux_data must start at or before the signal/price period)"
+                )
+            aux_step = aux_ts[1] - aux_ts[0] if len(aux_ts) > 1 else main_step
+            if aux_ts[-1] < main_end - aux_step:
+                raise DataShapeError(
+                    f"aux_data[{name!r}] ends at {aux_ts[-1]} which is more than one aux "
+                    f"bar before the data end {main_end}; aux_data must span the "
+                    "signal/price period (trailing ATR would be stale)"
+                )
+
     def _resolve_exit_atr(self, cfg: Exit) -> np.ndarray | None:
         """Resolve the ATR series for ``cfg`` (§5.2).
 
-        If the exit names an ``aux_data`` entry, it is resolved by :meth:`_atr_from_aux`
-        (a ``MarketData`` is the signal-timeframe OHLCV the library turns into ATR; an
-        array is used verbatim). Otherwise ATR is auto-computed over ``data`` at the
-        exit's ``period``. Returns ``None`` for exits that need no ATR (e.g.
-        ``TrailingStop``), letting the core level functions compute their running
-        extremes from the bars directly.
+        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) *requires* the named
+        ``aux_data`` series — there is no auto-compute fallback for those (the requirement
+        is enforced up-front in :meth:`_validate_aux`). If the exit names an ``aux_data``
+        entry, it is resolved by :meth:`_atr_from_aux` (a ``MarketData`` is the
+        signal-timeframe OHLCV the library turns into ATR; an array is used verbatim).
+        Returns ``None`` for exits that need no ATR (e.g. ``TrailingStop``), letting the
+        core level functions compute their running extremes from the bars directly.
         """
         name = getattr(cfg, "atr", None)
         if name and self._aux_atr and name in self._aux_atr:
             return self._atr_from_aux(name, getattr(cfg, "period", 14))
+        if isinstance(cfg, (ATRStop, ChandelierExit)):
+            raise ConfigError(
+                f"{type(cfg).__name__} requires aux_data[{name!r}] but it is missing; "
+                "ATR-based stops/chandelier are mandatory aux consumers (§5.2)"
+            )
         period = getattr(cfg, "period", 14)
         return atr(self._market_data, period)
 
