@@ -45,6 +45,8 @@ metrics/reporting layer (§10); it is not computed here.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import pickle
 import uuid
 from collections.abc import Mapping
@@ -74,7 +76,7 @@ from ube.core.ledger import (
     trades,
 )
 
-__all__ = ["BacktestResult"]
+__all__ = ["BacktestResult", "result_hash"]
 
 
 @dataclass(frozen=True)
@@ -242,6 +244,54 @@ class BacktestResult:
         _refreeze(obj.positions)
         _refreeze(obj.benchmark)
         return obj
+
+
+def result_hash(result: BacktestResult) -> str:
+    """SHA-256 fingerprint of a result's material output (§4.8, §16).
+
+    Hashes the completed ``trades`` — a canonical, deterministic projection sorted by
+    entry timestamp (the same field set as the §16 parity ``trades_hash``) — together
+    with the combined ``equity_curve`` values, so two runs that agree on both are treated
+    as identical. This is the ``result_hash`` stored in the experiment log (§4.8) and the
+    basis of cross-engine parity (§16).
+
+    Args:
+        result: The run's :class:`BacktestResult`.
+
+    Returns:
+        The hex SHA-256 digest.
+
+    Raises:
+        DataShapeError: If ``result`` is not a :class:`BacktestResult`.
+    """
+    if not isinstance(result, BacktestResult):
+        raise DataShapeError(
+            f"result_hash expects a BacktestResult; got {type(result).__name__}"
+        )
+    digest = hashlib.sha256()
+    records = []
+    for trade in sorted(result.trades, key=lambda t: t.entry_timestamp):
+        records.append(
+            {
+                "instrument_id": trade.instrument_id,
+                "side": trade.side,
+                "quantity": trade.quantity,
+                "entry_timestamp": trade.entry_timestamp,
+                "exit_timestamp": trade.exit_timestamp,
+                "entry_price": trade.entry_price,
+                "exit_price": trade.exit_price,
+                "gross_pnl": trade.gross_pnl,
+                "commission": trade.commission,
+                "funding": trade.funding,
+                "net_pnl": trade.net_pnl,
+                "exit_reason": trade.exit_reason,
+            }
+        )
+    digest.update(
+        json.dumps(records, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    digest.update(result.equity_curve.equity.tobytes())
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------

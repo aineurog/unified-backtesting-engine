@@ -19,6 +19,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 
+from numpy.typing import ArrayLike
+
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError
@@ -31,6 +33,7 @@ __all__ = [
     "get_engine",
     "register_engine",
     "registered_engines",
+    "resolve_engine_name",
 ]
 
 #: Engine names tried by :func:`get_engine` for ``"auto"``, in order of preference (§7.1).
@@ -52,7 +55,7 @@ class EngineAdapter(ABC):
         signals: Signals,
         config: BacktestConfig,
         *,
-        aux_data: Mapping[str, MarketData] | None = None,
+        aux_data: Mapping[str, ArrayLike] | None = None,
     ) -> BacktestResult:
         """Run one backtest and return the canonical result (§4.1, §7.1).
 
@@ -61,8 +64,8 @@ class EngineAdapter(ABC):
             signals: The 4-column entry/exit signals on the same bar grid as ``data``.
             config: The full :class:`~ube.core.config.BacktestConfig` (instrument, cost,
                 risk/exits, benchmark, engine overrides).
-            aux_data: Reserved for supplemental canonical data an adapter may need (e.g.
-                extra market data feeds); unused by adapters that only need ``data``.
+            aux_data: Named derived series (§5.2) — e.g. a precomputed ATR — keyed by
+                name; unused by adapters that only need ``data``.
         """
         raise NotImplementedError
 
@@ -112,6 +115,29 @@ def registered_engines() -> tuple[str, ...]:
     return tuple(sorted(_REGISTRY))
 
 
+def resolve_engine_name(name: str = "auto") -> str:
+    """Resolve ``name`` to a canonical (normalized) engine name (§7.1).
+
+    ``"auto"`` resolves to the first *installed* (registered) adapter in
+    ``vectorbt → backtrader → nautilus`` order, and raises
+    :class:`~ube.core.errors.ConfigError` when none is registered. Any other name is
+    normalized (lowercased/stripped) and returned as-is — whether that name is actually
+    *registered* is :func:`get_engine`'s concern, not this function's.
+    """
+    key = _normalize(name)
+    if key == "auto":
+        for candidate in AUTO_ENGINE_ORDER:
+            if candidate in _REGISTRY:
+                return candidate
+        available = registered_engines()
+        raise ConfigError(
+            "no engine adapter is installed (auto requested); "
+            "install one via ube.register_engine(...)"
+            f" — registered: {', '.join(available) if available else 'none'}"
+        )
+    return key
+
+
 def get_engine(name: str = "auto") -> type[EngineAdapter]:
     """Resolve the adapter class for ``name`` (§4.1, §7.1).
 
@@ -119,17 +145,7 @@ def get_engine(name: str = "auto") -> type[EngineAdapter]:
     ``vectorbt → backtrader → nautilus`` order. An unknown name — or ``"auto"`` with no
     adapter registered — raises :class:`~ube.core.errors.ConfigError`.
     """
-    key = _normalize(name)
-    if key == "auto":
-        for candidate in AUTO_ENGINE_ORDER:
-            if candidate in _REGISTRY:
-                return _REGISTRY[candidate]
-        available = registered_engines()
-        raise ConfigError(
-            "no engine adapter is installed (auto requested); "
-            "install one via ube.register_engine(...)"
-            f" — registered: {', '.join(available) if available else 'none'}"
-        )
+    key = resolve_engine_name(name)
     adapter = _REGISTRY.get(key)
     if adapter is None:
         available = registered_engines()

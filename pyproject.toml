@@ -42,7 +42,6 @@ dev = [
     "mypy",
     "hypothesis",
     "pandas-stubs",
-    "nautilus-trader",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -26,7 +26,7 @@ from numbers import Real
 
 from ube.core.errors import InvalidInstrumentError
 
-__all__ = ["Instrument", "ASSET_CLASSES"]
+__all__ = ["Instrument", "ASSET_CLASSES", "LONG_ONLY_ASSET_CLASSES", "allows_short"]
 
 # The asset classes the engine supports. The labels are locked by the per-asset-class
 # deterministic fixtures of §16 (``crypto_perp/``, ``futures/``, ``stocks/``,
@@ -35,6 +35,16 @@ __all__ = ["Instrument", "ASSET_CLASSES"]
 ASSET_CLASSES: frozenset[str] = frozenset(
     {"crypto_perp", "crypto_spot", "futures", "stocks", "forex", "commodities"}
 )
+
+#: Asset classes that cannot open a short position (§4.5). Spot crypto has nothing
+#: to borrow, so "short" is undefined — ``crypto_spot`` is the engine's one long-only
+#: class. The signal validation of §6.1 rejects any short signal on these.
+LONG_ONLY_ASSET_CLASSES: frozenset[str] = frozenset({"crypto_spot"})
+
+
+def allows_short(asset_class: str) -> bool:
+    """Whether an ``asset_class`` can open a short position (§4.5)."""
+    return asset_class not in LONG_ONLY_ASSET_CLASSES
 
 
 def _is_positive_number(value: object) -> bool:
@@ -96,3 +106,8 @@ class Instrument:
             raise InvalidInstrumentError(
                 "contract_multiplier must be a positive finite number"
             )
+
+    @property
+    def allows_short(self) -> bool:
+        """Whether this instrument's ``asset_class`` can open a short position (§4.5)."""
+        return allows_short(self.asset_class)

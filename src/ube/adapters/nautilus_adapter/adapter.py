@@ -5,7 +5,7 @@ runs one canonical backtest on NautilusTrader's ``BacktestEngine`` and folds the
 engine's fills/positions back into the canonical event ledger (§4.6), producing a
 :class:`~ube.core.result.BacktestResult`.
 
-Translation summary (plan §5.3):
+Translation summary (requirements §4.6):
 
 * **Signals + exits** — the canonical 4-column :class:`~ube.core.signals.Signals` and
   :class:`RiskConfig.exit` levels are injected into Nautilus via :class:`UbeActor`
@@ -58,6 +58,7 @@ Nautilus's bar-adaptive fill model legitimately differs from the core simulation
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any, cast
@@ -68,6 +69,7 @@ from nautilus_trader.config import BacktestEngineConfig, LoggingConfig
 from nautilus_trader.model.enums import AccountType, OmsType
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.objects import Currency, Money
+from numpy.typing import ArrayLike
 
 from ube.adapters.base import EngineAdapter
 from ube.adapters.nautilus_adapter.actor import UbeActor, UbeActorConfig
@@ -80,7 +82,7 @@ from ube.adapters.nautilus_adapter.overrides import (
     validate_overrides,
 )
 from ube.core.config import BacktestConfig
-from ube.core.cost import resolve_cost_model
+from ube.core.cost import CostModel, resolve_cost_model
 from ube.core.data import MarketData
 from ube.core.errors import (
     ConfigError,
@@ -90,8 +92,8 @@ from ube.core.errors import (
 )
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
-from ube.core.risk.exits import atr
-from ube.core.signals import Signals
+from ube.core.risk.exits import ATRStop, ChandelierExit, Exit, atr
+from ube.core.signals import Signals, validate_long_only
 
 __all__ = ["NautilusAdapter"]
 
@@ -139,8 +141,9 @@ class NautilusAdapter(EngineAdapter):
             DataShapeError: ``data`` is not a :class:`~ube.core.data.MarketData`
                 (or has fewer than two bars — no bar period to derive, §15).
             InvalidSignalError: ``signals`` is not a
-                :class:`~ube.core.signals.Signals`, or its rows do not match
-                ``data``'s bar count.
+                :class:`~ube.core.signals.Signals`, its rows do not match
+                ``data``'s bar count, or it shorts a long-only instrument
+                (``crypto_spot`` — §4.5).
             ConfigError: ``config`` is not a :class:`~ube.core.config.BacktestConfig`.
             EngineError: The underlying Nautilus backtest failed (original preserved).
         """
@@ -164,6 +167,10 @@ class NautilusAdapter(EngineAdapter):
                 f"signals cover {signals.n_bars} bars but market data has "
                 f"{data.n_bars}; signal rows must be row-aligned with bars"
             )
+
+        # A long-only instrument cannot express a short signal (§4.5) — reject
+        # before any engine work rather than letting the actor silently drop it.
+        validate_long_only(signals, config.instrument.asset_class)
 
         overrides = validate_overrides(config.engine_overrides)
         cost_model = (
@@ -195,7 +202,10 @@ class NautilusAdapter(EngineAdapter):
             fee_overrides["leverage"] = margin_leverage
 
         build = build_instrument(config.instrument, fee_overrides)
-        instrument_id = str(build.instrument_id)
+        # The ledger tags every event with the canonical symbol (§4.6), not the
+        # venue-qualified Nautilus ``InstrumentId`` (``build.instrument_id`` is still
+        # used below for the actor, which needs the venue to place native orders).
+        instrument_id = config.instrument.symbol
         bars, bar_type = to_nautilus_bars(data, build)
         signal_map = to_signal_map(data, signals)
         settlement = config.instrument.settlement_currency or "USD"
@@ -213,6 +223,7 @@ class NautilusAdapter(EngineAdapter):
                 asset_class=config.instrument.asset_class,
             ),
             market_data=data,
+            atr_series=_resolve_atr_series(config.risk.exit, aux_data),
             sizing=config.risk.sizing,
             exits=config.risk.exit,
             aux_atr=aux_data,
@@ -296,7 +307,7 @@ class NautilusAdapter(EngineAdapter):
         actor: UbeActor,
         data: MarketData,
         config: BacktestConfig,
-        cost_model: object,
+        cost_model: CostModel,
         instrument_id: str,
         settlement: str,
         starting_balance: float,
@@ -392,14 +403,13 @@ class NautilusAdapter(EngineAdapter):
                     side=side,
                     quantity=quantity,
                     price=price,
-                    notional=notional,
                     exit_reason=actor.exit_reasons.get(str(client_order_id)),
                 ),
                 ts,
             )
             commission = str(row["commission"])
             if commission:
-                amount, currency = _parse_money(commission)
+                amount, currency = _parse_money(commission, settlement)
                 if amount != 0.0:
                     _add(
                         LedgerEvent(
@@ -463,11 +473,42 @@ def _events_of_type(
     return [event for _ts, _rank, _seq, event in events if event.event_type is event_type]
 
 
-def _carry_rates(cost_model: object) -> tuple[float, float]:
+def _carry_rates(cost_model: CostModel) -> tuple[float, float]:
     """The ``(funding, borrow)`` per-bar rates of the resolved cost model."""
-    funding = float(getattr(cost_model, "funding", 0.0))
-    borrow = float(getattr(cost_model, "borrow", 0.0))
-    return funding, borrow
+    return float(cost_model.funding), float(cost_model.borrow)
+
+
+def _resolve_atr_series(
+    exits: tuple[Exit, ...],
+    aux_data: Mapping[str, ArrayLike] | None,
+) -> np.ndarray | None:
+    """Resolve the single ATR series the actor's exit book needs (§5.2).
+
+    Every ATR-referencing exit that names an ``aux_data`` key must name the *same* key —
+    the actor's exit book holds one series. A missing key falls back to auto-compute
+    (the exit's own ``period``). Multiple distinct named keys are a configuration the
+    single-series book cannot express and raise :class:`~ube.core.errors.ConfigError`
+    (fail-fast, §15).
+    """
+    names = {
+        e.atr
+        for e in exits
+        if isinstance(e, (ATRStop, ChandelierExit)) and e.atr is not None
+    }
+    if not names:
+        return None
+    if len(names) > 1:
+        raise ConfigError(
+            "nautilus actor supports a single named ATR series; "
+            f"exits reference {sorted(names)}"
+        )
+    name = names.pop()
+    if aux_data is None or name not in aux_data:
+        return None  # absent → auto-compute ATR(period) (§5.2)
+    series = np.asarray(aux_data[name], dtype=np.float64)
+    if series.ndim != 1:
+        raise ConfigError(f"aux_data[{name!r}] must be 1-D; got shape {series.shape}")
+    return series
 
 
 def _volatility_estimate(market_data: MarketData) -> np.ndarray:
@@ -482,14 +523,36 @@ def _bar_timestamps_ns(data: MarketData) -> np.ndarray:
 
 
 def _fill_timestamp_ns(row: Any) -> int:
-    """The int64-nanosecond fill timestamp from a fills-report row."""
-    return int(row["ts_event"].value)
+    """The int64-nanosecond fill timestamp from a fills-report row.
+
+    Nautilus emits ``ts_event`` as a tz-aware ``pandas.Timestamp``; accept any value
+    with a ``.value`` nanoseconds field and fall back to an integer epoch so the fold
+    does not break if the report schema changes.
+    """
+    ts = row["ts_event"]
+    value = getattr(ts, "value", None)
+    return int(value) if value is not None else int(ts)
 
 
-def _parse_money(text: str) -> tuple[float, str]:
-    """Parse a Nautilus ``Money`` repr (``"1000.20 USD"``) into ``(amount, currency)``."""
-    parts = str(text).strip().split()
-    return float(parts[0]), parts[1] if len(parts) > 1 else "USD"
+#: A ``Money`` string (``"1000.20 USD"``) — amount plus an optional currency code.
+_MONEY_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*([A-Za-z]{3,})?\s*$")
+
+
+def _parse_money(text: str, default_currency: str = "USD") -> tuple[float, str]:
+    """Parse a Nautilus ``Money`` string (``"1000.20 USD"``) into ``(amount, currency)``.
+
+    The currency suffix is optional; a missing or empty suffix falls back to
+    ``default_currency`` (the account settlement currency). Parsing is tolerant of
+    surrounding whitespace and raises rather than guessing when the layout is
+    unrecognised (fail-fast, §15).
+    """
+    s = str(text).strip()
+    if not s:
+        return 0.0, default_currency
+    match = _MONEY_RE.match(s)
+    if match is None:
+        raise EngineError(f"cannot parse commission as Money: {text!r}")
+    return float(match.group(1)), match.group(2) or default_currency
 
 
 def _step_timestamps(

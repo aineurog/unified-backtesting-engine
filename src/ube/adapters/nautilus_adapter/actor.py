@@ -1,17 +1,17 @@
-"""UbeActor — the Nautilus-specific trading piece (plan §4.5, requirements §4.5/§4.6/§6).
+"""UbeActor — the Nautilus-specific trading piece (requirements §4.5/§4.6/§6).
 
 The Actor translates canonical 4-column signals plus :class:`RiskConfig.exit` levels into
 native Nautilus order flow. It is a :class:`~nautilus_trader.trading.strategy.Strategy`
 (in this version ``Strategy`` *is* ``Actor`` and is the only class exposing the trading
 surface). All exit levels are **computed with the ``core`` pure functions** and injected
-into Nautilus's native mechanism — no strategy re-implementation (plan §4.5).
+into Nautilus's native mechanism — no strategy re-implementation (requirements §4.1).
 
-Behavior summary (each item maps to a plan §4.5 bullet):
+Behavior summary (each item maps to a requirements §6 bullet):
 
 * **Entries** — on a bar whose signals demand a position, size via
   :func:`~ube.core.risk.sizing.size_position` against the venue account balance and the
   bar's close, submit a market order (fills at the same-bar close — the entry is
-  evaluated at bar close, plan §4.4/§5.2).
+  evaluated at bar close, requirements §4.4/§5.2).
 * **Signal exits / flips** — ``long_exit`` / ``short_exit`` close the open position with a
   reduce-only market order; a same-bar flip closes + opens (two orders, the netting venue
   reconciles at the bar close). ``short_entry`` while long (and the mirror) is treated as
@@ -31,8 +31,9 @@ Behavior summary (each item maps to a plan §4.5 bullet):
   TP cannot fill against a later position. On every bar while open, working exit
   orders are re-synchronised to the remaining position quantity (scale-outs) and native
   stop triggers are moved to the just-completed bar's precomputed level.
-* **exit_reason stamping** — the reason (``signal``, ``take_profit``, ``atr_stop``,
-  ``trailing_stop``, ``chandelier``, ``time_exit``) is recorded per closing fill in
+* **exit_reason stamping** — the reason (``signal``, ``take_profit``, ``stop_loss``,
+  ``atr_stop``, ``trailing_stop``, ``chandelier``, ``time_exit``) is recorded per closing
+  fill in
   :attr:`exit_reasons` (keyed by client-order id) so the adapter can stamp the ledger's
   closing fill (§4.6). :attr:`position_reasons` mirrors the reference netting pattern.
 
@@ -81,6 +82,7 @@ from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, EngineError
+from ube.core.instrument import allows_short
 from ube.core.risk.exits import (
     ATRStop,
     ChandelierExit,
@@ -116,7 +118,7 @@ _EXIT_REASONS: dict[type, str] = {
 
 
 class UbeActorConfig(StrategyConfig):  # type: ignore[misc]
-    """Actor configuration — only msgspec-serializable scalars (plan §4.5.3).
+    """Actor configuration — only msgspec-serializable scalars (requirements §4.2).
 
     The heavyweight runtime inputs (``market_data``, ``atr_series``, ``sizing``,
     ``exits``) are passed as constructor kwargs so Nautilus never serializes them.
@@ -145,7 +147,7 @@ class _LiveExit:
 
 @dataclass
 class _Book:
-    """The exit book anchored at one position's entry (plan §4.5 item 3)."""
+    """The exit book anchored at one position's entry (requirements §6.4)."""
 
     side: int  # +1 long, -1 short
     entry_bar: int
@@ -190,9 +192,10 @@ class UbeActor(Strategy):  # type: ignore[misc]
         self._instrument: Any = None
         self._book: _Book | None = None
         self._fill_reasons: dict[str, str] = {}
-        #: Shorting is not permitted on ``crypto_spot`` (reference ``strategy/signals.py``:
-        #: ``allow_short = not (market == "crypto" and asset_type == "spot")``).
-        self._allow_short = config.asset_class != "crypto_spot"
+        #: Shorting is not permitted on long-only asset classes (§4.5). The adapter
+        #: rejects such signals up-front (``validate_long_only``); this guard is the
+        #: actor's own defence when constructed directly.
+        self._allow_short = allows_short(config.asset_class)
 
         #: Closing-fill client_order_id -> exit_reason (§4.6); read by the adapter.
         self.exit_reasons: dict[str, str] = {}
@@ -264,7 +267,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 f"UbeActor non-market order rejected (tolerated): {event.client_order_id}"
             )
 
-    # -- entries + signal exits (plan §4.5 items 1-2) ------------------------
+    # -- entries + signal exits (requirements §6) ------------------------
 
     def _record_order(self, order: Order, ts: int) -> None:
         """Remember an order so the fold can emit a §4.6 ``order_submitted`` event."""
@@ -336,31 +339,31 @@ class UbeActor(Strategy):  # type: ignore[misc]
         if position is not None and position.is_long:
             if lx or se:
                 self._submit_close("signal", ts=int(bar.ts_event))
-                action = "close_long"
+                action = "long_exit"
                 if se and self._allow_short:
                     self._open(-1, bar, idx)
-                    action = "flip_short"
+                    action = "short_entry"
         elif position is not None and position.is_short:
             if sx or le:
                 self._submit_close("signal", ts=int(bar.ts_event))
-                action = "close_short"
+                action = "short_exit"
                 if le:
                     self._open(1, bar, idx)
-                    action = "flip_long"
+                    action = "long_entry"
         else:
             if le:
                 self._open(1, bar, idx)
-                action = "buy"
+                action = "long_entry"
             elif se and self._allow_short:
                 self._open(-1, bar, idx)
-                action = "sell"
+                action = "short_entry"
 
         if action != "hold":
             self.signal_evaluated[idx] = action
 
     def _open(self, side: int, bar: Bar, idx: int) -> None:
         price = float(bar.close)
-        qty = self._entry_quantity(price)
+        qty = self._entry_quantity(price, idx)
         if qty is None:
             self.log.error(
                 f"UbeActor entry skipped at bar {idx}: sizing produced no tradable lot "
@@ -383,7 +386,13 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 entry_bar_ts=int(bar.ts_event),
             )
 
-    def _entry_quantity(self, price: float) -> Quantity | None:
+    def _entry_quantity(self, price: float, idx: int) -> Quantity | None:
+        """Sized entry quantity in tradable units at entry bar ``idx``.
+
+        For ``volatility_target`` the vol estimate is the *entry bar's* value
+        (``self._vol[idx]``) — never the whole series or its first element, which
+        would silently mis-size every later entry.
+        """
         if price <= 0.0 or self._instrument is None:
             return None
         account = self.cache.account_for_venue(self.instrument_id.venue)
@@ -392,13 +401,14 @@ class UbeActor(Strategy):  # type: ignore[misc]
         # capital, mirroring the reference nautilus_trader quantity formula
         # (``leveraged_capital = capital * leverage`` -> ``qty = notional / price``).
         leveraged_balance = balance * self._leverage
+        vol = self._vol[idx] if self._vol is not None else None
         units = np.asarray(
             size_position(
                 self._sizing,
                 capital=leveraged_balance,
                 price=price,
                 n=1,
-                vol=self._vol,
+                vol=vol,
             ),
             dtype=np.float64,
         )
@@ -415,6 +425,8 @@ class UbeActor(Strategy):  # type: ignore[misc]
         (``fraction < 1.0`` — a take-profit slice) closes only that slice with a
         reduce-only market order and leaves the book alive so the sibling stops
         keep protecting the remainder (§6.4).
+
+        ``ts`` is the submission bar's event timestamp (for the ``order_submitted`` fold).
         """
         position = self._open_position()
         if position is None:
@@ -438,7 +450,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
         if fraction >= 1.0:
             self._book = None
 
-    # -- exit book (plan §4.5 item 3) ----------------------------------------
+    # -- exit book (requirements §6.4) ----------------------------------------
 
     def _setup_book(
         self, *, side: int, entry_bar: int, entry_price: float, size: Quantity, entry_bar_ts: int
@@ -503,8 +515,8 @@ class UbeActor(Strategy):  # type: ignore[misc]
                     order=order, reason=reason, fraction=fraction
                 )
             else:
-                # ATRStop / TrailingStop / Chandelier: a native stop_market whose trigger
-                # is placed at the level computable on the entry bar, then ratcheted by
+                # StopLoss / ATRStop / TrailingStop / Chandelier: a native stop_market
+                # whose trigger is placed at the entry-bar level, then ratcheted by
                 # _maintain_exits on each later bar. The initial trigger must be *outside*
                 # the market at submission (the venue rejects a stop already "in the
                 # market", probe-verified on Nautilus 1.221.0), so the entry-bar level —

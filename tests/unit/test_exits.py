@@ -14,6 +14,7 @@ from ube.core.risk import (
     ChandelierExit,
     RiskConfig,
     SizeModel,
+    StopLoss,
     TakeProfit,
     TimeExit,
     TrailingStop,
@@ -25,6 +26,7 @@ from ube.core.risk import (
     is_triggered,
     scale_out_fraction,
     scale_out_plan,
+    stop_loss_level,
     take_profit_level,
     time_exit_mask,
     trailing_stop_level,
@@ -59,7 +61,14 @@ def test_triggers_constant():
 
 @pytest.mark.parametrize(
     "cfg",
-    [TakeProfit(0.02), ATRStop(3), TrailingStop(0.1), TimeExit(5), ChandelierExit(3)],
+    [
+        TakeProfit(0.02),
+        StopLoss(0.03),
+        ATRStop(3),
+        TrailingStop(0.1),
+        TimeExit(5),
+        ChandelierExit(3),
+    ],
 )
 def test_exit_configs_are_frozen(cfg):
     with pytest.raises(FrozenInstanceError):
@@ -81,6 +90,15 @@ def test_take_profit_validation():
         TakeProfit(0.02, scale_out=0.0)
     with pytest.raises(ConfigError):
         TakeProfit(0.02, trigger="intraday")  # type: ignore[arg-type]
+
+
+def test_stop_loss_validation():
+    with pytest.raises(ConfigError):
+        StopLoss(0.0)
+    with pytest.raises(ConfigError):
+        StopLoss(-0.05)
+    with pytest.raises(ConfigError):
+        StopLoss(0.05, trigger="weekly")  # type: ignore[arg-type]
 
 
 def test_atr_stop_validation():
@@ -144,6 +162,14 @@ def test_take_profit_level_long_and_short():
     short_level = take_profit_level(TakeProfit(0.1), md, side=-1, entry_price=100)
     np.testing.assert_allclose(long_level, [110.0, 110.0, 110.0])
     np.testing.assert_allclose(short_level, [90.0, 90.0, 90.0])
+
+
+def test_stop_loss_level_long_and_short():
+    md = _md([100, 101, 102])
+    long_level = stop_loss_level(StopLoss(0.05), md, side=1, entry_price=100)
+    short_level = stop_loss_level(StopLoss(0.05), md, side=-1, entry_price=100)
+    np.testing.assert_allclose(long_level, [95.0, 95.0, 95.0])
+    np.testing.assert_allclose(short_level, [105.0, 105.0, 105.0])
 
 
 def test_atr_stop_level_fixed():
@@ -225,6 +251,12 @@ def test_exit_level_dispatches():
     np.testing.assert_allclose(level, [110.0, 110.0, 110.0])
 
 
+def test_exit_level_dispatches_stop_loss():
+    md = _md([100, 101, 102])
+    level = exit_level(StopLoss(0.05), market_data=md, side=1, entry_price=100)
+    np.testing.assert_allclose(level, [95.0, 95.0, 95.0])
+
+
 def test_exit_level_rejects_time_exit():
     with pytest.raises(ConfigError):
         exit_level(TimeExit(5), market_data=_md([10, 11]), side=1, entry_price=10)
@@ -279,6 +311,13 @@ def test_exit_triggered_stop_uses_low_for_long():
     np.testing.assert_array_equal(fired, [False, True, False])
 
 
+def test_exit_triggered_stop_loss_uses_low_for_long():
+    md = _md([100, 101, 102], high=[100, 101, 102], low=[98, 94, 99])
+    fired = exit_triggered(StopLoss(0.05), market_data=md, side=1, entry_price=100)
+    # stop level = 95 (below); touched means low <= 95 -> [False, True, False]
+    np.testing.assert_array_equal(fired, [False, True, False])
+
+
 # ---------------------------------------------------------------------------
 # Scale-out.
 # ---------------------------------------------------------------------------
@@ -287,6 +326,7 @@ def test_exit_triggered_stop_uses_low_for_long():
 def test_scale_out_fraction_target_vs_stop():
     assert scale_out_fraction(TakeProfit(0.05, scale_out=0.5)) == 0.5
     assert scale_out_fraction(TakeProfit(0.05)) == 1.0
+    assert scale_out_fraction(StopLoss(0.05)) == 1.0
     assert scale_out_fraction(ATRStop(3)) == 1.0
     assert scale_out_fraction(TrailingStop(0.1)) == 1.0
     assert scale_out_fraction(ChandelierExit(3)) == 1.0

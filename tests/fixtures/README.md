@@ -32,24 +32,30 @@ committed bytes exactly. If a dependency upgrade changes `default_rng` output,
 the `manifest.json` content hashes drift — review and re-commit the fixtures
 deliberately rather than letting parity baselines shift silently.
 
-## `expected_results.json` (locked in Phase 2)
+## `expected_results.json`
 
-One file per asset class, produced by running the trivial parity strategy through
-all three engines, reviewing for agreement, and locking the result. Schema:
+One file per asset class, produced by running the trivial parity strategy
+(``trivial_long_roundtrip``) through each engine, reviewing for agreement, and locking
+the result. Schema:
 
 ```json
 {
   "asset_class": "futures",
   "instrument": "ES",
-  "strategy": "<name of the trivial parity strategy>",
+  "strategy": "trivial_long_roundtrip",
   "locked_at": "<ISO date>",
   "tolerance": { "final_equity_rtol": 1e-6 },
   "engines": {
-    "vectorbt":    { "final_equity": 0.0, "n_trades": 0, "trades_hash": "…" },
-    "backtrader":  { "final_equity": 0.0, "n_trades": 0, "trades_hash": "…" },
-    "nautilus":    { "final_equity": 0.0, "n_trades": 0, "trades_hash": "…" }
+    "vectorbt":    { "final_equity": 0.0, "n_trades": 0, "trades_hash": "" },
+    "backtrader":  { "final_equity": 0.0, "n_trades": 0, "trades_hash": "" },
+    "nautilus":    { "final_equity": 91725.0, "n_trades": 1, "trades_hash": "…" }
   }
 }
 ```
 
-The schema is fixed now; the values land in Phase 2 once the adapters exist.
+All five asset classes have a locked **nautilus** baseline (the reference engine).
+The ``vectorbt`` and ``backtrader`` blocks are zeroed placeholders — they are filled
+with real values once those adapters are implemented, at which point cross-engine
+parity is actually exercised. A baseline is a real, manually-reviewed run, never a
+hand-invented number; the test asserts the engine reproduces it within the stated
+tolerance (see ``tests/parity/test_nautilus_parity.py``).

@@ -2,7 +2,7 @@
   "asset_class": "futures",
   "instrument": "ES",
   "strategy": "trivial_long_roundtrip",
-  "locked_at": "2026-08-18",
+  "locked_at": "2026-08-19",
   "tolerance": {
     "final_equity_rtol": 1e-6
   },
@@ -20,7 +20,7 @@
     "nautilus": {
       "final_equity": 91725.0,
       "n_trades": 1,
-      "trades_hash": "c7513482aec47c37d0a195a47f0c5ba31b961d454ea4dd9e1ec2771b7262adba"
+      "trades_hash": "99842545acbf574f52ed4f5e23c73fb5ddde279b672dcb1b1424bc36c209fee9"
     }
   }
 }

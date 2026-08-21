@@ -31,7 +31,8 @@ from ube.core.signals import from_target
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 
-#: The two asset classes Nautilus is built against first (dev-guide §4.5).
+#: The five canonical asset classes of §16 — each has a committed parquet fixture, an
+#: instrument manifest entry, and a locked ``expected_results.json`` baseline.
 PARITY_ASSETS = {
     "futures": ("futures", "ES", "es"),
     "crypto_perp": ("crypto_perp", "BTC-USDT", "btc_usdt"),

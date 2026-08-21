@@ -24,7 +24,7 @@ __all__ = [
 
 #: Synthetic venue id used by the backtest environment (reference ``constants.py``).
 DEFAULT_VENUE = "SIM"
-#: Account starting balance in ``BacktestConfig.base_currency`` when unset (plan.md §4.2).
+#: Account starting balance in ``BacktestConfig.base_currency`` when unset (requirements §4.2).
 DEFAULT_STARTING_BALANCE = 100_000.0
 #: Default OMS type for margin accounts.
 DEFAULT_OMS_TYPE = "NETTING"
@@ -34,7 +34,7 @@ _OMS_TYPES: tuple[str, ...] = ("NETTING", "HEDGING")
 
 
 class NautilusEngineOverrides(TypedDict, total=False):
-    """Engine-specific overrides for the NautilusTrader adapter (dev-guide §4.3, plan.md §4.2).
+    """Engine-specific overrides for the NautilusTrader adapter (dev-guide §4.3, requirements §4.2).
 
     Every key is optional; Nautilus defaults are applied for anything not provided.
     Values are validated by :func:`validate_overrides` at ``NautilusAdapter.run`` time.

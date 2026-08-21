@@ -1,7 +1,8 @@
-"""Canonical :class:`~ube.core.instrument.Instrument` → Nautilus instrument mapping (§3.1, §4.3).
+"""Canonical :class:`~ube.core.instrument.Instrument` → Nautilus instrument mapping
+(requirements §4.5).
 
-Maps the canonical asset-class metadata onto the concrete Nautilus instrument class per
-plan §3.1 / requirements §4.5 / §16:
+Maps the canonical asset-class metadata onto the concrete Nautilus instrument class
+(requirements §4.5 / §16):
 
 +----------------+------------------------+---------------------------------------------+
 | ``asset_class``| Nautilus class         | Notes                                       |
@@ -18,7 +19,7 @@ Precision/increments come from the canonical ``tick_size`` / ``contract_multipli
 with the reference ``constants.py`` values as fallback defaults. Fees default to
 ``0.0`` and are set from the ``maker_fee`` / ``taker_fee`` overrides — the adapter
 folds the core cost model's ``commission + slippage`` into both at construction
-(plan §5.3); this module never invents a fee.
+(requirements §4.6); this module never invents a fee.
 """
 
 from __future__ import annotations
@@ -172,7 +173,7 @@ def _margin(overrides: Mapping[str, Any]) -> tuple[Decimal, Decimal]:
 def _fees(overrides: Mapping[str, Any]) -> tuple[Decimal, Decimal]:
     """Resolve ``(maker_fee, taker_fee)`` from the override fraction (default ``0``).
 
-    The override fees are *fractions of notional* charged per fill (plan §5.3): the
+    The override fees are *fractions of notional* charged per fill (requirements §4.6): the
     adapter folds ``cost_model.commission + slippage`` into both fees at construction,
     so Nautilus's fill accounting reports the same per-fill cost as the core cost
     model. A missing override defaults to ``0`` (zero-cost, §7.1).
@@ -341,11 +342,11 @@ def build_instrument(
 ) -> NautilusInstrumentBuild:
     """Map a canonical :class:`~ube.core.instrument.Instrument` onto a Nautilus instrument.
 
-    The synthetic venue and per-asset-class Nautilus class follow plan §3.1; precision and
+    The synthetic venue and per-asset-class Nautilus class follow requirements §4.5; precision and
     increments come from the canonical ``tick_size`` / ``contract_multiplier`` (with
     reference defaults as fallback). ``maker_fee`` / ``taker_fee`` are taken from the
     overrides (default ``0.0``) — the adapter folds the core cost model's
-    ``commission + slippage`` into both (plan §5.3).
+    ``commission + slippage`` into both (requirements §4.6).
 
     Args:
         canonical: The canonical :class:`~ube.core.instrument.Instrument`.

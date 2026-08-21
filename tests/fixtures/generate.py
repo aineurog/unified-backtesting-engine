@@ -14,9 +14,10 @@ timestamp and a per-asset SHA-256 content hash — so a numpy/pandas upgrade tha
 silently changes ``default_rng`` output shows up as a manifest diff, not a
 silent parity-baseline change.
 
-The parquet files are committed (§16). ``expected_results.json`` (per-engine
-results of the trivial parity strategy) is *not* produced here — its values are
-locked manually in Phase 2, once the adapters exist.
+The parquet files are committed (§16). ``expected_results.json`` (the per-engine
+locked results of the trivial parity strategy) is *not* produced here — a baseline is
+a reviewed value locked by hand, and ``generate.py`` must never regenerate (and thus
+silently overwrite) it.
 """
 
 from __future__ import annotations

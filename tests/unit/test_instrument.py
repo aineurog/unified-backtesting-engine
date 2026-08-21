@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from ube.core.errors import ConfigError, InvalidInstrumentError
-from ube.core.instrument import ASSET_CLASSES, Instrument
+from ube.core.instrument import ASSET_CLASSES, LONG_ONLY_ASSET_CLASSES, Instrument, allows_short
 
 
 def test_default_construction_leaves_asset_class_fields_none():
@@ -82,6 +82,26 @@ def test_asset_classes_match_fixture_labels():
 def test_crypto_spot_asset_class_is_supported():
     ins = Instrument("BTC-USDT", asset_class="crypto_spot")
     assert ins.asset_class == "crypto_spot"
+
+
+def test_long_only_asset_classes_constant():
+    assert frozenset({"crypto_spot"}) == LONG_ONLY_ASSET_CLASSES
+
+
+@pytest.mark.parametrize(
+    ("asset_class", "expected"),
+    [
+        ("crypto_spot", False),
+        ("crypto_perp", True),
+        ("futures", True),
+        ("stocks", True),
+        ("forex", True),
+        ("commodities", True),
+    ],
+)
+def test_allows_short(asset_class, expected):
+    assert allows_short(asset_class) is expected
+    assert Instrument("X", asset_class=asset_class).allows_short is expected
 
 
 @pytest.mark.parametrize("bad", ["foo", object()])
