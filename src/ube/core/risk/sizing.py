@@ -93,11 +93,19 @@ class SizeModel:
             ``fixed_units`` / ``volatility_target`` and forbidden otherwise. Its
             meaning depends on ``kind`` (a fraction of capital, a unit count, or a
             target volatility fraction respectively).
+        vol: The name of an ``aux_data`` series supplying the per-bar volatility
+            estimate for ``volatility_target`` sizing (a dimensionless fraction of
+            price — e.g. ``0.02`` = 2%, an ATR/price ratio or a return standard
+            deviation). Required by the *adapter* for ``volatility_target`` (§6.3):
+            the library never computes volatility from the signal bars. Forbidden
+            for every other ``kind``. The core sizers take the resolved ``vol`` array
+            as an explicit argument and do not read this name.
     """
 
     kind: SizeKind = "all_in"
     value: float | None = None
     leverage: float = 1.0
+    vol: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in SIZE_KINDS:
@@ -112,6 +120,18 @@ class SizeModel:
             raise ConfigError(
                 f"sizing kind={self.kind!r} does not take a value; got {self.value!r}"
             )
+        # ``vol`` names an aux_data series and is only meaningful for volatility_target
+        # (§6.3); the adapter enforces that it is actually supplied, mirroring how the
+        # ``ATRStop.atr`` reference is optional here but enforced there (§5.2).
+        if self.vol is not None:
+            if self.kind != "volatility_target":
+                raise ConfigError(
+                    f"sizing kind={self.kind!r} does not take a vol; got {self.vol!r}"
+                )
+            if not isinstance(self.vol, str) or not self.vol.strip():
+                raise ConfigError(
+                    f"SizeModel.vol must be a non-empty aux_data name; got {self.vol!r}"
+                )
         # Leverage is an *exposure* multiplier (§3.2 single source of truth): it
         # scales the allocated notional the same way the reference nautilus_trader
         # strategy does (``leveraged_capital = capital * leverage``). The adapter

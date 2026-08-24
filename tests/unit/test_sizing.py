@@ -60,6 +60,25 @@ def test_value_free_kind_rejects_value():
         SizeModel(kind="all_in", value=0.5)  # type: ignore[arg-type]
 
 
+def test_volatility_target_accepts_vol_name():
+    model = SizeModel(kind="volatility_target", value=0.01, vol="vol_1d")
+    assert model.vol == "vol_1d"
+
+
+def test_vol_forbidden_on_non_volatility_target_kinds():
+    with pytest.raises(ConfigError):
+        SizeModel(kind="all_in", vol="vol_1d")
+    with pytest.raises(ConfigError):
+        SizeModel(kind="fixed_fraction", value=0.1, vol="vol_1d")
+
+
+def test_vol_name_must_be_non_empty_string():
+    with pytest.raises(ConfigError):
+        SizeModel(kind="volatility_target", value=0.01, vol="")
+    with pytest.raises(ConfigError):
+        SizeModel(kind="volatility_target", value=0.01, vol=123)  # type: ignore[arg-type]
+
+
 def test_non_positive_value_raises():
     with pytest.raises(ConfigError):
         SizeModel(kind="fixed_fraction", value=0.0)

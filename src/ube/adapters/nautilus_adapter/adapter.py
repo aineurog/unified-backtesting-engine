@@ -92,7 +92,6 @@ from ube.core.errors import (
 from ube.core.instrument import resolve_funding_interval_hours
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
-from ube.core.risk.exits import atr
 from ube.core.signals import Signals, validate_long_only
 
 __all__ = ["NautilusAdapter"]
@@ -130,9 +129,14 @@ class NautilusAdapter(EngineAdapter):
             config: The full :class:`~ube.core.config.BacktestConfig` (instrument, cost,
                 risk/exits, benchmark, engine overrides).
             aux_data: Optional derived-series map referenced by name from exit configs
-                (§5.2) — e.g. ``{"atr_12h": <array>}`` for ``ATRStop(atr="atr_12h")``.
-                When a referenced name is absent the adapter computes ATR from ``data``.
-                A flat ``name -> array`` map for a single instrument.
+                (§5.2) and from ``volatility_target`` sizing (§6.3) — e.g.
+                ``{"atr_12h": <array>}`` for ``ATRStop(atr="atr_12h")`` or
+                ``{"vol_1d": <array>}`` for ``SizeModel(..., vol="vol_1d")``. A
+                ``MarketData`` value is turned into ATR (or ``ATR/price`` for vol)
+                internally; a precomputed array is used verbatim. A referenced name
+                that is absent is a ``ConfigError`` — the library never derives ATR or
+                volatility from the signal ``data`` bars. A flat ``name -> value`` map
+                for a single instrument.
 
         Returns:
             The canonical :class:`~ube.core.result.BacktestResult`.
@@ -227,11 +231,6 @@ class NautilusAdapter(EngineAdapter):
             exits=config.risk.exit,
             aux_atr=aux_data,
             leverage=actor_leverage,
-            vol=(
-                _volatility_estimate(data)
-                if config.risk.sizing.kind == "volatility_target"
-                else None
-            ),
         )
 
         venue = Venue(str(overrides.get("venue", DEFAULT_VENUE)))
@@ -482,12 +481,6 @@ def _events_of_type(
 def _carry_rates(cost_model: CostModel) -> tuple[float, float]:
     """The ``(funding, borrow)`` per-period rates of the resolved cost model (§24)."""
     return float(cost_model.funding), float(cost_model.borrow)
-
-
-def _volatility_estimate(market_data: MarketData) -> np.ndarray:
-    """A per-bar volatility estimate (ATR / price) for ``volatility_target`` sizing."""
-    result: np.ndarray = atr(market_data) / market_data.close
-    return result
 
 
 def _bar_timestamps_ns(data: MarketData) -> np.ndarray:
