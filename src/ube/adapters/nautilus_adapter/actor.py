@@ -295,12 +295,12 @@ class UbeActor(Strategy):  # type: ignore[misc]
         the data/signal period so its ATR is defined for every main bar (a leading gap
         would leave main bars with no ATR; a trailing gap would leave stale ATR).
         """
-        required = {
-            getattr(e, "atr", None)
-            for e in self._exits
-            if isinstance(e, (ATRStop, ChandelierExit))
-        }
-        required.discard(None)
+        required: set[str] = set()
+        for e in self._exits:
+            if isinstance(e, (ATRStop, ChandelierExit)):
+                atr_name = getattr(e, "atr", None)
+                if atr_name is not None:
+                    required.add(str(atr_name))
         if not required:
             return
         if self._aux_atr is None:

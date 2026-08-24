@@ -2,7 +2,7 @@
   "asset_class": "crypto_perp",
   "instrument": "BTC-USDT",
   "strategy": "trivial_long_roundtrip",
-  "locked_at": "2026-08-19",
+  "locked_at": "2026-08-24",
   "tolerance": {
     "final_equity_rtol": 1e-6
   },
@@ -18,9 +18,9 @@
       "trades_hash": ""
     },
     "nautilus": {
-      "final_equity": 87535.35303,
+      "final_equity": 91264.1478,
       "n_trades": 1,
-      "trades_hash": "edb0e1fd0989251180d59ba52236ac0e9daf8969e23d6e1934f39a2ef193fa82"
+      "trades_hash": "5aad80baf4e0f53a7c183734925dccc991b6db26bb0d1643bc2491ea79b71e0e"
     }
   }
 }

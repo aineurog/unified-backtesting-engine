@@ -698,7 +698,7 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
         BacktestConfig(
             instrument=PRESETS["crypto_perp"].instrument,
             cost_model=CostModel(commission=0.0005, slippage=0.0002, funding=0.0001),
-            engine_overrides={"starting_balance": 100000.0},
+            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
         ),
     )
 
@@ -733,7 +733,7 @@ def test_nautilus_full_loop_crypto_perp_short_pays_loss():
         BacktestConfig(
             instrument=PRESETS["crypto_perp"].instrument,
             cost_model=CostModel(commission=0.0005, slippage=0.0002, funding=0.0001),
-            engine_overrides={"starting_balance": 100000.0},
+            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
         ),
     )
 
@@ -797,6 +797,7 @@ def test_nautilus_reference_trailing_stop_mirror():
         BacktestConfig(
             instrument=PRESETS["crypto_perp"].instrument,
             risk=RiskConfig(exit=(TrailingStop(0.001),)),
+            engine_overrides={"funding_interval_hours": 1.0},
         ),
     )
 
@@ -928,8 +929,9 @@ def test_nautilus_trailing_and_chandelier_ratchet_without_lookahead():
         from_target([1, 1, 1]),
         BacktestConfig(
             instrument=PRESETS["stocks"].instrument,
-            risk=RiskConfig(exit=(ChandelierExit(2),)),
+            risk=RiskConfig(exit=(ChandelierExit(2, atr="atr_14"),)),
         ),
+        aux_data={"atr_14": atr(data, 14)},
     )
     # Ratchet uses only connected bars: the level for bar 1 (104 - 2*ATR[1]) triggers
     # on bar 2. The pre-fix lookahead used bar 2's own ATR (104 - 2*ATR[2] = 101.46).
@@ -1027,7 +1029,7 @@ def test_nautilus_actor_atr_stop_touched_fills_at_trigger():
     from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
     from ube.core.config import BacktestConfig
     from ube.core.risk import ATRStop, RiskConfig
-    from ube.core.risk.exits import exit_level
+    from ube.core.risk.exits import atr, exit_level
 
     data = _bars_from_rows(
         [
@@ -1042,8 +1044,9 @@ def test_nautilus_actor_atr_stop_touched_fills_at_trigger():
         from_target([1, 1, 1, 1]),
         BacktestConfig(
             instrument=PRESETS["stocks"].instrument,
-            risk=RiskConfig(exit=(ATRStop(2),)),
+            risk=RiskConfig(exit=(ATRStop(2, atr="atr_14"),)),
         ),
+        aux_data={"atr_14": atr(data, 14)},
     )
 
     fills = _fills(result)

@@ -448,9 +448,8 @@ class NautilusAdapter(EngineAdapter):
             step_ts, step_value = _step_timestamps(pc_ts, pc_val)
             # Calendar-aware funding (§24): charge the per-period rate once per interval
             # (default 8h) instead of per bar. ``funding`` is the per-period rate.
-            interval_hours = float(
-                config.engine_overrides.get("funding_interval_hours", 8.0)
-            )
+            _overrides = config.engine_overrides if config.engine_overrides is not None else {}
+            interval_hours = float(_overrides.get("funding_interval_hours", 8.0))
             interval_ns = int(interval_hours * 3600 * 1_000_000_000)
             for event in funding_payments(
                 instrument_id=instrument_id,
