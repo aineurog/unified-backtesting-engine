@@ -69,7 +69,6 @@ from nautilus_trader.config import BacktestEngineConfig, LoggingConfig
 from nautilus_trader.model.enums import AccountType, OmsType
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.objects import Currency, Money
-from numpy.typing import ArrayLike
 
 from ube.adapters.base import EngineAdapter
 from ube.adapters.nautilus_adapter.actor import UbeActor, UbeActorConfig
@@ -93,7 +92,7 @@ from ube.core.errors import (
 from ube.core.instrument import resolve_funding_interval_hours
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
-from ube.core.risk.exits import ATRStop, ChandelierExit, Exit, atr
+from ube.core.risk.exits import atr
 from ube.core.signals import Signals, validate_long_only
 
 __all__ = ["NautilusAdapter"]
@@ -224,7 +223,6 @@ class NautilusAdapter(EngineAdapter):
                 asset_class=config.instrument.asset_class,
             ),
             market_data=data,
-            atr_series=_resolve_atr_series(config.risk.exit, aux_data),
             sizing=config.risk.sizing,
             exits=config.risk.exit,
             aux_atr=aux_data,
@@ -484,44 +482,6 @@ def _events_of_type(
 def _carry_rates(cost_model: CostModel) -> tuple[float, float]:
     """The ``(funding, borrow)`` per-period rates of the resolved cost model (§24)."""
     return float(cost_model.funding), float(cost_model.borrow)
-
-
-def _resolve_atr_series(
-    exits: tuple[Exit, ...],
-    aux_data: Mapping[str, ArrayLike] | None,
-) -> np.ndarray | None:
-    """Resolve the single ATR series the actor's exit book needs (§5.2).
-
-    Every ATR-referencing exit that names an ``aux_data`` key must name the *same* key —
-    the actor's exit book holds one series. A missing key falls back to auto-compute
-    (the exit's own ``period``). Multiple distinct named keys are a configuration the
-    single-series book cannot express and raise :class:`~ube.core.errors.ConfigError`
-    (fail-fast, §15).
-    """
-    names = {
-        e.atr
-        for e in exits
-        if isinstance(e, (ATRStop, ChandelierExit)) and e.atr is not None
-    }
-    if not names:
-        return None
-    if len(names) > 1:
-        raise ConfigError(
-            "nautilus actor supports a single named ATR series; "
-            f"exits reference {sorted(names)}"
-        )
-    name = names.pop()
-    if aux_data is None or name not in aux_data:
-        return None  # absent → auto-compute ATR(period) (§5.2)
-    # A raw OHLCV MarketData aux is resolved into an ATR series by the actor itself
-    # (it computes ATR internally per-§5.2, with no look-ahead); don't coerce it to a
-    # plain array here. Precomputed 1-D series are forwarded straight through.
-    if isinstance(aux_data[name], MarketData):
-        return None
-    series = np.asarray(aux_data[name], dtype=np.float64)
-    if series.ndim != 1:
-        raise ConfigError(f"aux_data[{name!r}] must be 1-D; got shape {series.shape}")
-    return series
 
 
 def _volatility_estimate(market_data: MarketData) -> np.ndarray:

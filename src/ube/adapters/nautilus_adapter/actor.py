@@ -165,7 +165,6 @@ class UbeActor(Strategy):  # type: ignore[misc]
         config: UbeActorConfig,
         *,
         market_data: MarketData,
-        atr_series: np.ndarray | None = None,
         aux_atr: Mapping[str, Any] | None = None,
         sizing: SizeModel | None = None,
         exits: tuple[Exit, ...] = (),
@@ -175,7 +174,6 @@ class UbeActor(Strategy):  # type: ignore[misc]
         super().__init__(config)
         self.instrument_id = config.instrument_id
         self._market_data = market_data
-        self._atr_series = atr_series
         self._aux_atr = dict(aux_atr) if aux_atr is not None else None
         self._sizing = sizing if sizing is not None else SizeModel()
         # Exposure multiplier (§3.2): the reference nautilus_trader strategy scales
@@ -287,53 +285,44 @@ class UbeActor(Strategy):  # type: ignore[misc]
         )
 
     def _validate_aux(self) -> None:
-        """Fail fast if an ATR-based exit cannot be satisfied by ``aux_data`` (§5.2).
+        """Fail fast if an ATR-based exit has no usable ``aux_data`` series (§5.2).
 
-        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) is satisfied in one of two
-        ways: it names a specific ``aux_data`` series via its ``atr`` key, or — when no
-        key is given — the §5.2 auto-compute fallback turns price data
-        (open/high/low/close) present in ``aux_data`` into ATR internally. Either way
-        *some* usable input must exist; if neither a named series nor aux price data is
-        supplied, that is a config-shape error surfaced here, before the engine runs
-        (§3 fail-fast principle).
+        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) must name a specific
+        ``aux_data`` series via its ``atr`` key. The library never computes ATR from the
+        signal ``data`` bars — those may be non-time bars that cannot be resampled to a
+        time-based ATR, and even time bars may be at a too-fine level (§5.2). A missing
+        ``atr`` reference, or a name absent from ``aux_data``, is a config-shape error
+        surfaced here, before the engine runs (§3 fail-fast principle).
         """
         named: set[str] = set()
-        needs_auto = False
         for e in self._exits:
             if isinstance(e, (ATRStop, ChandelierExit)):
                 atr_name = getattr(e, "atr", None)
-                if atr_name is not None:
-                    named.add(str(atr_name))
-                else:
-                    needs_auto = True
-        if not named and not needs_auto:
+                if atr_name is None:
+                    raise ConfigError(
+                        f"{type(e).__name__} requires an 'atr' key referencing an "
+                        "aux_data series (§5.2); ATR is never computed from the signal "
+                        "data bars"
+                    )
+                named.add(str(atr_name))
+        if not named:
             return
 
-        if named:
-            if self._aux_atr is None:
-                raise ConfigError(
-                    "exits reference ATR series(es) "
-                    f"{sorted(named)} but aux_data was not supplied; "
-                    "ATR-based stops/chandelier require the named aux_data series (§5.2)"
-                )
-            missing = named - set(self._aux_atr)
-            if missing:
-                raise ConfigError(
-                    "exits reference ATR series(es) "
-                    f"{sorted(missing)} that are absent from aux_data; "
-                    "ATR-based stops/chandelier require the named aux_data series (§5.2)"
-                )
-
-        if needs_auto and self._auto_atr_source() is None:
+        if self._aux_atr is None:
             raise ConfigError(
-                "ATRStop/ChandelierExit with no 'atr' key requires aux_data to contain "
-                "price data (open/high/low/close) so ATR can be computed internally "
-                "(§5.2); no such aux_data was supplied"
+                "exits reference ATR series(es) "
+                f"{sorted(named)} but aux_data was not supplied; "
+                "ATR-based stops/chandelier require the named aux_data series (§5.2)"
+            )
+        missing = named - set(self._aux_atr)
+        if missing:
+            raise ConfigError(
+                "exits reference ATR series(es) "
+                f"{sorted(missing)} that are absent from aux_data; "
+                "ATR-based stops/chandelier require the named aux_data series (§5.2)"
             )
 
         # Range consistency vs the data/signal grid (named MarketData series only).
-        if not named or self._aux_atr is None:
-            return
         main_ts = self._market_data.timestamps
         main_start, main_end = main_ts[0], main_ts[-1]
         main_step = main_ts[1] - main_ts[0] if len(main_ts) > 1 else pd.Timedelta(0)
@@ -359,43 +348,17 @@ class UbeActor(Strategy):  # type: ignore[misc]
     def _resolve_exit_atr(self, cfg: Exit) -> np.ndarray | None:
         """Resolve the ATR series for ``cfg`` (§5.2).
 
-        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) either names a specific
-        ``aux_data`` series via its ``atr`` key, or — when no key is given — relies on the
-        §5.2 auto-compute fallback: the library turns price data (open/high/low/close) in
-        ``aux_data`` into ATR itself. The missing-input case is a config error caught up
-        front in :meth:`_validate_aux`, so this method never raises mid-engine.run().
+        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) names an ``aux_data`` series
+        via its ``atr`` key; that series is resolved by :meth:`_atr_from_aux` (a
+        ``MarketData`` value is turned into ATR internally; a precomputed array is used
+        verbatim). The missing-input case is a config error caught up front in
+        :meth:`_validate_aux`, so this method never raises mid-engine.run().
 
         Returns ``None`` for exits that need no ATR (e.g. ``TrailingStop``); the core
         level functions compute their running extremes from the bars directly.
         """
-        name = getattr(cfg, "atr", None)
-        if name and self._aux_atr and name in self._aux_atr:
-            return self._atr_from_aux(name, getattr(cfg, "period", 14))
         if isinstance(cfg, (ATRStop, ChandelierExit)):
-            src = self._auto_atr_source()
-            if src is not None:
-                return self._atr_from_marketdata(src, getattr(cfg, "period", 14))
-            # Unreachable in normal flow: _validate_aux enforces the input up-front and
-            # raises ConfigError before the engine ever runs.
-            raise ConfigError(
-                f"{type(cfg).__name__} has no 'atr' key and aux_data holds no price "
-                "data to compute ATR from (§5.2)"
-            )
-        period = getattr(cfg, "period", 14)
-        return atr(self._market_data, period)
-
-    def _auto_atr_source(self) -> MarketData | None:
-        """First price/OHLCV :class:`~ube.core.data.MarketData` in ``aux_data``.
-
-        Used by the §5.2 auto-compute fallback for ATR exits that name no ``atr`` series:
-        the library turns this raw OHLCV into an ATR internally. Returns ``None`` when
-        ``aux_data`` holds no usable price data (only precomputed arrays / nothing).
-        """
-        if not self._aux_atr:
-            return None
-        for value in self._aux_atr.values():
-            if isinstance(value, MarketData):
-                return value
+            return self._atr_from_aux(str(cfg.atr), cfg.period)
         return None
 
     def _atr_from_marketdata(self, value: MarketData, period: int) -> np.ndarray:
@@ -420,8 +383,9 @@ class UbeActor(Strategy):  # type: ignore[misc]
     def _atr_from_aux(self, name: str, period: int) -> np.ndarray:
         """Resolve an ``aux_data`` entry into an ATR series (§5.2), with no look-ahead.
 
-        A ``MarketData`` value is the signal-timeframe OHLCV the library turns into ATR
-        (via :meth:`_atr_from_marketdata`); a precomputed array is used verbatim.
+        A ``MarketData`` value is a raw OHLCV series — typically coarser than the signal
+        bars — that the library turns into ATR (via :meth:`_atr_from_marketdata`); a
+        precomputed array is used verbatim.
         """
         aux = self._aux_atr
         if aux is None or name not in aux:

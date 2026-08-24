@@ -1,9 +1,11 @@
 """Nautilus adapter ATR / aux_data resolution tests (§5.2).
 
-Covers the ATR auto-compute fallback: an ATR-based exit (``ATRStop`` / ``ChandelierExit``)
-with no ``atr`` key must compute ATR internally from price data present in ``aux_data``
-rather than erroring. The missing-input case is a *config* error (``ConfigError``),
-surfaced up-front in validation (fail-fast, §3) — never an ``EngineError`` mid-run (§15).
+An ATR-based exit (``ATRStop`` / ``ChandelierExit``) must name an ``aux_data`` series
+via its ``atr`` key. ATR is never computed from the signal ``data`` bars — those may be
+non-time bars (which cannot be resampled to a time-based ATR) or a too-fine timeframe.
+A missing ``atr`` reference, or a name absent from ``aux_data``, is a *config* error
+(``ConfigError``) surfaced up-front in validation (fail-fast, §3) — never an
+``EngineError`` mid-run (§15).
 """
 
 import numpy as np
@@ -50,39 +52,11 @@ def _instrument():
 
 
 # ---------------------------------------------------------------------------
-# §5.2 auto-compute fallback: no `atr` key, price data supplied in aux_data.
+# Missing `atr` reference: config error (§15 / §3 fail-fast), never auto-compute.
 # ---------------------------------------------------------------------------
 
 
-def test_atr_stop_no_key_auto_computes_from_aux_price_data():
-    data = _data()
-    result = NautilusAdapter().run(
-        data,
-        from_target([1, 1, 1, 1]),
-        BacktestConfig(instrument=_instrument(), risk=RiskConfig(exit=ATRStop(2))),
-        aux_data={"price": data},
-    )
-    assert len(result.trades) >= 1
-    assert result.trades[0].exit_reason == "atr_stop"
-
-
-def test_chandelier_no_key_auto_computes_from_aux_price_data():
-    data = _data()
-    result = NautilusAdapter().run(
-        data,
-        from_target([1, 1, 1, 1]),
-        BacktestConfig(instrument=_instrument(), risk=RiskConfig(exit=ChandelierExit(2))),
-        aux_data={"price": data},
-    )
-    assert len(result.trades) >= 1
-
-
-# ---------------------------------------------------------------------------
-# Missing input: config error (§15 / §3 fail-fast), NOT an engine error.
-# ---------------------------------------------------------------------------
-
-
-def test_atr_stop_no_key_no_aux_raises_config_error_not_engine_error():
+def test_atr_stop_no_key_raises_config_error_not_engine_error():
     with pytest.raises(ConfigError) as exc:
         NautilusAdapter().run(
             _data(),
@@ -92,6 +66,29 @@ def test_atr_stop_no_key_no_aux_raises_config_error_not_engine_error():
         )
     assert not isinstance(exc.value, EngineError)
     assert "aux_data" in str(exc.value)
+
+
+def test_chandelier_no_key_raises_config_error():
+    with pytest.raises(ConfigError):
+        NautilusAdapter().run(
+            _data(),
+            from_target([1, 1, 1, 1]),
+            BacktestConfig(instrument=_instrument(), risk=RiskConfig(exit=ChandelierExit(2))),
+            aux_data=None,
+        )
+
+
+def test_atr_stop_no_key_raises_config_error_even_with_price_aux_data():
+    # Supplying an *unrelated* named series must not silently satisfy the exit: the
+    # `atr` reference is mandatory (§5.2), and the library never guesses which aux
+    # entry to use.
+    with pytest.raises(ConfigError):
+        NautilusAdapter().run(
+            _data(),
+            from_target([1, 1, 1, 1]),
+            BacktestConfig(instrument=_instrument(), risk=RiskConfig(exit=ATRStop(2))),
+            aux_data={"price": _data()},
+        )
 
 
 def test_named_atr_missing_raises_config_error():
@@ -107,7 +104,7 @@ def test_named_atr_missing_raises_config_error():
 
 
 # ---------------------------------------------------------------------------
-# Named `atr` key still resolves verbatim (precomputed series path).
+# Named `atr` reference resolves: precomputed series + raw MarketData.
 # ---------------------------------------------------------------------------
 
 
@@ -120,6 +117,23 @@ def test_named_atr_series_resolves_verbatim():
             instrument=_instrument(), risk=RiskConfig(exit=ATRStop(2, atr="atr_14"))
         ),
         aux_data={"atr_14": atr(data, 14)},
+    )
+    assert len(result.trades) >= 1
+    assert result.trades[0].exit_reason == "atr_stop"
+
+
+def test_named_atr_marketdata_computes_atr_internally():
+    # A raw MarketData aux value is turned into ATR internally by the adapter (§5.2) —
+    # the escape hatch for a coarser-timeframe ATR than the signal bars.
+    data = _data()
+    result = NautilusAdapter().run(
+        data,
+        from_target([1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=_instrument(),
+            risk=RiskConfig(exit=ATRStop(2, atr="atr_1h")),
+        ),
+        aux_data={"atr_1h": data},
     )
     assert len(result.trades) >= 1
     assert result.trades[0].exit_reason == "atr_stop"
