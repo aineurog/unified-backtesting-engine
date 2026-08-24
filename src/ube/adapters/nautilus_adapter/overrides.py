@@ -49,7 +49,6 @@ class NautilusEngineOverrides(TypedDict, total=False):
     oms_type: Literal["NETTING", "HEDGING"]
     maker_fee: float
     taker_fee: float
-    funding_interval_hours: float
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +104,6 @@ _FIELD_VALIDATORS: dict[str, Callable[[Any, str], None]] = {
     "oms_type": _validate_oms_type,
     "maker_fee": _require_fraction,
     "taker_fee": _require_fraction,
-    "funding_interval_hours": _require_positive_number,
 }
 
 

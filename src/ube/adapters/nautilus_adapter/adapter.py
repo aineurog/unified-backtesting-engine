@@ -90,6 +90,7 @@ from ube.core.errors import (
     EngineError,
     InvalidSignalError,
 )
+from ube.core.instrument import resolve_funding_interval_hours
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
 from ube.core.risk.exits import ATRStop, ChandelierExit, Exit, atr
@@ -446,10 +447,11 @@ class NautilusAdapter(EngineAdapter):
                 dtype=np.float64,
             )
             step_ts, step_value = _step_timestamps(pc_ts, pc_val)
-            # Calendar-aware funding (§24): charge the per-period rate once per interval
-            # (default 8h) instead of per bar. ``funding`` is the per-period rate.
-            _overrides = config.engine_overrides if config.engine_overrides is not None else {}
-            interval_hours = float(_overrides.get("funding_interval_hours", 8.0))
+            # Calendar-aware funding (§24): accrue the per-period rate by elapsed
+            # wall-clock time, so the charge is correct for any bar spacing. The schedule
+            # (the funding period in hours) is asset-class metadata on the Instrument
+            # (§4.5), not a nautilus engine override — see ``resolve_funding_interval_hours``.
+            interval_hours = resolve_funding_interval_hours(config.instrument)
             interval_ns = int(interval_hours * 3600 * 1_000_000_000)
             for event in funding_payments(
                 instrument_id=instrument_id,
@@ -480,7 +482,7 @@ def _events_of_type(
 
 
 def _carry_rates(cost_model: CostModel) -> tuple[float, float]:
-    """The ``(funding, borrow)`` per-bar rates of the resolved cost model."""
+    """The ``(funding, borrow)`` per-period rates of the resolved cost model (§24)."""
     return float(cost_model.funding), float(cost_model.borrow)
 
 

@@ -6,6 +6,8 @@ recreated or deleted. Step 1 covers the :class:`~ube.adapters.base.EngineAdapter
 contract + the engine registry (§4.1).
 """
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -692,13 +694,14 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
     from ube.core.ledger import EventType
 
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    instrument = replace(PRESETS["crypto_perp"].instrument, funding_interval_hours=1.0)
     result = NautilusAdapter().run(
         md,
         from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0]),
         BacktestConfig(
-            instrument=PRESETS["crypto_perp"].instrument,
+            instrument=instrument,
             cost_model=CostModel(commission=0.0005, slippage=0.0002, funding=0.0001),
-            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
+            engine_overrides={"starting_balance": 100000.0},
         ),
     )
 
@@ -727,13 +730,14 @@ def test_nautilus_full_loop_crypto_perp_short_pays_loss():
     from ube.core.ledger import EventType
 
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    instrument = replace(PRESETS["crypto_perp"].instrument, funding_interval_hours=1.0)
     result = NautilusAdapter().run(
         md,
         from_target([0, -1, -1, -1, 0, 0, 0, 0, 0, 0]),
         BacktestConfig(
-            instrument=PRESETS["crypto_perp"].instrument,
+            instrument=instrument,
             cost_model=CostModel(commission=0.0005, slippage=0.0002, funding=0.0001),
-            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
+            engine_overrides={"starting_balance": 100000.0},
         ),
     )
 
@@ -791,13 +795,13 @@ def test_nautilus_reference_trailing_stop_mirror():
     from ube.core.risk import RiskConfig, TrailingStop
 
     data = _bars_from_rows(_TRAILING_REFERENCE_ROWS)
+    instrument = replace(PRESETS["crypto_perp"].instrument, funding_interval_hours=1.0)
     result = NautilusAdapter().run(
         data,
         from_target([1] * 12),
         BacktestConfig(
-            instrument=PRESETS["crypto_perp"].instrument,
+            instrument=instrument,
             risk=RiskConfig(exit=(TrailingStop(0.001),)),
-            engine_overrides={"funding_interval_hours": 1.0},
         ),
     )
 

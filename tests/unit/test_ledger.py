@@ -650,6 +650,58 @@ def test_funding_payments_empty_when_no_carry():
     assert events == ()
 
 
+_HOUR_NS = 3_600_000_000_000
+
+
+def test_funding_payments_accrues_by_elapsed_time_90m_bars():
+    # 90-minute bars (5.4e12 ns) over a 8h (2.88e13 ns) funding interval. The old
+    # modulo schedule only fired on phase-aligned bars (1 of 8) and under-charged ~6.7x.
+    # Elapsed-time accrual charges rate * sum(span / interval) = 1.5 periods over 12h.
+    interval = 8 * _HOUR_NS
+    ts = np.array([i * 90 * 60 * 1_000_000_000 for i in range(8)], dtype=np.int64)
+    n = np.full(8, 1000.0)
+    s = np.ones(8)
+    events = funding_payments(
+        instrument_id="A",
+        timestamps=ts,
+        notional=n,
+        side=s,
+        funding_rate=0.0001,
+        borrow_rate=0.0,
+        currency="USD",
+        interval_ns=interval,
+    )
+    # One event per open bar (every bar spans time), each with a fractional accrual.
+    assert len(events) == 8
+    total = sum(e.amount for e in events)
+    # 8 bars * (90m / 8h) = 1.5 periods of 0.0001 * 1000 notional.
+    assert total == pytest.approx(0.0001 * 1000.0 * 1.5)
+
+
+def test_funding_payments_accrues_by_elapsed_time_daily_bars():
+    # Daily bars (24h) over an 8h funding interval span 3 funding periods each. The old
+    # modulo schedule charged one period per day (3x under-charge); elapsed accrual charges
+    # 3 periods per day.
+    interval = 8 * _HOUR_NS
+    ts = np.array([i * 24 * _HOUR_NS for i in range(3)], dtype=np.int64)
+    n = np.full(3, 1000.0)
+    s = np.ones(3)
+    events = funding_payments(
+        instrument_id="A",
+        timestamps=ts,
+        notional=n,
+        side=s,
+        funding_rate=0.0001,
+        borrow_rate=0.0,
+        currency="USD",
+        interval_ns=interval,
+    )
+    assert len(events) == 3
+    total = sum(e.amount for e in events)
+    # 3 days * (24h / 8h) = 9 periods of 0.0001 * 1000 notional.
+    assert total == pytest.approx(0.0001 * 1000.0 * 9.0)
+
+
 # ---------------------------------------------------------------------------
 # trade_table (§4.6).
 # ---------------------------------------------------------------------------

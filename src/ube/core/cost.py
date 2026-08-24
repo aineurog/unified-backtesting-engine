@@ -17,9 +17,13 @@ borrow / hard-to-borrow fees — to "filled in per asset class as adapters are b
   resolves to zero-cost until §24 lands (see the note in :func:`resolve_cost_model`).
 
 Rates are expressed as fractions of notional: ``commission`` and ``slippage`` are
-charged per fill; ``funding`` and ``borrow`` are charged per bar held. Keeping the
-model bar-agnostic (§4.3) — the bar span is supplied by the caller, so the same model
-works for any bar type.
+charged per fill; ``funding`` and ``borrow`` are charged per funding period — the
+wall-clock cadence declared on the :class:`~ube.core.instrument.Instrument`
+(``funding_interval_hours``, §4.5, §24). ``funding_payments`` accrues them by elapsed
+time, so the per-period number is the *single* meaning of ``funding``/``borrow`` across
+all adapters (the old "per bar held" reading was the legacy ``interval_ns == 0``
+fallback, now expressed as one period per bar). Keeping the model bar-agnostic (§4.3) —
+the bar span is supplied by the caller, so the same model works for any bar type.
 """
 
 from __future__ import annotations
@@ -67,15 +71,17 @@ class CostModel:
     of §7.1. Rates are fractions of notional:
 
     - ``commission`` / ``slippage`` — charged per fill (see :func:`fill_cost`).
-    - ``funding`` / ``borrow`` — charged per bar held (see :func:`carrying_cost`);
-      ``borrow`` applies to the short side only.
+    - ``funding`` / ``borrow`` — charged **per funding period** (see ``funding_payments``
+      and ``carrying_cost``); ``borrow`` applies to the short side only. The period is the
+      instrument's ``funding_interval_hours`` schedule (§4.5, §24).
 
     Attributes:
         commission: Per-fill commission/fee rate, as a fraction of notional.
         slippage: Per-fill slippage rate, as a fraction of notional.
-        funding: Per-bar funding/swap rate (perps, forex), as a fraction of notional.
-        borrow: Per-bar short-side borrow / hard-to-borrow fee rate (stocks, futures),
-            as a fraction of notional; applied only while short.
+        funding: Per-funding-period funding/swap rate (perps, forex), as a fraction of
+            notional.
+        borrow: Per-funding-period short-side borrow / hard-to-borrow fee rate
+            (stocks, futures), as a fraction of notional; applied only while short.
     """
 
     commission: float = 0.0
@@ -140,7 +146,13 @@ def carrying_cost(
     side: ArrayLike,
     bar_span: ArrayLike,
 ) -> np.ndarray:
-    """Per-bar carrying cost (funding/swap + short-side borrow) over ``bar_span`` bars.
+    """Legacy per-bar carrying cost (funding/swap + short-side borrow), one period per bar.
+
+    This is the flat-scalar ``interval_ns == 0`` fallback used by callers that hold a
+    position for whole bars and want the simple ``rate × notional × bars`` formula. The
+    calendar-aware path (see ``funding_payments``) accrues the same per-period rates by
+    elapsed wall-clock time instead, which is the canonical reading of ``funding`` /
+    ``borrow`` (§4.5, §24).
 
     ``notional`` is the non-negative value of the open position, ``side`` the direction
     (``+1`` long / ``-1`` short / ``0`` flat), and ``bar_span`` the number of bars the
