@@ -311,49 +311,6 @@ class VectorbtAdapter(EngineAdapter):
             int(bar_ts[0]),
         )
 
-        # Signal evaluations (only real entry/exit/flip bars, §6.1).
-        for i in range(data.n_bars):
-            if bool(signals.long_entry[i]):
-                _add(
-                    LedgerEvent(
-                        EventType.SIGNAL_EVALUATED,
-                        int(bar_ts[i]),
-                        instrument_id,
-                        action="long_entry",
-                    ),
-                    int(bar_ts[i]),
-                )
-            if bool(signals.long_exit[i]):
-                _add(
-                    LedgerEvent(
-                        EventType.SIGNAL_EVALUATED,
-                        int(bar_ts[i]),
-                        instrument_id,
-                        action="long_exit",
-                    ),
-                    int(bar_ts[i]),
-                )
-            if bool(signals.short_entry[i]):
-                _add(
-                    LedgerEvent(
-                        EventType.SIGNAL_EVALUATED,
-                        int(bar_ts[i]),
-                        instrument_id,
-                        action="short_entry",
-                    ),
-                    int(bar_ts[i]),
-                )
-            if bool(signals.short_exit[i]):
-                _add(
-                    LedgerEvent(
-                        EventType.SIGNAL_EVALUATED,
-                        int(bar_ts[i]),
-                        instrument_id,
-                        action="short_exit",
-                    ),
-                    int(bar_ts[i]),
-                )
-
         net: float = 0.0
         for _, trade in records.iterrows():
             entry_dt = pd.Timestamp(trade["Entry Timestamp"])
@@ -368,6 +325,25 @@ class VectorbtAdapter(EngineAdapter):
             exit_reason = classify_exit_reason(
                 exits, data, side, entry_price, entry_bar, exit_bar, aux_data, signals
             )
+
+            # Signal evaluation recorded at the entry bar (§6.1): holds are never
+            # emitted, and only real entries reach the ledger — matching the Nautilus fold.
+            if bool(signals.long_entry[entry_bar]):
+                eval_action = "long_entry"
+            elif bool(signals.short_entry[entry_bar]):
+                eval_action = "short_entry"
+            else:
+                eval_action = None
+            if eval_action is not None:
+                _add(
+                    LedgerEvent(
+                        EventType.SIGNAL_EVALUATED,
+                        int(bar_ts[entry_bar]),
+                        instrument_id,
+                        action=eval_action,
+                    ),
+                    int(bar_ts[entry_bar]),
+                )
 
             # Entry fill + cash leg + position change.
             entry_notional = size * entry_price * multiplier
@@ -429,7 +405,6 @@ class VectorbtAdapter(EngineAdapter):
                 ),
                 int(bar_ts[exit_bar]),
             )
-            _order_submitted(int(bar_ts[exit_bar]), -side, size)
             _add(
                 LedgerEvent(
                     EventType.FILL,
