@@ -52,17 +52,25 @@ __all__ = ["run", "ensure_builtin_engines_registered"]
 def ensure_builtin_engines_registered() -> None:
     """Register the built-in engine adapters whose dependency is importable (§4.1).
 
-    Only Nautilus is implemented today (the vectorbt / backtrader adapters are stubs whose
-    ``run`` raises ``NotImplementedError``), and it depends on the *optional*
-    ``nautilus-trader`` package. Registration is therefore guarded by an ``ImportError``
-    check so ``import ube`` never hard-requires it. Idempotent — re-registering the same
-    class is a no-op — so calling this repeatedly is safe.
+    Nautilus and vectorbt are both implemented and depend on their respective *optional*
+    packages (``nautilus-trader`` and ``vectorbt``). Registration is guarded so ``import ube``
+    never hard-requires either; an adapter whose optional dependency is missing is simply not
+    registered (its ``run`` would raise ``EngineError`` if somehow invoked). Idempotent —
+    re-registering the same class is a no-op — so calling this repeatedly is safe.
     """
     try:
         from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
     except ImportError:
-        return
-    register_engine("nautilus", NautilusAdapter)
+        pass
+    else:
+        register_engine("nautilus", NautilusAdapter)
+
+    try:
+        from ube.adapters.vectorbt_adapter.adapter import VectorbtAdapter
+    except ImportError:
+        pass
+    else:
+        register_engine("vectorbt", VectorbtAdapter)
 
 
 def _standardize_data(data: object) -> MarketData:

@@ -1416,13 +1416,28 @@ def test_ensure_builtin_engines_registered_registers_nautilus():
 
     ube.ensure_builtin_engines_registered()
     assert ube.get_engine("nautilus") is NautilusAdapter
-    assert ube.resolve_engine_name("auto") == "nautilus"
+    # vectorbt is also a builtin adapter, registered when its optional dep is installed.
+    # "auto" resolves to the highest-priority registered engine.
+    try:
+        from ube.adapters.vectorbt_adapter.adapter import VectorbtAdapter
+    except ImportError:
+        assert ube.resolve_engine_name("auto") == "nautilus"
+    else:
+        assert ube.get_engine("vectorbt") is VectorbtAdapter
+        assert ube.resolve_engine_name("auto") == "vectorbt"
 
 
 def test_ensure_builtin_engines_registered_is_idempotent():
     ube.ensure_builtin_engines_registered()
     ube.ensure_builtin_engines_registered()
-    assert registered_engines() == ("nautilus",)
+    engines = registered_engines()
+    assert "nautilus" in engines
+    try:
+        import vectorbt  # noqa: F401
+    except ImportError:
+        assert engines == ("nautilus",)
+    else:
+        assert engines == ("nautilus", "vectorbt")
 
 
 def main() -> int:
