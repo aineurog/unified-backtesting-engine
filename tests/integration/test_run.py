@@ -16,6 +16,7 @@ import pytest
 import ube
 from ube.adapters.base import _REGISTRY
 from ube.core.config import BacktestConfig
+from ube.core.cost import CostModel
 from ube.core.data import MarketData
 from ube.core.errors import (
     CalendarMismatchError,
@@ -264,3 +265,23 @@ def test_run_warmup_slices_benchmark_to_match_strategy_curve(tmp_path):
     # The previously-shipped bug left the benchmark at the raw 60 bars; it must now be
     # warmup-sliced to match the strategy curve positionally (§10).
     assert len(result.benchmark.equity) == 40
+
+
+def test_run_default_all_in_reserves_fees_and_still_trades(tmp_path):
+    # §7.1: ``all_in`` is the zero-config default. With a realistic 5% commission it must
+    # reserve the entry fee in the sized quantity (not spend 100% on units), so the engine
+    # never hits a negative balance and silently returns an empty ``BacktestResult``. The
+    # previously-shipped bug did exactly that — n_trades == 0 with only a stderr line.
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=20)
+    config = BacktestConfig(
+        instrument=PRESETS["stocks"].instrument,
+        cost_model=CostModel(commission=0.05),
+        engine_overrides={"starting_balance": 1_000_000.0},
+    )
+    result = ube.run(
+        md,
+        from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    assert len(result.trades) > 0

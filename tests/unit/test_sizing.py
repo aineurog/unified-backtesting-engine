@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 import numpy as np
 import pytest
 
+from ube.core.cost import CostModel
 from ube.core.errors import ConfigError
 from ube.core.risk import (
     SIZE_KINDS,
@@ -117,6 +118,26 @@ def test_equal_weight_size():
     assert float(result) == pytest.approx(50.0)
 
 
+def test_all_in_size_reserves_entry_fee():
+    # §7.1: the entry fee must be reserved up front so the order doesn't push the account
+    # negative when the venue charges commission on top. With a 5% commission, the units are
+    # sized so that notional + entry fee == capital exactly.
+    cost = CostModel(commission=0.05)
+    units = float(all_in_size(10_000, 50, cost_model=cost))
+    assert units == pytest.approx(10_000 / (50 * 1.05))
+    # entry outlay = price * units * (1 + commission) must equal the capital.
+    assert 50 * units * 1.05 == pytest.approx(10_000)
+    # Without a cost model the legacy fee-less behavior is preserved.
+    assert float(all_in_size(10_000, 50)) == pytest.approx(200.0)
+
+
+def test_equal_weight_size_reserves_entry_fee():
+    cost = CostModel(commission=0.05)
+    units = float(equal_weight_size(10_000, 50, n=4, cost_model=cost))
+    assert units == pytest.approx((10_000 / 4) / (50 * 1.05))
+    assert 50 * units * 1.05 == pytest.approx(2_500)
+
+
 def test_volatility_target_size():
     # units = target * capital / (price * vol)
     result = volatility_target_size(0.01, capital=100_000, price=100, vol=0.02)
@@ -173,3 +194,20 @@ def test_size_position_missing_required_kwarg_raises():
 def test_size_position_bare_value_requiring_kind_raises():
     with pytest.raises(ConfigError):
         size_position("fixed_fraction", capital=10_000, price=50)
+
+
+def test_size_position_affordability_guard_raises_on_shortfall():
+    # §7.1: deploying 100% of capital plus a 1% entry fee is a genuine shortfall — the
+    # in-core guard must surface it as a clear ConfigError before any order is placed,
+    # not let the engine halt internally on a negative balance.
+    model = SizeModel(kind="fixed_fraction", value=1.0)
+    with pytest.raises(ConfigError, match="exceeds available capital"):
+        size_position(model, capital=10_000, price=50, cost_model=CostModel(commission=0.01))
+
+
+def test_size_position_affordability_guard_passes_for_fee_aware_all_in():
+    # The fee-adjusted all_in sizer lands exactly on capital, so the guard must not fire.
+    units = float(
+        size_position("all_in", capital=10_000, price=50, cost_model=CostModel(commission=0.05))
+    )
+    assert units == pytest.approx(10_000 / (50 * 1.05))

@@ -231,6 +231,7 @@ class NautilusAdapter(EngineAdapter):
             exits=config.risk.exit,
             aux_atr=aux_data,
             leverage=actor_leverage,
+            cost_model=cost_model,
         )
 
         venue = Venue(str(overrides.get("venue", DEFAULT_VENUE)))

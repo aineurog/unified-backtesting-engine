@@ -80,6 +80,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders.base import Order
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
+from ube.core.cost import CostModel
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, EngineError
 from ube.core.instrument import allows_short
@@ -169,12 +170,16 @@ class UbeActor(Strategy):  # type: ignore[misc]
         sizing: SizeModel | None = None,
         exits: tuple[Exit, ...] = (),
         leverage: float = 1.0,
+        cost_model: CostModel | None = None,
     ) -> None:
         super().__init__(config)
         self.instrument_id = config.instrument_id
         self._market_data = market_data
         self._aux_atr = dict(aux_atr) if aux_atr is not None else None
         self._sizing = sizing if sizing is not None else SizeModel()
+        # Cost model drives fee-aware sizing (§7.1): the sizer reserves the entry fee so
+        # the order can't push the account negative when the venue charges on top.
+        self._cost_model = cost_model
         # Exposure multiplier (§3.2): the reference nautilus_trader strategy scales
         # ``capital * leverage``; the adapter forces this to 1.0 for cash accounts.
         self._leverage = float(leverage)
@@ -536,6 +541,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 price=price,
                 n=1,
                 vol=vol,
+                cost_model=self._cost_model,
             ),
             dtype=np.float64,
         )
