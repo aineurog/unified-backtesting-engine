@@ -1,26 +1,26 @@
 {
   "asset_class": "crypto_perp",
-  "instrument": "BTC-USDT",
-  "strategy": "trivial_long_roundtrip",
-  "locked_at": "2026-08-24",
-  "tolerance": {
-    "final_equity_rtol": 1e-6
-  },
   "engines": {
-    "vectorbt": {
-      "final_equity": 0.0,
-      "n_trades": 0,
-      "trades_hash": ""
-    },
     "backtrader": {
       "final_equity": 0.0,
       "n_trades": 0,
       "trades_hash": ""
     },
     "nautilus": {
-      "final_equity": 91264.1478,
+      "final_equity": 91259.9899,
       "n_trades": 1,
-      "trades_hash": "5aad80baf4e0f53a7c183734925dccc991b6db26bb0d1643bc2491ea79b71e0e"
+      "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
+    },
+    "vectorbt": {
+      "final_equity": 0.0,
+      "n_trades": 0,
+      "trades_hash": ""
     }
+  },
+  "instrument": "BTC-USDT",
+  "locked_at": "2026-08-24",
+  "strategy": "trivial_long_roundtrip",
+  "tolerance": {
+    "final_equity_rtol": 1e-06
   }
 }

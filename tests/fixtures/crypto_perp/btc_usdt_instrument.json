@@ -3,6 +3,7 @@
   "borrow_model": null,
   "calendar": "24/7",
   "contract_multiplier": null,
+  "funding_interval_hours": null,
   "funding_model": null,
   "settlement_currency": "USDT",
   "symbol": "BTC-USDT",

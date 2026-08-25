@@ -63,7 +63,13 @@ def test_synthetic_bars_shape_and_index():
     assert md.index.tz is not None
     assert md.index.is_monotonic_increasing
     assert not md.index.has_duplicates
-    assert md.index[0] == pd.Timestamp("2024-01-01", tz="UTC")
+    # Sessioned instruments (futures/CMES) carry only in-session bars, so the first bar
+    # is the first trading-session timestamp on or after the requested start — never
+    # before it. The calendar filter must also leave no out-of-session bars.
+    assert md.index[0] >= pd.Timestamp("2024-01-01", tz="UTC")
+    from ube.core.calendar import resolve_calendar, validate_in_session
+
+    validate_in_session(md, resolve_calendar(PRESETS["futures"].instrument))  # must not raise
 
 
 def test_synthetic_bars_ohlc_invariants():

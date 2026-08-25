@@ -16,6 +16,7 @@ from ube.core.errors import BacktestRuntimeError, ConfigError, DataShapeError
 from ube.core.experiment_log import (
     DataReference,
     ExperimentLog,
+    PortfolioDataReference,
     RecordInput,
     _expand_home,
     _resolve_path,
@@ -425,3 +426,136 @@ def test_resolve_path_default_when_nothing_set(monkeypatch):
     monkeypatch.delenv("BACKTEST_LOG_PATH", raising=False)
     monkeypatch.setenv("HOME", "C:/fake/home")
     assert _resolve_path(None) == Path("C:/fake/home/.backtest/experiments.db")
+
+
+# ---------------------------------------------------------------------------
+# PortfolioDataReference (§4.8 multi-instrument fingerprint).
+# ---------------------------------------------------------------------------
+
+
+def _inst(symbol: str = "BTC-USDT", asset_class: str = "crypto_perp") -> Instrument:
+    return Instrument(symbol, asset_class=asset_class)
+
+
+def _md(n: int = 50) -> MarketData:
+    return MarketData.from_dataframe(_df(n))
+
+
+def test_portfolio_data_reference_from_mapping_basic():
+    inst_a = _inst("SYM_A", "crypto_perp")
+    inst_b = _inst("SYM_B", "crypto_spot")
+    mds = {"SYM_A": _md(10), "SYM_B": _md(20)}
+    inst_map = {"SYM_A": inst_a, "SYM_B": inst_b}
+    ref = PortfolioDataReference.from_market_data_mapping(mds, inst_map)
+    assert ref.symbols == ("SYM_A", "SYM_B")
+    assert ref.instruments == (inst_a, inst_b)
+    assert ref.row_count == 30
+    assert ref.date_range[0] == "2024-01-01T00:00:00+00:00"
+    assert ref.date_range[1] == "2024-01-01T19:00:00+00:00"  # 20 bars (0..19) = 19 hours
+    assert isinstance(ref.content_hash, str) and len(ref.content_hash) == 64
+
+
+def test_portfolio_data_reference_content_hash_deterministic():
+    mds = {"SYM_A": _md(10), "SYM_B": _md(20)}
+    h1 = PortfolioDataReference.from_market_data_mapping(mds).content_hash
+    h2 = PortfolioDataReference.from_market_data_mapping(mds).content_hash
+    assert h1 == h2
+    # Changing one instrument's data changes the combined hash
+    mds2 = {"SYM_A": _md(10), "SYM_B": _md(20)}
+    df = _df(10)
+    df.iloc[0, df.columns.get_loc("open")] += 1.0
+    mds2["SYM_A"] = MarketData.from_dataframe(df)
+    h3 = PortfolioDataReference.from_market_data_mapping(mds2).content_hash
+    assert h3 != h1
+
+
+def test_portfolio_data_reference_symbol_sorting():
+    # Input order must not matter; symbols are sorted for deterministic identity.
+    mds = {"SYM_B": _md(5), "SYM_A": _md(5)}
+    ref = PortfolioDataReference.from_market_data_mapping(mds)
+    assert ref.symbols == ("SYM_A", "SYM_B")
+
+
+def test_portfolio_data_reference_empty_mapping_raises():
+    with pytest.raises(DataShapeError):
+        PortfolioDataReference.from_market_data_mapping({})
+
+
+def test_portfolio_data_reference_zero_bar_raises():
+    mds = {"SYM_A": _md(5)}
+    mds["SYM_A"] = mds["SYM_A"].head(0)
+    with pytest.raises(DataShapeError):
+        PortfolioDataReference.from_market_data_mapping(mds)
+
+
+def test_portfolio_data_reference_non_marketdata_raises():
+    mds = {"SYM_A": "not a MarketData"}
+    with pytest.raises(DataShapeError):
+        PortfolioDataReference.from_market_data_mapping(mds)  # type: ignore[arg-type]
+
+
+def test_portfolio_data_reference_instrument_map_optional():
+    # instruments_map is optional; asset_class falls back to "portfolio" in the log row.
+    mds = {"SYM_A": _md(5), "SYM_B": _md(5)}
+    ref = PortfolioDataReference.from_market_data_mapping(mds)
+    assert ref.symbols == ("SYM_A", "SYM_B")
+    assert ref.instruments == ()
+
+
+def test_portfolio_data_reference_frozen():
+    ref = PortfolioDataReference.from_market_data_mapping({"SYM_A": _md(5)})
+    with pytest.raises(FrozenInstanceError):
+        ref.row_count = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# ExperimentLog accepts PortfolioDataReference and stores joined labels.
+# ---------------------------------------------------------------------------
+
+
+def test_experiment_log_records_portfolio_reference(tmp_path):
+    log = ExperimentLog(path=tmp_path / "exp.db")
+    mds = {"SYM_A": _md(5), "SYM_B": _md(10)}
+    ref = PortfolioDataReference.from_market_data_mapping(mds)
+    log.record(
+        run_id="run-portfolio",
+        config=_config(),
+        engine="vectorbt",
+        data_reference=ref,
+        result_hash="abc123",
+    )
+    assert log.count() == 1
+    rec = log.get("run-portfolio")
+    assert rec is not None
+    assert rec.instrument == "SYM_A|SYM_B"
+    assert rec.asset_class == "portfolio"
+    assert rec.row_count == 15
+    assert rec.result_hash == "abc123"
+
+
+def test_experiment_log_records_portfolio_reference_with_instruments(tmp_path):
+    log = ExperimentLog(path=tmp_path / "exp.db")
+    inst_a = _inst("SYM_A", "crypto_perp")
+    inst_b = _inst("SYM_B", "stocks")
+    mds = {"SYM_A": _md(5), "SYM_B": _md(10)}
+    inst_map = {"SYM_A": inst_a, "SYM_B": inst_b}
+    ref = PortfolioDataReference.from_market_data_mapping(mds, inst_map)
+    log.record(
+        run_id="run-portfolio",
+        config=_config(),
+        engine="vectorbt",
+        data_reference=ref,
+    )
+    rec = log.get("run-portfolio")
+    assert rec.asset_class == "crypto_perp|stocks"  # sorted union
+
+
+def test_experiment_log_rejects_bad_data_reference(tmp_path):
+    log = ExperimentLog(path=tmp_path / "exp.db")
+    with pytest.raises(ConfigError):
+        log.record(
+            run_id="bad",
+            config=_config(),
+            engine="vectorbt",
+            data_reference="not a reference",  # type: ignore[arg-type]
+        )

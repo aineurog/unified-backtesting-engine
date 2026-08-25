@@ -7,8 +7,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ube.core.data import MarketData
+from ube.core.data import MarketData, derive_bar_period_ns
 from ube.core.errors import DataError, DataShapeError
+from ube.testing.synthetic import PRESETS, synthetic_bars
 
 
 def _ohlcv_df(n: int = 5, tz: str | None = "UTC") -> pd.DataFrame:
@@ -352,3 +353,16 @@ def test_to_dataframe_round_trips():
     assert out.index.equals(df.index)
     assert list(out.columns) == ["open", "high", "low", "close", "volume"]
     np.testing.assert_allclose(out["close"].to_numpy(), df["close"].to_numpy())
+
+
+def test_derive_bar_period_ns_is_median_positive_spacing():
+    # §4.9: the bar period is inferred from the data (median positive inter-bar spacing),
+    # never a hard-coded label. Futures preset bars are hourly → 3_600_000_000_000 ns.
+    md = synthetic_bars(PRESETS["futures"], n_bars=48)
+    assert derive_bar_period_ns(md) == 3_600_000_000_000
+
+
+def test_derive_bar_period_ns_single_bar_raises():
+    md = synthetic_bars(PRESETS["futures"], n_bars=1)
+    with pytest.raises(DataShapeError, match="at least two bars"):
+        derive_bar_period_ns(md)

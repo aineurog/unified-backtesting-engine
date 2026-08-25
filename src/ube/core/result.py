@@ -39,8 +39,10 @@ Design notes:
   round-trips the full event ledger (parquet cannot carry the heterogeneous sealed event
   schema cleanly). Opt-in and user-driven (§7.3); results are never auto-stored.
 
-``metrics`` defaults to ``None`` and is populated later by the (deferred)
-metrics/reporting layer (§10); it is not computed here.
+``metrics`` is populated here by :func:`~ube.core.metrics.compute_metrics` (§4.9, §10) —
+the standard performance report (returns, risk, drawdown, trade stats) plus the benchmark
+comparison (excess return, information ratio). It is computed once, at construction, from
+the equity curve and (optional) benchmark curve.
 """
 
 from __future__ import annotations
@@ -75,6 +77,7 @@ from ube.core.ledger import (
     trade_table,
     trades,
 )
+from ube.core.metrics import compute_metrics
 
 __all__ = ["BacktestResult", "result_hash"]
 
@@ -99,8 +102,10 @@ class BacktestResult:
         equity_curve: The combined equity curve in ``base_currency`` (§4.6).
         equity_curve_by_instrument: The per-instrument equity breakdown, on the same
             combined grid (§4.6).
-        metrics: Performance metrics, populated by the (deferred) metrics/reporting
-            layer (§10); ``None`` here.
+        metrics: Performance metrics, populated at construction by
+            :func:`~ube.core.metrics.compute_metrics` (§4.9, §10). Always a
+            :class:`~ube.core.metrics.Metrics` instance on results built via
+            :meth:`from_ledger`.
         benchmark: The benchmark curve for this run (``None`` when not computed).
     """
 
@@ -208,7 +213,7 @@ class BacktestResult:
             positions=positions_view,
             equity_curve=combined,
             equity_curve_by_instrument=by_instrument,
-            metrics=None,
+            metrics=compute_metrics(combined, benchmark=benchmark, trades=trades_view),
             benchmark=benchmark,
         )
 

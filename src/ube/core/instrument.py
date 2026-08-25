@@ -26,7 +26,14 @@ from numbers import Real
 
 from ube.core.errors import InvalidInstrumentError
 
-__all__ = ["Instrument", "ASSET_CLASSES", "LONG_ONLY_ASSET_CLASSES", "allows_short"]
+__all__ = [
+    "Instrument",
+    "ASSET_CLASSES",
+    "LONG_ONLY_ASSET_CLASSES",
+    "allows_short",
+    "DEFAULT_FUNDING_INTERVAL_HOURS",
+    "resolve_funding_interval_hours",
+]
 
 # The asset classes the engine supports. The labels are locked by the per-asset-class
 # deterministic fixtures of §16 (``crypto_perp/``, ``futures/``, ``stocks/``,
@@ -42,9 +49,32 @@ ASSET_CLASSES: frozenset[str] = frozenset(
 LONG_ONLY_ASSET_CLASSES: frozenset[str] = frozenset({"crypto_spot"})
 
 
+#: Default funding/swap schedule for instruments that do not declare their own
+#: ``funding_interval_hours`` (§4.5, §24). Crypto perpetuals settle funding every 8
+#: hours, so 8.0 is the sensible cross-asset default; asset classes without funding
+#: (stocks, futures, commodities, crypto_spot, forex) resolve to this too but charge
+#: nothing because their cost model carries a zero funding rate.
+DEFAULT_FUNDING_INTERVAL_HOURS: float = 8.0
+
+
 def allows_short(asset_class: str) -> bool:
     """Whether an ``asset_class`` can open a short position (§4.5)."""
     return asset_class not in LONG_ONLY_ASSET_CLASSES
+
+
+def resolve_funding_interval_hours(instrument: Instrument | None) -> float:
+    """The funding/swap cadence in hours for ``instrument`` (§4.5, §24).
+
+    Returns ``instrument.funding_interval_hours`` when declared, otherwise
+    :data:`DEFAULT_FUNDING_INTERVAL_HOURS`. ``None`` (no instrument) resolves to the
+    default as well — the schedule is asset-class metadata, but an absent instrument
+    cannot carry anything more specific.
+    """
+    if instrument is None:
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+    if instrument.funding_interval_hours is not None:
+        return float(instrument.funding_interval_hours)
+    return DEFAULT_FUNDING_INTERVAL_HOURS
 
 
 def _is_positive_number(value: object) -> bool:
@@ -79,6 +109,12 @@ class Instrument:
         funding_model: Reference to the funding/swap cost model (perps, forex).
         borrow_model: Reference to the short-side borrow / hard-to-borrow fee model
             (stocks, futures).
+        funding_interval_hours: Scheduled funding cadence in hours — the wall-clock
+            period over which ``CostModel.funding`` (the per-period rate, §24) is accrued
+            once. ``None`` applies :data:`DEFAULT_FUNDING_INTERVAL_HOURS`. This is
+            asset-class metadata (§4.5) and belongs on the instrument, not on the
+            engine overrides: cross-engine parity (§16) requires the schedule to travel
+            with the instrument rather than with one adapter's knobs.
     """
 
     symbol: str
@@ -89,6 +125,7 @@ class Instrument:
     settlement_currency: str | None = None
     funding_model: str | None = None
     borrow_model: str | None = None
+    funding_interval_hours: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.symbol, str) or not self.symbol.strip():
@@ -105,6 +142,13 @@ class Instrument:
         ):
             raise InvalidInstrumentError(
                 "contract_multiplier must be a positive finite number"
+            )
+        if (
+            self.funding_interval_hours is not None
+            and not _is_positive_number(self.funding_interval_hours)
+        ):
+            raise InvalidInstrumentError(
+                "funding_interval_hours must be a positive finite number"
             )
 
     @property

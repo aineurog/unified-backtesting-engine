@@ -1132,12 +1132,17 @@ def funding_payments(
 
     Scheduling (Phase-2 calendar-aware, §24):
       * ``interval_ns == 0`` (legacy) — one event **per bar** where the position is open;
-        ``funding_rate`` / ``borrow_rate`` are interpreted as *per-bar* rates.
-      * ``interval_ns > 0`` — events are emitted only on bars whose timestamp falls on the
-        schedule anchored to the first bar's phase (i.e. every ``interval_ns``); the rates
-        are interpreted as the *per-period* (per-interval) rate and charged once per
-        period. This is the correct behaviour for e.g. crypto-perp funding every 8h, and
-        avoids the per-bar over-charge.
+        ``funding_rate`` / ``borrow_rate`` are interpreted as *per-bar* rates (elapsed-time
+        accrual degenerates to one period per bar).
+      * ``interval_ns > 0`` — the rates are interpreted as the *per-period* (per-interval)
+        rate and are accrued **by elapsed wall-clock time**, not by bar-count modulo. For
+        each open bar the charge is ``rate × notional × (bar_span / interval)``; the per-bar
+        ``bar_span`` is the gap to the neighbouring bar timestamp. This makes the total
+        carry correct for *any* bar spacing — a daily bar spanning three 8h funding periods
+        accrues ~3× the per-period rate, and a 90-minute bar accrues 1/3 — instead of the
+        old modulo schedule that silently skipped non-aligned bars and under-charged by
+        3×–6.7×. One event is emitted **per open bar**, carrying that bar's accrued slice;
+        the summed amount equals the true time-weighted carry.
 
     ``notional`` is the non-negative open value per bar, ``side`` is ``+1``/``-1``/``0``,
     and ``timestamps`` are int64-ns bar boundaries aligned to them (all length-``n``).
@@ -1150,8 +1155,8 @@ def funding_payments(
         timestamps: int64-ns bar boundaries, one per open bar.
         notional: Open notional (≥ 0) per bar, in the settlement currency.
         side: Direction per bar, ``+1`` long / ``-1`` short / ``0`` flat.
-        funding_rate: Per-bar funding/swap rate (fraction of notional), or a scalar.
-        borrow_rate: Per-bar short-side borrow rate (fraction of notional), or a scalar.
+        funding_rate: Per-period funding/swap rate (fraction of notional), or a scalar.
+        borrow_rate: Per-period short-side borrow rate (fraction of notional), or a scalar.
         currency: Currency the accrual is denominated in.
 
     Returns:
@@ -1180,16 +1185,18 @@ def funding_payments(
     f = _series(funding_rate, "funding_rate")
     b = _series(borrow_rate, "borrow_rate")
 
-    # Calendar-aware scheduling (§24): charge only on interval-boundary bars. When no
-    # interval is set, every open bar accrues (legacy per-bar behaviour).
-    if interval_ns and interval_ns > 0:
-        phase = ts[0] % interval_ns
-        on_schedule = (ts % interval_ns) == phase
+    # Elapsed-time accrual (§24). The per-period rate is charged in proportion to the
+    # real time each open bar spans, so the total carry is correct for any bar spacing.
+    # For interval_ns == 0 (or a single bar) the rate is per bar: frac = 1.0.
+    if interval_ns and interval_ns > 0 and ts.shape[0] > 1:
+        # First bar inherits its right-neighbour's span (no preceding timestamp to measure).
+        dts = np.diff(ts, prepend=ts[0] - (ts[1] - ts[0]))
+        frac = dts / float(interval_ns)
     else:
-        on_schedule = np.ones(n.shape[0], dtype=bool)
+        frac = np.ones(n.shape[0], dtype=np.float64)
 
-    cost = (f + b * (s < 0.0)) * n
-    idx = np.nonzero((n > 0.0) & (cost != 0.0) & on_schedule)[0]
+    cost = (f + b * (s < 0.0)) * n * frac
+    idx = np.nonzero((n > 0.0) & (cost != 0.0))[0]
     return tuple(
         LedgerEvent(
             EventType.FUNDING_PAYMENT,

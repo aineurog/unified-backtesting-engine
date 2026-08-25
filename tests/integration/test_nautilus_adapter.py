@@ -6,6 +6,8 @@ recreated or deleted. Step 1 covers the :class:`~ube.adapters.base.EngineAdapter
 contract + the engine registry (§4.1).
 """
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -20,7 +22,7 @@ from ube.adapters.nautilus_adapter.overrides import (
     validate_overrides,
 )
 from ube.core.data import MarketData
-from ube.core.errors import ConfigError, DataShapeError, InvalidInstrumentError, InvalidSignalError
+from ube.core.errors import ConfigError, InvalidInstrumentError, InvalidSignalError
 from ube.core.signals import from_target
 from ube.testing.synthetic import PRESETS, synthetic_bars
 
@@ -444,21 +446,6 @@ def test_build_instrument_rejects_unsupported_asset_class():
 # ---------------------------------------------------------------------------
 
 
-def test_derive_bar_period_ns_is_median_positive_spacing():
-    from ube.adapters.nautilus_adapter.adapt_data import derive_bar_period_ns
-
-    md = synthetic_bars(PRESETS["futures"], n_bars=48)
-    assert derive_bar_period_ns(md) == 3_600_000_000_000
-
-
-def test_derive_bar_period_ns_single_bar_raises():
-    from ube.adapters.nautilus_adapter.adapt_data import derive_bar_period_ns
-
-    md = synthetic_bars(PRESETS["futures"], n_bars=1)
-    with pytest.raises(DataShapeError, match="at least two bars"):
-        derive_bar_period_ns(md)
-
-
 def test_to_nautilus_bars_builds_hourly_bar_type_and_matches_every_bar():
     from ube.adapters.nautilus_adapter.adapt_data import to_nautilus_bars
     from ube.adapters.nautilus_adapter.instrument_map import build_instrument
@@ -692,21 +679,22 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
     from ube.core.ledger import EventType
 
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    instrument = replace(PRESETS["crypto_perp"].instrument, funding_interval_hours=1.0)
     result = NautilusAdapter().run(
         md,
         from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0]),
         BacktestConfig(
-            instrument=PRESETS["crypto_perp"].instrument,
+            instrument=instrument,
             cost_model=CostModel(commission=0.0005, slippage=0.0002, funding=0.0001),
-            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
+            engine_overrides={"starting_balance": 100000.0},
         ),
     )
 
     fills = _fills(result)
     assert len(fills) == 2
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (1, 1.652, 60535.9, None),
-        (-1, 1.652, 60693.9, "signal"),
+        (1, 1.65, 60535.9, None),
+        (-1, 1.65, 60693.9, "signal"),
     ]
     commissions = _ledger_events(result, EventType.COMMISSION)
     fundings = _ledger_events(result, EventType.FUNDING_PAYMENT)
@@ -716,8 +704,10 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
     assert all(e.amount > 0.0 for e in fundings)
     (trade,) = result.trades
     assert trade.exit_reason == "signal"
-    assert trade.net_pnl == pytest.approx(90.7002, rel=1e-4)  # gross less fees + funding
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.7002, rel=1e-6)
+    # all_in now reserves the entry fee in the sized quantity (§7.1), so the entry fills
+    # slightly fewer units and the net PnL/equity reflect the correctly-reserved fee.
+    assert trade.net_pnl == pytest.approx(90.5904, rel=1e-4)  # gross less fees + funding
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.6453, rel=1e-6)
 
 
 def test_nautilus_full_loop_crypto_perp_short_pays_loss():
@@ -727,27 +717,30 @@ def test_nautilus_full_loop_crypto_perp_short_pays_loss():
     from ube.core.ledger import EventType
 
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    instrument = replace(PRESETS["crypto_perp"].instrument, funding_interval_hours=1.0)
     result = NautilusAdapter().run(
         md,
         from_target([0, -1, -1, -1, 0, 0, 0, 0, 0, 0]),
         BacktestConfig(
-            instrument=PRESETS["crypto_perp"].instrument,
+            instrument=instrument,
             cost_model=CostModel(commission=0.0005, slippage=0.0002, funding=0.0001),
-            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
+            engine_overrides={"starting_balance": 100000.0},
         ),
     )
 
     fills = _fills(result)
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (-1, 1.652, 60535.9, None),
-        (1, 1.652, 60693.9, "signal"),
+        (-1, 1.65, 60535.9, None),
+        (1, 1.65, 60693.9, "signal"),
     ]
     (trade,) = result.trades
     assert trade.side == -1
-    assert trade.net_pnl == pytest.approx(-431.3318, rel=1e-4)
+    # all_in now reserves the entry fee in the sized quantity (§7.1), so the entry fills
+    # slightly fewer units and the net PnL/equity reflect the correctly-reserved fee.
+    assert trade.net_pnl == pytest.approx(-430.8096, rel=1e-4)
     assert len(_ledger_events(result, EventType.COMMISSION)) == 2
     assert len(_ledger_events(result, EventType.FUNDING_PAYMENT)) == 3
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(99568.6682, rel=1e-6)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(99569.1904, rel=1e-6)
 
 
 def test_nautilus_cash_account_short_rejection_raises_engine_error():
@@ -765,6 +758,72 @@ def test_nautilus_cash_account_short_rejection_raises_engine_error():
                 engine_overrides={"account_type": "cash"},
             ),
         )
+
+
+def test_nautilus_last_bar_rejection_surfaces_after_run():
+    # Regression for failure mode B: a market-order rejection on the *final* bar has no
+    # subsequent on_bar to trip the per-bar market_rejection check, so the adapter must
+    # re-check it after engine.run() returns. The short signal is placed only on the last
+    # bar; on a cash account the order is rejected, and the run must raise rather than
+    # report success with a silently missing trade.
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import EngineError
+
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
+    with pytest.raises(EngineError, match="market order rejected by the venue"):
+        NautilusAdapter().run(
+            md,
+            from_target([0, 0, 0, 0, 0, -1]),
+            BacktestConfig(
+                instrument=PRESETS["stocks"].instrument,
+                engine_overrides={"account_type": "cash"},
+            ),
+        )
+
+
+def test_actor_index_for_raises_on_unknown_timestamp():
+    # Regression for failure mode A: a bar whose timestamp does not match any input bar is
+    # a genuine data/logic error and must raise, not silently fall back to "the bar after
+    # the last one".
+    from types import SimpleNamespace
+
+    from ube.adapters.nautilus_adapter.actor import UbeActor, UbeActorConfig
+    from ube.adapters.nautilus_adapter.adapter import (
+        build_instrument,
+        to_nautilus_bars,
+        to_signal_map,
+    )
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import EngineError
+    from ube.core.risk.sizing import SizeModel
+
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
+    config = BacktestConfig(instrument=PRESETS["stocks"].instrument)
+    build = build_instrument(config.instrument, {})
+    _, bar_type = to_nautilus_bars(md, build)
+    signal_map = to_signal_map(md, from_target([0, 0, 0, 0, 0, 0]))
+
+    actor = UbeActor(
+        UbeActorConfig(
+            instrument_id=build.instrument_id,
+            bar_type=bar_type,
+            signal_map=signal_map,
+            asset_class=config.instrument.asset_class,
+        ),
+        market_data=md,
+        sizing=SizeModel(),
+        exits=(),
+        aux_atr=None,
+        leverage=1.0,
+        cost_model=None,
+    )
+
+    ts = int(md.timestamps.as_unit("ns").asi8[3])
+    assert actor._index_for(SimpleNamespace(ts_event=ts)) == 3
+
+    with pytest.raises(EngineError, match="not found in the known bar index"):
+        actor._index_for(SimpleNamespace(ts_event=999_999_999_999_999_999))
 
 
 # Reference mirror: rows 2026-08-03 12:00 -> 23:00 of the nautilus_trader
@@ -791,34 +850,35 @@ def test_nautilus_reference_trailing_stop_mirror():
     from ube.core.risk import RiskConfig, TrailingStop
 
     data = _bars_from_rows(_TRAILING_REFERENCE_ROWS)
+    instrument = replace(PRESETS["crypto_perp"].instrument, funding_interval_hours=1.0)
     result = NautilusAdapter().run(
         data,
         from_target([1] * 12),
         BacktestConfig(
-            instrument=PRESETS["crypto_perp"].instrument,
+            instrument=instrument,
             risk=RiskConfig(exit=(TrailingStop(0.001),)),
-            engine_overrides={"funding_interval_hours": 1.0},
         ),
     )
 
-    # Entry splits: all-in sizing on 100000 at ~65000 -> 1.538 BTC in two fills; the
-    # trailing stop is armed at the running peak * 0.999 and fires on the last (drop)
-    # bar — the reference journals its exit on this same 23:00 bar.
+    # Entry splits: all-in sizing on 100000 at ~65000 -> 1.537 BTC in two fills (the
+    # fee-aware all_in size is floored to the lot grid, §7.1); the trailing stop is
+    # armed at the running peak * 0.999 and fires on the last (drop) bar — the
+    # reference journals its exit on this same 23:00 bar.
     fills = _fills(result)
     assert len(fills) == 4
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
         (1, 0.25, 65000.0, None),
-        (1, 1.288, 65000.1, None),
+        (1, 1.287, 65000.1, None),
         (-1, 0.25, 65600.4, "trailing_stop"),
-        (-1, 1.288, 65600.3, "trailing_stop"),
+        (-1, 1.287, 65600.3, "trailing_stop"),
     ]
     (trade,) = result.trades
     assert trade.exit_reason == "trailing_stop"
     assert trade.entry_price == pytest.approx(65000.0837, abs=1e-3)
     assert trade.exit_price == pytest.approx(65600.4, abs=1e-1)
-    assert trade.net_pnl == pytest.approx(712.2074, rel=1e-4)
-    assert float(result.equity_curve.equity[0]) == pytest.approx(99939.8891, abs=1e-3)
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100712.2074, rel=1e-6)
+    assert trade.net_pnl == pytest.approx(711.7444, rel=1e-4)
+    assert float(result.equity_curve.equity[0]) == pytest.approx(99939.9282, abs=1e-3)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100711.7444, rel=1e-6)
 
 
 def test_nautilus_touched_take_profit_stamps_exit_reason():
@@ -939,9 +999,9 @@ def test_nautilus_trailing_and_chandelier_ratchet_without_lookahead():
         (25.0, 101.57, "chandelier"),
         (975.0, 101.56, "chandelier"),
     ]
-    assert chandelier_level(
-        ChandelierExit(2), data, side=1, entry_bar=0, atr_series=atr(data)
-    )[1] == pytest.approx(101.5714, abs=1e-3)
+    assert chandelier_level(ChandelierExit(2), data, side=1, entry_bar=0, atr_series=atr(data))[
+        1
+    ] == pytest.approx(101.5714, abs=1e-3)
     assert (
         chandelier_level(ChandelierExit(2), data, side=1, entry_bar=0, atr_series=atr(data))[2]
         < 101.5
@@ -981,9 +1041,7 @@ def test_nautilus_actor_entry_sized_in_integer_contracts():
     assert sum(e.quantity for e in fills) == pytest.approx(20.0, abs=1e-9)
     assert result.trades == ()
     (position_value,) = [
-        e.position_after
-        for e in result.ledger
-        if e.event_type is EventType.POSITION_CHANGE
+        e.position_after for e in result.ledger if e.event_type is EventType.POSITION_CHANGE
     ]
     assert position_value == 20.0  # remains flat after entry, one contract block
 
@@ -1062,10 +1120,9 @@ def test_nautilus_actor_atr_stop_touched_fills_at_trigger():
     assert trade.exit_price == pytest.approx(97.28, abs=1e-2)
     assert trade.net_pnl == pytest.approx(-3213.35, rel=1e-3)
     # The ratcheted trigger is the level on the last completed bar (no lookahead).
-    assert (
-        exit_level(ATRStop(2), market_data=data, side=1, entry_price=100.5, entry_bar=0)[1]
-        == pytest.approx(97.2857, abs=1e-3)
-    )
+    assert exit_level(ATRStop(2), market_data=data, side=1, entry_price=100.5, entry_bar=0)[
+        1
+    ] == pytest.approx(97.2857, abs=1e-3)
     assert float(result.equity_curve.equity[-1]) == pytest.approx(96786.65, rel=1e-6)
 
 

@@ -30,6 +30,7 @@ from typing import Literal, cast
 import numpy as np
 from numpy.typing import ArrayLike
 
+from ube.core.cost import CostModel, fill_cost
 from ube.core.errors import ConfigError
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "volatility_target_size",
     "all_in_size",
     "equal_weight_size",
+    "floor_to_step",
 ]
 
 SizeKind = Literal[
@@ -93,11 +95,19 @@ class SizeModel:
             ``fixed_units`` / ``volatility_target`` and forbidden otherwise. Its
             meaning depends on ``kind`` (a fraction of capital, a unit count, or a
             target volatility fraction respectively).
+        vol: The name of an ``aux_data`` series supplying the per-bar volatility
+            estimate for ``volatility_target`` sizing (a dimensionless fraction of
+            price — e.g. ``0.02`` = 2%, an ATR/price ratio or a return standard
+            deviation). Required by the *adapter* for ``volatility_target`` (§6.3):
+            the library never computes volatility from the signal bars. Forbidden
+            for every other ``kind``. The core sizers take the resolved ``vol`` array
+            as an explicit argument and do not read this name.
     """
 
     kind: SizeKind = "all_in"
     value: float | None = None
     leverage: float = 1.0
+    vol: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in SIZE_KINDS:
@@ -112,6 +122,18 @@ class SizeModel:
             raise ConfigError(
                 f"sizing kind={self.kind!r} does not take a value; got {self.value!r}"
             )
+        # ``vol`` names an aux_data series and is only meaningful for volatility_target
+        # (§6.3); the adapter enforces that it is actually supplied, mirroring how the
+        # ``ATRStop.atr`` reference is optional here but enforced there (§5.2).
+        if self.vol is not None:
+            if self.kind != "volatility_target":
+                raise ConfigError(
+                    f"sizing kind={self.kind!r} does not take a vol; got {self.vol!r}"
+                )
+            if not isinstance(self.vol, str) or not self.vol.strip():
+                raise ConfigError(
+                    f"SizeModel.vol must be a non-empty aux_data name; got {self.vol!r}"
+                )
         # Leverage is an *exposure* multiplier (§3.2 single source of truth): it
         # scales the allocated notional the same way the reference nautilus_trader
         # strategy does (``leveraged_capital = capital * leverage``). The adapter
@@ -149,6 +171,62 @@ def _divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
     return result
 
 
+def _entry_fee_rate(cost_model: CostModel | None) -> float:
+    """Entry-fill fee rate (commission + slippage) as a fraction of notional.
+
+    Reuses :func:`ube.core.cost.fill_cost` so the fee math has a single source of truth
+    (§4.5) — this is not a second, independent implementation of the same calculation.
+    ``None`` means zero-cost (the §7.1 default), preserving fee-less behavior for callers
+    that don't pass a cost model. Entry fee only: the exit fill is paid out of proceeds,
+    not out of the upfront capital being sized here.
+    """
+    if cost_model is None:
+        return 0.0
+    return float(fill_cost(cost_model, notional=1.0).item())
+
+
+def _check_affordable(
+    capital: ArrayLike, price: ArrayLike, units: np.ndarray, cost_model: CostModel | None
+) -> None:
+    """Raise if the entry outlay (notional + entry fee) exceeds available capital (§7.1).
+
+    Surfaces a genuine shortfall as a clear error in core — *before* the order reaches the
+    venue — instead of letting the engine halt internally on a negative balance. A tiny
+    tolerance absorbs float rounding at the exact-capital boundary (the fee-adjusted
+    ``all_in`` / ``equal_weight`` sizers land exactly on capital).
+    """
+    cap = np.asarray(capital, dtype=np.float64)
+    px = np.asarray(price, dtype=np.float64)
+    gross = px * units
+    total = gross + fill_cost(cost_model, notional=gross) if cost_model is not None else gross
+    if (total > cap * (1.0 + 1e-9)).any():
+        raise ConfigError(
+            "position entry cost (notional + fees) exceeds available capital; "
+            "the requested size cannot be funded"
+        )
+
+
+def floor_to_step(units: ArrayLike, step: float) -> np.ndarray:
+    """Floor sized units onto the instrument's tradable lot grid (§7.1).
+
+    The adapter converts a sized float into the venue's lot size; that conversion must
+    never round **up**. An up-rounded quantity can exceed the exact size the
+    affordability guard verified (e.g. 52.37 whole-lot units flooring to 52 is safe, but a
+    venue rounding to 53 re-breaches capital by up to one lot's notional + fee — observed
+    as a small residual account shortfall and an internal engine halt). Flooring keeps the
+    final tradable quantity at or below the checked size. The tiny epsilon absorbs float
+    representation error so a value like ``3.0`` stored as ``2.9999999996`` floors to 3,
+    not 2.
+    """
+    if isinstance(step, bool) or not isinstance(step, (int, float)):
+        raise ConfigError(f"step must be a positive number; got {step!r}")
+    s = float(step)
+    if not math.isfinite(s) or s <= 0:
+        raise ConfigError(f"step must be finite and positive; got {step!r}")
+    arr = _as_float(units, "units")
+    return np.floor(arr / s + 1e-9) * s
+
+
 def fixed_fraction_size(fraction: float, *, capital: ArrayLike, price: ArrayLike) -> np.ndarray:
     """Units for ``fraction`` of capital allocated to a position (§6.3).
 
@@ -172,19 +250,31 @@ def fixed_units_size(units: ArrayLike) -> np.ndarray:
     return arr
 
 
-def all_in_size(capital: ArrayLike, price: ArrayLike) -> np.ndarray:
-    """Units for the naive all-in sizer: 100% of capital (units = ``capital / price``)."""
+def all_in_size(
+    capital: ArrayLike, price: ArrayLike, cost_model: CostModel | None = None
+) -> np.ndarray:
+    """Fee-aware all-in sizer: 100% of capital, reserving the entry fee (§7.1).
+
+    ``units = capital / (price * (1 + entry_fee_rate))``, where the entry-fee rate is the
+    commission + slippage fraction reused from :func:`ube.core.cost.fill_cost`. Reserving
+    the fee up front means the order no longer pushes the account negative when the venue
+    charges commission on top of the notional (the previously-silent empty-result bug).
+    """
     cap = _as_float(capital, "capital")
     px = _as_float(price, "price")
     _require_nonnegative(cap)
     _require_positive_price(px)
-    return _divide(cap, px)
+    fee = _entry_fee_rate(cost_model)
+    return _divide(cap, px * (1.0 + fee))
 
 
-def equal_weight_size(capital: ArrayLike, price: ArrayLike, n: int) -> np.ndarray:
-    """Units for an equal split of capital across ``n`` positions (portfolio).
+def equal_weight_size(
+    capital: ArrayLike, price: ArrayLike, n: int, cost_model: CostModel | None = None
+) -> np.ndarray:
+    """Fee-aware equal split of capital across ``n`` positions (portfolio, §7.1).
 
-    ``units = (capital / n) / price``.
+    ``units = (capital / n) / (price * (1 + entry_fee_rate))`` — like
+    :func:`all_in_size`, the entry fee is reserved up front (§7.1).
     """
     if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
         raise ConfigError(f"equal_weight n must be a positive integer; got {n!r}")
@@ -192,7 +282,8 @@ def equal_weight_size(capital: ArrayLike, price: ArrayLike, n: int) -> np.ndarra
     px = _as_float(price, "price")
     _require_nonnegative(cap)
     _require_positive_price(px)
-    return _divide(cap / float(n), px)
+    fee = _entry_fee_rate(cost_model)
+    return _divide(cap / float(n), px * (1.0 + fee))
 
 
 def volatility_target_size(
@@ -228,13 +319,15 @@ def size_position(
     price: ArrayLike,
     n: int | None = None,
     vol: ArrayLike | None = None,
+    cost_model: CostModel | None = None,
 ) -> np.ndarray:
     """Dispatch a :class:`SizeModel` (or a bare ``kind``) to its sizer (§6.3).
 
     ``kind_or_model`` is either a :class:`SizeModel`, or a bare :data:`SizeKind` string
     (valid only for value-free kinds — ``all_in`` / ``equal_weight``). ``n`` is required
-    for ``equal_weight``; ``vol`` is required for ``volatility_target``. Returns units as
-    a float64 array (0-d for scalar inputs).
+    for ``equal_weight``; ``vol`` is required for ``volatility_target``. ``cost_model``
+    (optional) lets the fee-aware sizers reserve the entry fee and enables the in-core
+    affordability guard (§7.1). Returns units as a float64 array (0-d for scalar inputs).
     """
     model = (
         kind_or_model
@@ -243,20 +336,23 @@ def size_position(
     )
 
     if model.kind == "fixed_fraction":
-        return fixed_fraction_size(
+        units = fixed_fraction_size(
             cast(float, model.value), capital=capital, price=price
         )
-    if model.kind == "fixed_units":
-        return fixed_units_size(cast(float, model.value))
-    if model.kind == "volatility_target":
+    elif model.kind == "fixed_units":
+        units = fixed_units_size(cast(float, model.value))
+    elif model.kind == "volatility_target":
         if vol is None:
             raise ConfigError("volatility_target sizing requires a vol estimate")
-        return volatility_target_size(
+        units = volatility_target_size(
             cast(float, model.value), capital=capital, price=price, vol=vol
         )
-    if model.kind == "all_in":
-        return all_in_size(capital, price)
-    # equal_weight
-    if n is None:
-        raise ConfigError("equal_weight sizing requires n")
-    return equal_weight_size(capital, price, n)
+    elif model.kind == "all_in":
+        units = all_in_size(capital, price, cost_model)
+    else:  # equal_weight
+        if n is None:
+            raise ConfigError("equal_weight sizing requires n")
+        units = equal_weight_size(capital, price, n, cost_model)
+
+    _check_affordable(capital, price, units, cost_model)
+    return units

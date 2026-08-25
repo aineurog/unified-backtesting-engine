@@ -69,7 +69,6 @@ from nautilus_trader.config import BacktestEngineConfig, LoggingConfig
 from nautilus_trader.model.enums import AccountType, OmsType
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.objects import Currency, Money
-from numpy.typing import ArrayLike
 
 from ube.adapters.base import EngineAdapter
 from ube.adapters.nautilus_adapter.actor import UbeActor, UbeActorConfig
@@ -90,9 +89,9 @@ from ube.core.errors import (
     EngineError,
     InvalidSignalError,
 )
+from ube.core.instrument import resolve_funding_interval_hours
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
-from ube.core.risk.exits import ATRStop, ChandelierExit, Exit, atr
 from ube.core.signals import Signals, validate_long_only
 
 __all__ = ["NautilusAdapter"]
@@ -130,9 +129,14 @@ class NautilusAdapter(EngineAdapter):
             config: The full :class:`~ube.core.config.BacktestConfig` (instrument, cost,
                 risk/exits, benchmark, engine overrides).
             aux_data: Optional derived-series map referenced by name from exit configs
-                (§5.2) — e.g. ``{"atr_12h": <array>}`` for ``ATRStop(atr="atr_12h")``.
-                When a referenced name is absent the adapter computes ATR from ``data``.
-                A flat ``name -> array`` map for a single instrument.
+                (§5.2) and from ``volatility_target`` sizing (§6.3) — e.g.
+                ``{"atr_12h": <array>}`` for ``ATRStop(atr="atr_12h")`` or
+                ``{"vol_1d": <array>}`` for ``SizeModel(..., vol="vol_1d")``. A
+                ``MarketData`` value is turned into ATR (or ``ATR/price`` for vol)
+                internally; a precomputed array is used verbatim. A referenced name
+                that is absent is a ``ConfigError`` — the library never derives ATR or
+                volatility from the signal ``data`` bars. A flat ``name -> value`` map
+                for a single instrument.
 
         Returns:
             The canonical :class:`~ube.core.result.BacktestResult`.
@@ -223,16 +227,11 @@ class NautilusAdapter(EngineAdapter):
                 asset_class=config.instrument.asset_class,
             ),
             market_data=data,
-            atr_series=_resolve_atr_series(config.risk.exit, aux_data),
             sizing=config.risk.sizing,
             exits=config.risk.exit,
             aux_atr=aux_data,
             leverage=actor_leverage,
-            vol=(
-                _volatility_estimate(data)
-                if config.risk.sizing.kind == "volatility_target"
-                else None
-            ),
+            cost_model=cost_model,
         )
 
         venue = Venue(str(overrides.get("venue", DEFAULT_VENUE)))
@@ -274,6 +273,13 @@ class NautilusAdapter(EngineAdapter):
             if not isinstance(exc, EngineError):
                 raise EngineError(f"nautilus backtest failed: {exc}") from exc
             raise
+
+        # A market-order rejection raised inside the per-bar loop only fires if a later bar
+        # calls on_bar again (which re-checks market_rejection). A rejection on the very
+        # last bar has no subsequent on_bar, so surface it here — otherwise the run reports
+        # as fully successful while silently missing the trade that should have happened.
+        if actor.market_rejection is not None:
+            raise EngineError(f"market order rejected by the venue: {actor.market_rejection}")
 
         try:
             ledger = self._fold(
@@ -446,10 +452,11 @@ class NautilusAdapter(EngineAdapter):
                 dtype=np.float64,
             )
             step_ts, step_value = _step_timestamps(pc_ts, pc_val)
-            # Calendar-aware funding (§24): charge the per-period rate once per interval
-            # (default 8h) instead of per bar. ``funding`` is the per-period rate.
-            _overrides = config.engine_overrides if config.engine_overrides is not None else {}
-            interval_hours = float(_overrides.get("funding_interval_hours", 8.0))
+            # Calendar-aware funding (§24): accrue the per-period rate by elapsed
+            # wall-clock time, so the charge is correct for any bar spacing. The schedule
+            # (the funding period in hours) is asset-class metadata on the Instrument
+            # (§4.5), not a nautilus engine override — see ``resolve_funding_interval_hours``.
+            interval_hours = resolve_funding_interval_hours(config.instrument)
             interval_ns = int(interval_hours * 3600 * 1_000_000_000)
             for event in funding_payments(
                 instrument_id=instrument_id,
@@ -480,52 +487,8 @@ def _events_of_type(
 
 
 def _carry_rates(cost_model: CostModel) -> tuple[float, float]:
-    """The ``(funding, borrow)`` per-bar rates of the resolved cost model."""
+    """The ``(funding, borrow)`` per-period rates of the resolved cost model (§24)."""
     return float(cost_model.funding), float(cost_model.borrow)
-
-
-def _resolve_atr_series(
-    exits: tuple[Exit, ...],
-    aux_data: Mapping[str, ArrayLike] | None,
-) -> np.ndarray | None:
-    """Resolve the single ATR series the actor's exit book needs (§5.2).
-
-    Every ATR-referencing exit that names an ``aux_data`` key must name the *same* key —
-    the actor's exit book holds one series. A missing key falls back to auto-compute
-    (the exit's own ``period``). Multiple distinct named keys are a configuration the
-    single-series book cannot express and raise :class:`~ube.core.errors.ConfigError`
-    (fail-fast, §15).
-    """
-    names = {
-        e.atr
-        for e in exits
-        if isinstance(e, (ATRStop, ChandelierExit)) and e.atr is not None
-    }
-    if not names:
-        return None
-    if len(names) > 1:
-        raise ConfigError(
-            "nautilus actor supports a single named ATR series; "
-            f"exits reference {sorted(names)}"
-        )
-    name = names.pop()
-    if aux_data is None or name not in aux_data:
-        return None  # absent → auto-compute ATR(period) (§5.2)
-    # A raw OHLCV MarketData aux is resolved into an ATR series by the actor itself
-    # (it computes ATR internally per-§5.2, with no look-ahead); don't coerce it to a
-    # plain array here. Precomputed 1-D series are forwarded straight through.
-    if isinstance(aux_data[name], MarketData):
-        return None
-    series = np.asarray(aux_data[name], dtype=np.float64)
-    if series.ndim != 1:
-        raise ConfigError(f"aux_data[{name!r}] must be 1-D; got shape {series.shape}")
-    return series
-
-
-def _volatility_estimate(market_data: MarketData) -> np.ndarray:
-    """A per-bar volatility estimate (ATR / price) for ``volatility_target`` sizing."""
-    result: np.ndarray = atr(market_data) / market_data.close
-    return result
 
 
 def _bar_timestamps_ns(data: MarketData) -> np.ndarray:

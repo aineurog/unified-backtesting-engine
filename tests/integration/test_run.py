@@ -1,0 +1,405 @@
+"""Top-level ``ube.run`` orchestrator tests (§4.8, §7.1).
+
+The orchestrator ties the Phase-1 core together: standardize the inputs, resolve the
+engine, run the adapter, attach the benchmark, and record the run to the experiment log.
+These tests exercise that pipeline end-to-end through the Nautilus adapter (the only
+implemented engine) and verify the benchmark attachment and the unconditional
+experiment-log record.
+"""
+
+import math
+from dataclasses import replace
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import ube
+from ube.adapters.base import _REGISTRY, EngineAdapter
+from ube.core.config import BacktestConfig
+from ube.core.cost import CostModel
+from ube.core.data import MarketData
+from ube.core.errors import (
+    CalendarMismatchError,
+    ConfigError,
+    DataShapeError,
+    InvalidSignalError,
+    UndeclaredConfigError,
+)
+from ube.core.experiment_log import ExperimentLog
+from ube.core.result import BacktestResult, result_hash
+from ube.core.risk import RiskConfig
+from ube.core.risk.sizing import SizeModel
+from ube.core.signals import from_target
+from ube.testing.synthetic import PRESETS, synthetic_bars
+
+
+@pytest.fixture(autouse=True)
+def _isolated_registry():
+    """Snapshot and restore the global registry around every test."""
+    snapshot = dict(_REGISTRY)
+    _REGISTRY.clear()
+    yield
+    _REGISTRY.clear()
+    _REGISTRY.update(snapshot)
+
+
+def _config() -> BacktestConfig:
+    return BacktestConfig(
+        instrument=PRESETS["futures"].instrument,
+        risk=RiskConfig(sizing=SizeModel(kind="fixed_units", value=1.0)),
+        engine_overrides={"starting_balance": 100000.0},
+    )
+
+
+def test_run_end_to_end_attaches_benchmark_and_logs(tmp_path):
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
+    signals = from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+    log_path = tmp_path / "experiments.db"
+
+    result = ube.run(md, signals, _config(), log_path=log_path)
+
+    assert isinstance(result, BacktestResult)
+    assert result.benchmark is not None
+    assert result.benchmark.n_bars == md.n_bars
+    assert float(result.benchmark.equity[0]) == 1.0  # buy-and-hold, normalized
+
+    with ExperimentLog(path=log_path) as log:
+        assert log.count() == 1
+        record = log.get(result.run_id)
+        assert record is not None
+        assert record.engine == "nautilus"
+        assert record.instrument == PRESETS["futures"].instrument.symbol
+        assert record.result_hash == result_hash(result)
+
+
+def test_run_populates_metrics_with_benchmark_comparison(tmp_path):
+    from ube.core.metrics import Metrics
+
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=300)
+    signals = from_target([0] + [1] * 100 + [0] * 100 + [-1] * 99)
+    result = ube.run(md, signals, _config(), log_path=tmp_path / "experiments.db")
+
+    assert isinstance(result.metrics, Metrics)
+    # Standard set present and finite where defined.
+    assert math.isfinite(result.metrics.total_return)
+    assert result.metrics.max_drawdown <= 0.0
+    assert result.metrics.trade_count == len(result.trades)
+    # Benchmark is the default buy-and-hold, so the comparison must be populated.
+    assert result.metrics.excess_return is not None
+    assert result.metrics.information_ratio is not None
+    # 300 hourly bars << 1 year of calendar days -> flagged low confidence.
+    assert result.metrics.low_confidence is True
+    assert result.metrics.bar_period_ns > 0
+    # The metrics object is stable across a pickle round-trip (§7.3 persistence).
+    import pickle
+
+    restored = pickle.loads(pickle.dumps(result))
+    assert restored.metrics.total_return == result.metrics.total_return
+
+
+def test_run_standardizes_dataframe_and_signals_dataframe(tmp_path):
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=8)
+    signals = from_target([0, 1, 1, 0, 0, 0, 0, 0])
+    result = ube.run(
+        md.to_dataframe(),
+        signals.to_dataframe(),
+        _config(),
+        log_path=tmp_path / "experiments.db",
+    )
+    assert isinstance(result, BacktestResult)
+    assert result.benchmark is not None
+
+
+def test_run_rejects_non_backtest_config():
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=8)
+    signals = from_target([0, 1, 0, 0, 0, 0, 0, 0])
+    with pytest.raises(ConfigError, match="BacktestConfig"):
+        ube.run(md, signals, {"instrument": "nope"})  # type: ignore[arg-type]
+
+
+def test_run_rejects_non_signal_and_non_dataframe_signals(tmp_path):
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=8)
+    with pytest.raises(InvalidSignalError, match="from_target"):
+        ube.run(md, [0, 1, 0, 0], _config(), log_path=tmp_path / "experiments.db")
+
+
+def test_run_rejects_unknown_engine(tmp_path):
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=8)
+    signals = from_target([0, 1, 0, 0, 0, 0, 0, 0])
+    config = replace(_config(), engine="nonexistent")
+    with pytest.raises(ConfigError, match="unknown engine"):
+        ube.run(md, signals, config, log_path=tmp_path / "experiments.db")
+
+
+def test_run_rejects_out_of_session_stock_bars(tmp_path):
+    # §4.4: a bar whose timestamp falls where the declared trading calendar says the
+    # market is closed is a CalendarMismatchError, never silently accepted. This locks in
+    # the wiring of the previously-dead calendar check — 2024-01-01 is a New-Year holiday
+    # (and overnight) for XNYS, so a stock bar there must be rejected up-front.
+    md = MarketData(
+        open=np.array([100.0]),
+        high=np.array([101.0]),
+        low=np.array([99.0]),
+        close=np.array([100.0]),
+        volume=np.full(1, 1.0),
+        index=pd.DatetimeIndex(["2024-01-01 00:00:00+00:00"]).as_unit("ns"),
+    )
+    with pytest.raises(CalendarMismatchError):
+        ube.run(
+            md,
+            from_target([1]),
+            BacktestConfig(
+                instrument=PRESETS["stocks"].instrument,
+                engine_overrides={"starting_balance": 100000.0},
+            ),
+            log_path=tmp_path / "e.db",
+        )
+
+
+def test_run_rejects_portfolio_without_base_currency(tmp_path):
+    # §4.7 / §7.1: a portfolio run (data is a Mapping of label -> bars) with no declared
+    # base_currency is rejected up-front by BacktestConfig.validate(), which run() now
+    # calls via config.validate(portfolio=isinstance(data, Mapping)). This locks in the
+    # previously-orphaned validate() method — a portfolio run can no longer silently run
+    # with an assumed base currency.
+    a = synthetic_bars(PRESETS["stocks"], seed=1, n_bars=4)
+    b = synthetic_bars(PRESETS["futures"], seed=2, n_bars=4)
+    portfolio_data = {"STOCK": a, "FUT": b}
+    config = BacktestConfig(
+        instrument=PRESETS["stocks"].instrument,
+        engine_overrides={"starting_balance": 100000.0},
+    )  # base_currency deliberately undeclared
+    with pytest.raises(UndeclaredConfigError, match="base_currency"):
+        ube.run(
+            portfolio_data,
+            from_target([1, 0, 1, 0]),
+            config,
+            log_path=tmp_path / "e.db",
+        )
+
+
+def test_run_single_instrument_does_not_require_base_currency(tmp_path):
+    # The §4.7 guard only fires for portfolio runs. A single-instrument run (data is a
+    # MarketData, not a Mapping) must NOT raise UndeclaredConfigError for an undeclared
+    # base_currency — the lone instrument's settlement currency is used instead (§7.1).
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=8)
+    config = BacktestConfig(
+        instrument=PRESETS["stocks"].instrument,
+        engine_overrides={"starting_balance": 100000.0},
+    )  # no base_currency
+    result = ube.run(
+        md,
+        from_target([1, 0, 1, 0, 1, 0, 1, 0]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    assert result is not None
+
+
+def _constant_bars(n: int = 10, start: str = "2024-01-01") -> MarketData:
+    """Hourly constant-price bars with a known, tz-aware UTC index (for date_range tests)."""
+    idx = pd.date_range(start, periods=n, freq="h", tz="UTC")
+    prices = np.arange(10.0, 10.0 + n)
+    return MarketData(
+        open=prices,
+        high=prices + 1.0,
+        low=prices - 1.0,
+        close=prices,
+        volume=np.ones(n),
+        index=idx,
+    )
+
+
+def test_run_date_range_restricts_bars_to_window(tmp_path):
+    # §7.2: date_range must actually slice the data, not validate-and-ignore. With an
+    # hourly 10-bar dataset and date_range ("... 02:00" .. "... 06:00"), only bars 2..6
+    # (inclusive) reach the engine, so the resulting equity curve is exactly those 5 bars.
+    md = _constant_bars(10)
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        date_range=("2024-01-01 02:00", "2024-01-01 06:00"),
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    result = ube.run(
+        md,
+        from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    eq_idx = result.equity_curve.index
+    assert len(eq_idx) == 5
+    assert eq_idx[0] == pd.Timestamp("2024-01-01 02:00", tz="UTC")
+    assert eq_idx[-1] == pd.Timestamp("2024-01-01 06:00", tz="UTC")
+
+
+def test_run_date_range_excluding_all_bars_raises_data_shape_error(tmp_path):
+    # §7.2: a date_range that excludes every bar must raise DataShapeError — never return
+    # an empty/zeroed result silently.
+    md = _constant_bars(10)
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        date_range=("2030-01-01", "2030-02-01"),
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    with pytest.raises(DataShapeError, match="excludes every bar"):
+        ube.run(
+            md,
+            from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+            config,
+            log_path=tmp_path / "e.db",
+        )
+
+
+def test_run_date_range_with_open_start_bound(tmp_path):
+    # An open lower bound keeps everything up to `end`. date_range (None, "... 04:00") on
+    # the 10-bar set keeps bars 0..4 inclusive → 5 bars ending at 04:00.
+    md = _constant_bars(10)
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        date_range=(None, "2024-01-01 04:00"),
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    result = ube.run(
+        md,
+        from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    assert len(result.equity_curve.index) == 5
+    assert result.equity_curve.index[-1] == pd.Timestamp("2024-01-01 04:00", tz="UTC")
+
+
+def test_run_warmup_slices_benchmark_to_match_strategy_curve(tmp_path):
+    # §10: the benchmark must be built from the same warmup-excluded bars the strategy
+    # curve uses. With 60 bars and warmup_bars=20, the strategy equity curve is 40 bars
+    # long — the benchmark equity must be 40 too, not the raw 60 (the previously-shipped
+    # bug left the two curves 20 bars apart with no error).
+    md = _constant_bars(60)
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        warmup_bars=20,
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    result = ube.run(
+        md,
+        from_target([1] + [0] * 58 + [1]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    assert len(result.equity_curve.equity) == 40
+    # The previously-shipped bug left the benchmark at the raw 60 bars; it must now be
+    # warmup-sliced to match the strategy curve positionally (§10).
+    assert len(result.benchmark.equity) == 40
+
+
+def test_run_default_all_in_reserves_fees_and_still_trades(tmp_path):
+    # §7.1: ``all_in`` is the zero-config default. With a realistic 5% commission it must
+    # reserve the entry fee in the sized quantity (not spend 100% on units), so the engine
+    # never hits a negative balance and silently returns an empty ``BacktestResult``. The
+    # previously-shipped bug did exactly that — n_trades == 0 with only a stderr line.
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=20)
+    config = BacktestConfig(
+        instrument=PRESETS["stocks"].instrument,
+        cost_model=CostModel(commission=0.05),
+        engine_overrides={"starting_balance": 1_000_000.0},
+    )
+    result = ube.run(
+        md,
+        from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    assert len(result.trades) > 0
+
+
+# ---------------------------------------------------------------------------
+# Portfolio run experiment-log integration (§4.8).
+# ---------------------------------------------------------------------------
+
+
+class _FakePortfolioAdapter(EngineAdapter):
+    """Minimal adapter that accepts dict MarketData and returns a BacktestResult.
+
+    Used to exercise the `ube.run` portfolio branch and confirm the experiment log
+    records the portfolio reference (§4.8). The adapter does nothing interesting;
+    it just constructs a valid result object with per-instrument equity curves.
+    """
+
+    name = "fake_portfolio"
+
+    def run(
+        self,
+        data: dict[str, MarketData],
+        signals: dict[str, object],
+        config: BacktestConfig,
+        aux_data: dict | None = None,
+    ) -> BacktestResult:
+        # Build a trivial equity curve per instrument (2 bars = 1 return point).
+        import pandas as pd
+
+        from ube.core.ledger import EventLedger
+        from ube.core.result import EquityCurve
+
+        symbols = sorted(data.keys())
+        idx = pd.DatetimeIndex(
+            ["2024-01-01 00:00:00+00:00", "2024-01-01 01:00:00+00:00"], tz="UTC"
+        ).as_unit("ns")
+        equity_by_inst = {}
+        for s in symbols:
+            equity_by_inst[s] = EquityCurve(index=idx, equity=np.array([1.0, 1.01]))
+        # Combined equity curve (sum of instruments for portfolio view).
+        combined_eq = EquityCurve(index=idx, equity=np.array([1.0, 1.01]))
+        return BacktestResult(
+            run_id="test-portfolio-run",
+            config=config,
+            ledger=EventLedger(),
+            trades=(),
+            trade_table=pd.DataFrame(),
+            positions=None,
+            equity_curve=combined_eq,
+            equity_curve_by_instrument=equity_by_inst,
+            benchmark=None,
+            metrics=None,
+        )
+
+
+def test_run_portfolio_logs_experiment_record(tmp_path):
+    # Register a portfolio-capable fake adapter to exercise the Mapping branch of ube.run.
+    from ube.adapters.base import register_engine
+
+    register_engine("fake_portfolio", _FakePortfolioAdapter)
+
+    a = _constant_bars(10)
+    b = _constant_bars(10)
+    portfolio_data = {"SYM_A": a, "SYM_B": b}
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        base_currency="USDT",
+        engine="fake_portfolio",
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    signals = from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0])
+    log_path = tmp_path / "exp.db"
+
+    result = ube.run(
+        portfolio_data,
+        signals,
+        config,
+        log_path=log_path,
+    )
+
+    # The run completed (adapter returned a result) and the experiment log was written.
+    assert isinstance(result, BacktestResult)
+    assert result.equity_curve_by_instrument is not None
+    assert set(result.equity_curve_by_instrument.keys()) == {"SYM_A", "SYM_B"}
+
+    with ExperimentLog(path=log_path) as log:
+        assert log.count() == 1
+        rec = log.get(result.run_id)
+        assert rec is not None
+        assert rec.instrument == "SYM_A|SYM_B"
+        assert rec.asset_class == "portfolio"
+        assert rec.row_count == 20  # 10 + 10 bars
+        assert rec.engine == "fake_portfolio"
+        assert rec.result_hash is not None

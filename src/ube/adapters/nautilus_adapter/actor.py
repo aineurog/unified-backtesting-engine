@@ -66,6 +66,7 @@ as a known divergence for the parity report.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -80,6 +81,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders.base import Order
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
+from ube.core.cost import CostModel
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, EngineError
 from ube.core.instrument import allows_short
@@ -96,7 +98,13 @@ from ube.core.risk.exits import (
     exit_level,
     scale_out_plan,
 )
-from ube.core.risk.sizing import SizeModel, size_position
+from ube.core.risk.sizing import (
+    SizeModel,
+    _check_affordable,
+    _entry_fee_rate,
+    floor_to_step,
+    size_position,
+)
 
 __all__ = [
     "UbeActor",
@@ -165,32 +173,30 @@ class UbeActor(Strategy):  # type: ignore[misc]
         config: UbeActorConfig,
         *,
         market_data: MarketData,
-        atr_series: np.ndarray | None = None,
         aux_atr: Mapping[str, Any] | None = None,
         sizing: SizeModel | None = None,
         exits: tuple[Exit, ...] = (),
-        vol: np.ndarray | None = None,
         leverage: float = 1.0,
+        cost_model: CostModel | None = None,
     ) -> None:
         super().__init__(config)
         self.instrument_id = config.instrument_id
         self._market_data = market_data
-        self._atr_series = atr_series
         self._aux_atr = dict(aux_atr) if aux_atr is not None else None
         self._sizing = sizing if sizing is not None else SizeModel()
+        # Cost model drives fee-aware sizing (§7.1): the sizer reserves the entry fee so
+        # the order can't push the account negative when the venue charges on top.
+        self._cost_model = cost_model
         # Exposure multiplier (§3.2): the reference nautilus_trader strategy scales
         # ``capital * leverage``; the adapter forces this to 1.0 for cash accounts.
         self._leverage = float(leverage)
         self._exits = exits
-        self._vol = vol
-        # Self-sufficient volatility estimate for ``volatility_target`` sizing (§6.3): if
-        # the adapter didn't supply one, derive per-bar ATR/price from the main bars so
-        # trade execution can size dynamically on the entry bar's realized vol.
-        if self._sizing.kind == "volatility_target" and self._vol is None:
-            self._vol = atr(self._market_data) / self._market_data.close
-        # Fail fast: ATR-based exits require their named aux_data series, and that raw
-        # aux OHLCV must span the data/signal period (§5.2).
+        # Fail fast: ATR-based exits and ``volatility_target`` sizing require their named
+        # aux_data series, and raw aux OHLCV must span the data/signal period (§5.2/§6.3).
         self._validate_aux()
+        # The volatility estimate for ``volatility_target`` sizing is resolved from the
+        # named ``aux_data`` series (§6.3) — never computed from the signal bars.
+        self._vol = self._resolve_vol() if self._sizing.kind == "volatility_target" else None
 
         ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
         self._ts_to_index: dict[int, int] = {
@@ -287,49 +293,66 @@ class UbeActor(Strategy):  # type: ignore[misc]
         )
 
     def _validate_aux(self) -> None:
-        """Fail fast if an ATR-based exit cannot be satisfied by ``aux_data`` (§5.2).
+        """Fail fast if an ATR exit or ``volatility_target`` sizing has no usable series.
 
-        ``ATRStop`` / ``ChandelierExit`` *require* a named ``aux_data`` series — there is
-        no auto-compute fallback for them (unlike the generic auto path). The named series
-        must be present, and if it is the raw signal-timeframe ``MarketData`` it must span
-        the data/signal period so its ATR is defined for every main bar (a leading gap
-        would leave main bars with no ATR; a trailing gap would leave stale ATR).
+        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) must name a specific
+        ``aux_data`` series via its ``atr`` key (§5.2); ``volatility_target`` sizing names
+        one via ``SizeModel.vol`` (§6.3). The library never computes ATR or volatility
+        from the signal ``data`` bars — those may be non-time bars that cannot be
+        resampled, and even time bars may be at a too-fine level (§5.2). A missing
+        reference, or a name absent from ``aux_data``, is a config-shape error surfaced
+        here, before the engine runs (§3 fail-fast principle).
         """
-        required: set[str] = set()
+        named: set[str] = set()
         for e in self._exits:
             if isinstance(e, (ATRStop, ChandelierExit)):
                 atr_name = getattr(e, "atr", None)
-                if atr_name is not None:
-                    required.add(str(atr_name))
-        if not required:
+                if atr_name is None:
+                    raise ConfigError(
+                        f"{type(e).__name__} requires an 'atr' key referencing an "
+                        "aux_data series (§5.2); ATR is never computed from the signal "
+                        "data bars"
+                    )
+                named.add(str(atr_name))
+
+        if self._sizing.kind == "volatility_target":
+            vol_name = self._sizing.vol
+            if not vol_name:
+                raise ConfigError(
+                    "volatility_target sizing requires a 'vol' key referencing an "
+                    "aux_data series (§6.3); volatility is never computed from the "
+                    "signal data bars"
+                )
+            named.add(str(vol_name))
+
+        if not named:
             return
+
         if self._aux_atr is None:
             raise ConfigError(
-                "exits reference ATR series(es) "
-                f"{sorted(required)} but aux_data was not supplied; "
-                "ATR-based stops/chandelier require aux_data"
+                "config references aux_data series(es) "
+                f"{sorted(named)} but aux_data was not supplied"
             )
-        missing = required - set(self._aux_atr)
+        missing = named - set(self._aux_atr)
         if missing:
             raise ConfigError(
-                "exits reference ATR series(es) "
-                f"{sorted(missing)} that are absent from aux_data; "
-                "ATR-based stops/chandelier require the named aux_data series"
+                "config references aux_data series(es) "
+                f"{sorted(missing)} that are absent from aux_data"
             )
-        # Range consistency vs the data/signal grid. Signals are aligned to the main bar
-        # grid, so checking aux against ``market_data`` covers the signal range too.
+
+        # Range consistency vs the data/signal grid (named MarketData series only).
         main_ts = self._market_data.timestamps
         main_start, main_end = main_ts[0], main_ts[-1]
         main_step = main_ts[1] - main_ts[0] if len(main_ts) > 1 else pd.Timedelta(0)
-        for name in sorted(required):
+        for name in sorted(named):
             value = self._aux_atr[name]
             if not isinstance(value, MarketData):
-                continue  # precomputed arrays are length-checked in _atr_from_aux
+                continue  # precomputed arrays are length-checked in _atr_from_aux/_vol_from_aux
             aux_ts = value.timestamps
             if aux_ts[0] > main_start + main_step:
                 raise DataShapeError(
                     f"aux_data[{name!r}] starts at {aux_ts[0]} which is after the data "
-                    f"start {main_start}; the leading main bars would have no ATR "
+                    f"start {main_start}; the leading main bars would have no value "
                     "(aux_data must start at or before the signal/price period)"
                 )
             aux_step = aux_ts[1] - aux_ts[0] if len(aux_ts) > 1 else main_step
@@ -337,57 +360,57 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 raise DataShapeError(
                     f"aux_data[{name!r}] ends at {aux_ts[-1]} which is more than one aux "
                     f"bar before the data end {main_end}; aux_data must span the "
-                    "signal/price period (trailing ATR would be stale)"
+                    "signal/price period (the trailing value would be stale)"
                 )
 
     def _resolve_exit_atr(self, cfg: Exit) -> np.ndarray | None:
         """Resolve the ATR series for ``cfg`` (§5.2).
 
-        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) *requires* the named
-        ``aux_data`` series — there is no auto-compute fallback for those (the requirement
-        is enforced up-front in :meth:`_validate_aux`). If the exit names an ``aux_data``
-        entry, it is resolved by :meth:`_atr_from_aux` (a ``MarketData`` is the
-        signal-timeframe OHLCV the library turns into ATR; an array is used verbatim).
-        Returns ``None`` for exits that need no ATR (e.g. ``TrailingStop``), letting the
-        core level functions compute their running extremes from the bars directly.
+        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) names an ``aux_data`` series
+        via its ``atr`` key; that series is resolved by :meth:`_atr_from_aux` (a
+        ``MarketData`` value is turned into ATR internally; a precomputed array is used
+        verbatim). The missing-input case is a config error caught up front in
+        :meth:`_validate_aux`, so this method never raises mid-engine.run().
+
+        Returns ``None`` for exits that need no ATR (e.g. ``TrailingStop``); the core
+        level functions compute their running extremes from the bars directly.
         """
-        name = getattr(cfg, "atr", None)
-        if name and self._aux_atr and name in self._aux_atr:
-            return self._atr_from_aux(name, getattr(cfg, "period", 14))
         if isinstance(cfg, (ATRStop, ChandelierExit)):
-            raise ConfigError(
-                f"{type(cfg).__name__} requires aux_data[{name!r}] but it is missing; "
-                "ATR-based stops/chandelier are mandatory aux consumers (§5.2)"
-            )
-        period = getattr(cfg, "period", 14)
-        return atr(self._market_data, period)
+            return self._atr_from_aux(str(cfg.atr), cfg.period)
+        return None
 
-    def _atr_from_aux(self, name: str, period: int) -> np.ndarray:
-        """Compute ATR from an ``aux_data`` entry (§5.2), with no look-ahead bias.
+    def _atr_from_marketdata(self, value: MarketData, period: int) -> np.ndarray:
+        """Compute ATR(``period``) from a raw OHLCV ``MarketData`` (§5.2), no look-ahead.
 
-        The test only passes the *raw* signal-timeframe OHLCV as a
-        :class:`~ube.core.data.MarketData`; the adapter does the rest:
-
-        1. ATR(``period``) is computed over those aux bars (Wilder, causal — value at
-           bar ``h`` uses only bars through ``h``).
+        1. ATR(``period``) is computed over the aux bars (Wilder, causal — value at bar
+           ``h`` uses only bars through ``h``).
         2. The series is shifted forward one aux bar, so a main bar inside hour ``h``
            only ever sees the ATR of the *last completed* aux bar (``h-1``) — no
            look-ahead into the bar being traded.
         3. The aux ATR is forward-filled onto the (possibly finer) main bar grid so it
            is row-aligned with ``data`` (length ``n_bars``).
         """
+        atr_aux = atr(value, period)  # causal Wilder ATR, aligned to aux bars
+        series = pd.Series(atr_aux, index=value.timestamps)
+        # No look-ahead: shift forward one aux bar (bar h uses ATR through h-1).
+        series = series.shift(1).fillna(series.iloc[0])
+        # Forward-fill the aux ATR onto the main bar grid (length == n_bars).
+        aligned = series.reindex(self._market_data.timestamps, method="ffill")
+        return aligned.to_numpy(dtype=np.float64)
+
+    def _atr_from_aux(self, name: str, period: int) -> np.ndarray:
+        """Resolve an ``aux_data`` entry into an ATR series (§5.2), with no look-ahead.
+
+        A ``MarketData`` value is a raw OHLCV series — typically coarser than the signal
+        bars — that the library turns into ATR (via :meth:`_atr_from_marketdata`); a
+        precomputed array is used verbatim.
+        """
         aux = self._aux_atr
         if aux is None or name not in aux:
             raise ConfigError(f"aux_data[{name!r}] was not supplied")
         value = aux[name]
         if isinstance(value, MarketData):
-            atr_aux = atr(value, period)  # causal Wilder ATR, aligned to aux bars
-            series = pd.Series(atr_aux, index=value.timestamps)
-            # No look-ahead: shift forward one aux bar (bar h uses ATR through h-1).
-            series = series.shift(1).fillna(series.iloc[0])
-            # Forward-fill the aux ATR onto the main bar grid (length == n_bars).
-            aligned = series.reindex(self._market_data.timestamps, method="ffill")
-            arr = aligned.to_numpy(dtype=np.float64)
+            arr = self._atr_from_marketdata(value, period)
         else:
             arr = np.asarray(value, dtype=np.float64)
         if arr.shape[0] != self._market_data.n_bars:
@@ -397,6 +420,54 @@ class UbeActor(Strategy):  # type: ignore[misc]
             )
         if not np.isfinite(arr).all() or (arr <= 0).any():
             raise ConfigError("atr_series must be finite and positive")
+        return arr
+
+    def _resolve_vol(self) -> np.ndarray:
+        """Resolve the ``volatility_target`` vol estimate from ``aux_data`` (§6.3).
+
+        The ``SizeModel.vol`` name is validated up front in :meth:`_validate_aux`, so
+        this method never raises mid-engine.run() for a missing reference.
+        """
+        return self._vol_from_aux(str(self._sizing.vol))
+
+    def _vol_from_marketdata(self, value: MarketData) -> np.ndarray:
+        """Per-bar volatility (ATR/price) from a raw OHLCV ``MarketData``, no look-ahead.
+
+        Mirrors :meth:`_atr_from_marketdata`: ATR over the aux bars (causal Wilder), then
+        shifted forward one aux bar so a main bar inside hour ``h`` only ever sees the
+        volatility of the *last completed* aux bar (``h-1``), then forward-filled onto the
+        main bar grid. Dividing by the aux close turns ATR into a dimensionless fraction.
+        """
+        vol_aux = atr(value) / value.close
+        series = pd.Series(vol_aux, index=value.timestamps)
+        # No look-ahead: shift forward one aux bar (bar h uses vol through h-1).
+        series = series.shift(1).fillna(series.iloc[0])
+        # Forward-fill the aux vol onto the main bar grid (length == n_bars).
+        aligned = series.reindex(self._market_data.timestamps, method="ffill")
+        return aligned.to_numpy(dtype=np.float64)
+
+    def _vol_from_aux(self, name: str) -> np.ndarray:
+        """Resolve an ``aux_data`` entry into a per-bar volatility fraction (§6.3).
+
+        A ``MarketData`` value is a raw OHLCV series — typically coarser than the signal
+        bars — that the library turns into ``ATR/price`` (via
+        :meth:`_vol_from_marketdata`); a precomputed array is used verbatim.
+        """
+        aux = self._aux_atr
+        if aux is None or name not in aux:
+            raise ConfigError(f"aux_data[{name!r}] was not supplied")
+        value = aux[name]
+        if isinstance(value, MarketData):
+            arr = self._vol_from_marketdata(value)
+        else:
+            arr = np.asarray(value, dtype=np.float64)
+        if arr.shape[0] != self._market_data.n_bars:
+            raise DataShapeError(
+                f"aux_data[{name!r}] has {arr.shape[0]} bars but data has "
+                f"{self._market_data.n_bars}"
+            )
+        if not np.isfinite(arr).all() or (arr <= 0).any():
+            raise ConfigError("vol estimate must be finite and positive")
         return arr
 
     def _apply_signal(self, signals: tuple[bool, bool, bool, bool], bar: Bar, idx: int) -> None:
@@ -460,6 +531,13 @@ class UbeActor(Strategy):  # type: ignore[misc]
         For ``volatility_target`` the vol estimate is the *entry bar's* value
         (``self._vol[idx]``) — never the whole series or its first element, which
         would silently mis-size every later entry.
+
+        For the fee-aware ``all_in`` / ``equal_weight`` sizers the lot-grid conversion
+        floors (never rounds up) and the affordability guard is re-run against the
+        **final** quantity (§7.1): ``size_position`` verifies the raw float, but
+        ``make_qty`` quantizes to the instrument's size precision and an up-rounded
+        quantity could exceed the verified size by up to one lot's notional + fee —
+        pushing the account negative and halting the engine silently.
         """
         if price <= 0.0 or self._instrument is None:
             return None
@@ -477,13 +555,46 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 price=price,
                 n=1,
                 vol=vol,
+                cost_model=self._cost_model,
             ),
             dtype=np.float64,
         )
+        raw = float(units.ravel()[0])
+        # §7.1: for the FEE-AWARE all_in / equal_weight sizers the lot-grid conversion
+        # must floor (never round up): make_qty quantizes to the instrument's size
+        # precision and an up-rounded quantity can exceed the size the affordability
+        # guard verified by up to one lot's notional + fee — pushing the account
+        # negative and halting the engine silently. The gate is the RESOLVED entry-fee
+        # rate (not ``cost_model is not None``): the adapter always supplies a cost
+        # model (falling back to per-asset-class defaults), and a zero-rate model has
+        # no reserved fees to protect — fee-less runs keep the legacy conversion.
+        step = float(self._instrument.size_increment)
+        fee_rate = _entry_fee_rate(self._cost_model)
+        fee_aware = self._sizing.kind in ("all_in", "equal_weight") and fee_rate > 0.0
+        tradable = (
+            float(floor_to_step(raw, step))
+            if fee_aware and math.isfinite(step) and step > 0.0
+            else raw
+        )
         try:
-            return self._instrument.make_qty(float(units.ravel()[0]))
+            qty = self._instrument.make_qty(tradable)
         except ValueError:
             return None
+        final_units = float(qty.as_double())
+        if final_units <= 0.0:
+            return None
+        # Re-verify with the FINAL venue-quantized quantity (§7.1): nothing after the
+        # in-sizer guard may push the outlay past capital without a loud error.
+        # Zero-fee runs keep legacy semantics (the venue tolerates a sub-lot notional
+        # overhang; there is no fee to turn it into a shortfall).
+        if fee_rate > 0.0:
+            _check_affordable(
+                leveraged_balance,
+                price,
+                np.asarray([final_units], dtype=np.float64),
+                self._cost_model,
+            )
+        return qty
 
     def _submit_close(self, reason: str, fraction: float = 1.0, ts: int | None = None) -> None:
         """Submit a reduce-only market close of ``fraction`` of the remaining position.
@@ -683,7 +794,18 @@ class UbeActor(Strategy):  # type: ignore[misc]
         return cfg.signal_map.get(int(bar.ts_event), _NO_SIGNAL)
 
     def _index_for(self, bar: Bar) -> int:
-        return self._ts_to_index.get(int(bar.ts_event), self._bar_count)
+        ts = int(bar.ts_event)
+        idx = self._ts_to_index.get(ts)
+        if idx is None:
+            # A genuine data/logic error: the engine delivered a bar whose timestamp does
+            # not match any input bar. Guessing "the bar after the last one" would compute
+            # against the wrong bar's data, so fail loudly instead of silently.
+            raise EngineError(
+                f"bar timestamp {ts} not found in the known bar index "
+                f"({len(self._ts_to_index)} bars); the engine produced a bar that does "
+                "not correspond to any input bar"
+            )
+        return idx
 
     def _open_position(self) -> Any | None:
         positions = self.cache.positions_open(instrument_id=self.instrument_id)

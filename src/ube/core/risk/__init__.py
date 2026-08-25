@@ -37,6 +37,7 @@ from ube.core.risk.sizing import (
     equal_weight_size,
     fixed_fraction_size,
     fixed_units_size,
+    floor_to_step,
     size_position,
     volatility_target_size,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "volatility_target_size",
     "all_in_size",
     "equal_weight_size",
+    "floor_to_step",
     "TRIGGERS",
     "Trigger",
     "TakeProfit",

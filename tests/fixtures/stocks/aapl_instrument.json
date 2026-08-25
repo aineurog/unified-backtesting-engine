@@ -3,6 +3,7 @@
   "borrow_model": null,
   "calendar": "XNYS",
   "contract_multiplier": null,
+  "funding_interval_hours": null,
   "funding_model": null,
   "settlement_currency": "USD",
   "symbol": "AAPL",
