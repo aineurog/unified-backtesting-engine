@@ -241,3 +241,26 @@ def test_run_date_range_with_open_start_bound(tmp_path):
     )
     assert len(result.equity_curve.index) == 5
     assert result.equity_curve.index[-1] == pd.Timestamp("2024-01-01 04:00", tz="UTC")
+
+
+def test_run_warmup_slices_benchmark_to_match_strategy_curve(tmp_path):
+    # §10: the benchmark must be built from the same warmup-excluded bars the strategy
+    # curve uses. With 60 bars and warmup_bars=20, the strategy equity curve is 40 bars
+    # long — the benchmark equity must be 40 too, not the raw 60 (the previously-shipped
+    # bug left the two curves 20 bars apart with no error).
+    md = _constant_bars(60)
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        warmup_bars=20,
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    result = ube.run(
+        md,
+        from_target([1] + [0] * 58 + [1]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    assert len(result.equity_curve.equity) == 40
+    # The previously-shipped bug left the benchmark at the raw 60 bars; it must now be
+    # warmup-sliced to match the strategy curve positionally (§10).
+    assert len(result.benchmark.equity) == 40

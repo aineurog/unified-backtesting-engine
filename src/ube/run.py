@@ -123,6 +123,23 @@ def _slice_signals(sig: Signals, mask: np.ndarray) -> Signals:
     )
 
 
+def _warmup_slice_market_data(md: MarketData, n: int) -> MarketData:
+    """Drop the first ``n`` bars of ``md`` positionally, to mirror the engine's warm-up
+    exclusion (§7.2) so a benchmark built from the result lines up bar-for-bar with the
+    strategy curve.
+    """
+    if n <= 0:
+        return md
+    return MarketData(
+        open=md.open[n:],
+        high=md.high[n:],
+        low=md.low[n:],
+        close=md.close[n:],
+        volume=md.volume[n:],
+        index=md.index[n:],
+    )
+
+
 __all__ = ["run", "ensure_builtin_engines_registered"]
 
 
@@ -298,7 +315,12 @@ def run(
 
     result = adapter_cls().run(md, sig, config, aux_data=aux_data)
 
-    benchmark = build_benchmark(config.benchmark, md)
+    # §10: the benchmark comparison (excess return, information ratio) assumes the
+    # benchmark and strategy curves line up positionally, bar for bar. The adapter
+    # already warm-up-slices the strategy outputs, so build the benchmark from the same
+    # warmup-excluded bars — not the raw (or merely date_range-sliced) input.
+    benchmark_md = _warmup_slice_market_data(md, config.warmup_bars)
+    benchmark = build_benchmark(config.benchmark, benchmark_md)
     result = replace(result, benchmark=benchmark)
 
     with ExperimentLog(path=log_path) as log:
