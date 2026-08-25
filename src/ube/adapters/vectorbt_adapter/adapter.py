@@ -39,8 +39,13 @@ from ube.adapters.vectorbt_adapter.exits import (
     exit_stop_params,
     validate_aux,
 )
+from ube.adapters.vectorbt_adapter.instrument_map import (
+    VbtInstrument,
+    build_instrument,
+    floor_to_increment,
+    round_to_increment,
+)
 from ube.adapters.vectorbt_adapter.overrides import (
-    DEFAULT_FUNDING_INTERVAL_HOURS,
     DEFAULT_STARTING_BALANCE,
     validate_overrides,
 )
@@ -56,7 +61,7 @@ from ube.core.errors import (
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
 from ube.core.risk.exits import atr
-from ube.core.risk.sizing import size_position
+from ube.core.risk.sizing import _entry_fee_rate, size_position
 from ube.core.signals import Signals, validate_long_only
 
 __all__ = ["VectorbtAdapter"]
@@ -74,18 +79,40 @@ _KIND_RANK: dict[EventType, int] = {
 
 
 def _target_quantity(
-    sizing: Any, price: float, equity: float, vol: float | None
+    sizing: Any,
+    price: float,
+    equity: float,
+    vol: float | None,
+    cost_model: CostModel | None,
+    vbt_inst: VbtInstrument,
 ) -> float:
     """Target units for one entry via the core sizer (§6.3).
 
     Mirrors the Nautilus actor: the sizing ``leverage`` is applied as an exposure multiplier
     on the allocated capital (``leveraged_capital = capital * leverage`` -> ``qty = notional /
-    price``), so a leveraged position in vectorbt matches Nautilus for the same config.
+    price``), so a leveraged position in vectorbt matches Nautilus for the same config. The
+    ``cost_model`` is passed through so fee-aware sizers (``all_in`` / ``equal_weight``) reserve
+    the entry fee up front (§7.1) — the same fix applied to the Nautilus actor — instead of
+    spending 100% of equity on units and letting the engine's commission push the account
+    negative.
+
+    The resulting quantity is then quantized to the asset-class lot increment
+    (:func:`~ube.adapters.vectorbt_adapter.instrument_map.build_instrument`,
+    requirements §4.5): fee-less sizers round to the nearest lot (matching Nautilus'
+    ``make_qty``) while fee-aware sizers floor (never round up) so the lot boundary cannot push
+    the verified size past the remaining capital — the exact §7.1 residual that was fixed in the
+    Nautilus actor. Fractional asset classes (e.g. forex) keep their fine precision.
     """
     leveraged = equity * getattr(sizing, "leverage", 1.0)
     if vol is None:
-        return float(size_position(sizing, capital=leveraged, price=price))
-    return float(size_position(sizing, capital=leveraged, price=price, vol=vol))
+        qty = float(size_position(sizing, capital=leveraged, price=price, cost_model=cost_model))
+    else:
+        qty = float(
+            size_position(sizing, capital=leveraged, price=price, vol=vol, cost_model=cost_model)
+        )
+    if _entry_fee_rate(cost_model) > 0.0:
+        return float(floor_to_increment(qty, vbt_inst.size_increment))
+    return float(round_to_increment(qty, vbt_inst.size_increment))
 
 
 def _build_size_series(
@@ -94,6 +121,8 @@ def _build_size_series(
     sizing: Any,
     starting_balance: float,
     vol_arr: np.ndarray | None,
+    cost_model: CostModel | None,
+    vbt_inst: VbtInstrument,
 ) -> pd.Series:
     """Per-bar ``size`` (amount) array: target qty at entry bars, same qty at exit bars.
 
@@ -109,7 +138,7 @@ def _build_size_series(
         exit_bar = bar_index(ts, pd.Timestamp(trade["Exit Timestamp"]))
         entry_price = float(trade["Avg Entry Price"])
         vol = float(vol_arr[entry_bar]) if vol_arr is not None and 0 <= entry_bar < n else None
-        qty = _target_quantity(sizing, entry_price, running, vol)
+        qty = _target_quantity(sizing, entry_price, running, vol, cost_model, vbt_inst)
         if 0 <= entry_bar < n:
             size[entry_bar] = qty
         if 0 <= exit_bar < n:
@@ -179,17 +208,12 @@ class VectorbtAdapter(EngineAdapter):
             if config.cost_model is not None
             else resolve_cost_model(config.instrument)
         )
+        vbt_inst = build_instrument(config.instrument, overrides)
         instrument_id = config.instrument.symbol
-        settlement = config.instrument.settlement_currency or "USD"
+        settlement = vbt_inst.settlement_currency
         starting_balance = float(overrides.get("starting_balance", DEFAULT_STARTING_BALANCE))
-        funding_interval_hours = float(
-            overrides.get("funding_interval_hours", DEFAULT_FUNDING_INTERVAL_HOURS)
-        )
-        multiplier = (
-            1.0
-            if config.instrument.contract_multiplier is None
-            else float(config.instrument.contract_multiplier)
-        )
+        funding_interval_hours = vbt_inst.funding_interval_hours
+        multiplier = vbt_inst.contract_multiplier
 
         exits = config.risk.exit
         validate_aux(exits, aux_data)
@@ -218,7 +242,7 @@ class VectorbtAdapter(EngineAdapter):
         records = pf.trades.records_readable
         if len(records):
             size_series = _build_size_series(
-                records, data, config.risk.sizing, starting_balance, vol_arr
+                records, data, config.risk.sizing, starting_balance, vol_arr, cost_model, vbt_inst
             )
             pf = build_portfolio(
                 inputs,

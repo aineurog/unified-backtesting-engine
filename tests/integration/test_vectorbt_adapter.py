@@ -308,7 +308,9 @@ def test_vectorbt_full_loop_crypto_perp_books_fees_and_funding():
     fills = _fills(result)
     assert len(fills) == 2
     assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "signal")]
-    assert fills[0].quantity == pytest.approx(1.6508, abs=1e-3)
+    # Fee-aware all_in reserves the entry fee (§7.1), so the filled quantity is slightly
+    # below the fee-less 1.6508 the previous test pinned.
+    assert fills[0].quantity == pytest.approx(1.65, abs=1e-3)
     commissions = _ledger_events(result, EventType.COMMISSION)
     fundings = _ledger_events(result, EventType.FUNDING_PAYMENT)
     assert len(commissions) >= 1
@@ -317,7 +319,7 @@ def test_vectorbt_full_loop_crypto_perp_books_fees_and_funding():
     assert all(e.amount > 0.0 for e in fundings)
     (trade,) = result.trades
     assert trade.exit_reason == "signal"
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.63, abs=1e-2)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.59, abs=1e-2)
 
 
 def test_vectorbt_full_loop_crypto_perp_short_pays_loss():
@@ -334,10 +336,15 @@ def test_vectorbt_full_loop_crypto_perp_short_pays_loss():
     fills = _fills(result)
     assert [(e.side, e.exit_reason) for e in fills] == [(-1, None), (1, "signal")]
     assert len(_ledger_events(result, EventType.FUNDING_PAYMENT)) == 3
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(99568.69, abs=1e-2)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(99569.19, abs=1e-2)
 
 
-def test_vectorbt_funding_default_8h_charges_nothing_for_short_hold():
+def test_vectorbt_funding_default_8h_accrues_proportionally_per_open_bar():
+    # §24 (blocker 2) accrues funding by elapsed wall-clock time, emitting one proportional
+    # event per open bar. With the default 8h interval and a ~3h hold, three open bars each
+    # accrue ~1/8 of the per-period rate (frac = bar_span / 8h), so three events are emitted
+    # whose summed amount equals the true time-weighted carry — rather than the legacy
+    # "nothing if under one full interval" behavior.
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
     result = VectorbtAdapter().run(
         md,
@@ -345,11 +352,13 @@ def test_vectorbt_funding_default_8h_charges_nothing_for_short_hold():
         BacktestConfig(
             instrument=PRESETS["crypto_perp"].instrument,
             cost_model=CostModel(funding=0.0001),
-            # No funding_interval_hours override -> default 8h; a <8h hold books nothing.
+            # No funding_interval_hours override -> default 8h.
             engine_overrides={"starting_balance": 100000.0},
         ),
     )
-    assert len(_ledger_events(result, EventType.FUNDING_PAYMENT)) == 0
+    fundings = _ledger_events(result, EventType.FUNDING_PAYMENT)
+    assert len(fundings) == 3
+    assert all(e.amount > 0.0 for e in fundings)
 
 
 def test_vectorbt_trailing_stop_stamps_exit_reason():
@@ -498,3 +507,43 @@ def test_run_end_to_end_via_ube_run_with_vectorbt(tmp_path):
         record = log.get(result.run_id)
         assert record is not None
         assert record.engine == "vectorbt"
+
+
+# ---------------------------------------------------------------------------
+# Asset-class handling (§4.5): the vbt adapter must size every asset class
+# with the same per-asset-class precision / lot increment that Nautilus applies.
+# ---------------------------------------------------------------------------
+
+
+def test_vbt_handles_all_asset_classes_with_lot_quantization():
+    """The vbt adapter resolves asset-class params via build_instrument and quantizes sizes.
+
+    Stocks / futures / commodities trade whole contracts or shares; forex keeps its fine
+    precision; crypto_perp keeps fractional lots. This mirrors Nautilus' instrument_map so the
+    same config produces the same lot-quantized quantity on either engine.
+    """
+    from ube.adapters.vectorbt_adapter.instrument_map import build_instrument
+
+    for key in ["stocks", "futures", "commodities", "forex", "crypto_perp"]:
+        preset = PRESETS[key]
+        md = synthetic_bars(preset, seed=3, n_bars=12)
+        signals = from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+        config = BacktestConfig(
+            instrument=preset.instrument,
+            engine="vectorbt",
+            engine_overrides={"starting_balance": 100000.0},
+        )
+        result = VectorbtAdapter().run(md, signals, config)
+        fills = _fills(result)
+        assert fills, f"expected a fill for asset class {key!r}"
+        vbt_inst = build_instrument(preset.instrument, config.engine_overrides)
+        inc = vbt_inst.size_increment
+        for f in fills:
+            # Quantity must be a whole multiple of the asset-class lot increment.
+            if inc > 0:
+                ratio = f.quantity / inc
+                assert abs(ratio - round(ratio)) < 1e-6, (
+                    f"{key}: qty {f.quantity} not a multiple of increment {inc}"
+                )
+            assert f.quantity > 0
+

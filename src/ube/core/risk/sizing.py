@@ -354,5 +354,10 @@ def size_position(
             raise ConfigError("equal_weight sizing requires n")
         units = equal_weight_size(capital, price, n, cost_model)
 
-    _check_affordable(capital, price, units, cost_model)
+    # The affordability guard protects the capital-targeting sizers (all_in / equal_weight /
+    # fixed_fraction), which must land on capital within the fee tolerance. ``volatility_target``
+    # intentionally sizes beyond capital (a volatility budget with implied leverage), so it is
+    # exempt — holding it to a notional ≤ capital would defeat the sizer (§6.3).
+    if model.kind != "volatility_target":
+        _check_affordable(capital, price, units, cost_model)
     return units
