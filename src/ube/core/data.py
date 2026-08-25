@@ -395,16 +395,19 @@ class MarketData:
         )
 
 
-def derive_bar_period_ns(market_data: MarketData) -> int:
+def derive_bar_period_ns(market_data: MarketData | pd.DatetimeIndex) -> int:
     """Median positive inter-bar spacing in nanoseconds (requirements §4.9).
 
     The bar period is *inferred from the data*, not assumed from a hard-coded label, so
     annualization is correct regardless of which engine produced the backtest (§4.9 frames
-    this as a core concern). ``MarketData`` guarantees a sorted, unique, tz-aware UTC index,
-    so every consecutive delta is strictly positive.
+    this as a core concern). Accepts either a :class:`~ube.core.data.MarketData` or a
+    pre-built tz-aware UTC ``pd.DatetimeIndex`` (the latter lets the metrics layer infer the
+    period from the *equity-curve* grid, which may already be warm-up / date-range sliced).
+    The index is sorted, unique, and tz-aware UTC, so every consecutive delta is strictly
+    positive.
 
     Args:
-        market_data: The canonical bars whose period is to be inferred.
+        market_data: The canonical bars, or a bar index, whose period is to be inferred.
 
     Returns:
         The median positive inter-bar spacing, in nanoseconds.
@@ -412,12 +415,11 @@ def derive_bar_period_ns(market_data: MarketData) -> int:
     Raises:
         DataShapeError: fewer than two bars (no spacing to infer a period from).
     """
-    if market_data.n_bars < 2:
+    index = market_data if isinstance(market_data, pd.DatetimeIndex) else market_data.timestamps
+    if len(index) < 2:
         raise DataShapeError(
-            f"cannot derive a bar period from {market_data.n_bars} bar(s); "
+            f"cannot derive a bar period from {len(index)} bar(s); "
             "require at least two bars"
         )
-    deltas = np.diff(
-        market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
-    )
+    deltas = np.diff(index.as_unit("ns").asi8)  # type: ignore[attr-defined]
     return int(np.median(deltas[deltas > 0]))

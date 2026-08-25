@@ -45,6 +45,7 @@ from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
 from ube.core.experiment_log import DataReference, ExperimentLog
+from ube.core.metrics import compute_metrics
 from ube.core.result import BacktestResult, result_hash
 from ube.core.signals import Signals
 
@@ -321,7 +322,16 @@ def run(
     # warmup-excluded bars — not the raw (or merely date_range-sliced) input.
     benchmark_md = _warmup_slice_market_data(md, config.warmup_bars)
     benchmark = build_benchmark(config.benchmark, benchmark_md)
-    result = replace(result, benchmark=benchmark)
+    # Recompute metrics against the now-attached benchmark (the adapter built the result
+    # without one). Benchmark and strategy curves are positionally aligned (both warm-up /
+    # date-range sliced), so excess return + information ratio can be populated here (§10).
+    result = replace(
+        result,
+        benchmark=benchmark,
+        metrics=compute_metrics(
+            result.equity_curve, benchmark=benchmark, trades=result.trades
+        ),
+    )
 
     with ExperimentLog(path=log_path) as log:
         log.record(
