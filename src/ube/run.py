@@ -39,6 +39,7 @@ import pandas as pd
 
 from ube.adapters import get_engine, register_engine, resolve_engine_name
 from ube.core.benchmark import build_benchmark
+from ube.core.calendar import resolve_calendar, validate_in_session
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, InvalidSignalError
@@ -183,6 +184,12 @@ def run(
 
     md = _standardize_data(data)
     sig = _standardize_signals(signals)
+
+    # Calendar validation (§4.4): a bar whose timestamp falls where the declared trading
+    # calendar says the market is closed is a §15 data error, never silently accepted.
+    # Crypto's "24/7" calendar is a no-op. This is the single integration point so the
+    # check runs for every single-instrument run, regardless of adapter.
+    validate_in_session(md, resolve_calendar(config.instrument))
 
     ensure_builtin_engines_registered()
     engine_name = resolve_engine_name(config.engine)

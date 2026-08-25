@@ -1,35 +1,35 @@
 {
   "assets": {
     "commodities": {
-      "content_hash": "7774d6ebd6eae9dd3fc347ccd22f6af0a2397fc642f3f3c5b9e073a94c5f14e5",
+      "content_hash": "0b369fa2ada38cb6c375d7495a5879be59d5c4fc4eda86e7f87f02b5c341e664",
       "instrument": "commodities/gc_instrument.json",
       "parquet": "commodities/gc_2024_01.parquet",
       "row_count": 744,
       "symbol": "GC"
     },
     "crypto_perp": {
-      "content_hash": "40a3ed8b2158ca5f941f61fdb4b80ea966107b23d5a0d42f7bfd3326ac1d7869",
+      "content_hash": "e85316ea6915f1b07f1bb9115794ff2741773ad9c5df4bbf6bb686c148c6ed6f",
       "instrument": "crypto_perp/btc_usdt_instrument.json",
       "parquet": "crypto_perp/btc_usdt_2024_01.parquet",
       "row_count": 744,
       "symbol": "BTC-USDT"
     },
     "forex": {
-      "content_hash": "bb0df471e3ae55e14330f8bfe8508a3d643b782717e15665536bffaddcaf39ca",
+      "content_hash": "9a45c5d355846ca227a9f84f84b111a857d65748e67f54fd9c54122cdce5ec6d",
       "instrument": "forex/eurusd_instrument.json",
       "parquet": "forex/eurusd_2024_01.parquet",
       "row_count": 744,
       "symbol": "EURUSD"
     },
     "futures": {
-      "content_hash": "c6e74e08a5f5c1826e65a9a7e0076f095032063caf45fba3738ff9016825301c",
+      "content_hash": "2c3103ab91d4ab11b9c318c851ef692bb362114598a14e2770fd857631afc226",
       "instrument": "futures/es_instrument.json",
       "parquet": "futures/es_2024_01.parquet",
       "row_count": 744,
       "symbol": "ES"
     },
     "stocks": {
-      "content_hash": "7328c2ba96caaade12275c94752070b480bb6eafe964051331c07e828e31f8a0",
+      "content_hash": "d20522f5197a6effcf64177bb49d1fcd436fa5680e2e2b57fe84ad359f3acce2",
       "instrument": "stocks/aapl_instrument.json",
       "parquet": "stocks/aapl_2024_01.parquet",
       "row_count": 744,

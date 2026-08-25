@@ -9,12 +9,15 @@ experiment-log record.
 
 from dataclasses import replace
 
+import numpy as np
+import pandas as pd
 import pytest
 
 import ube
 from ube.adapters.base import _REGISTRY
 from ube.core.config import BacktestConfig
-from ube.core.errors import ConfigError, InvalidSignalError
+from ube.core.data import MarketData
+from ube.core.errors import CalendarMismatchError, ConfigError, InvalidSignalError
 from ube.core.experiment_log import ExperimentLog
 from ube.core.result import BacktestResult, result_hash
 from ube.core.risk import RiskConfig
@@ -94,3 +97,28 @@ def test_run_rejects_unknown_engine(tmp_path):
     config = replace(_config(), engine="nonexistent")
     with pytest.raises(ConfigError, match="unknown engine"):
         ube.run(md, signals, config, log_path=tmp_path / "experiments.db")
+
+
+def test_run_rejects_out_of_session_stock_bars(tmp_path):
+    # §4.4: a bar whose timestamp falls where the declared trading calendar says the
+    # market is closed is a CalendarMismatchError, never silently accepted. This locks in
+    # the wiring of the previously-dead calendar check — 2024-01-01 is a New-Year holiday
+    # (and overnight) for XNYS, so a stock bar there must be rejected up-front.
+    md = MarketData(
+        open=np.array([100.0]),
+        high=np.array([101.0]),
+        low=np.array([99.0]),
+        close=np.array([100.0]),
+        volume=np.full(1, 1.0),
+        index=pd.DatetimeIndex(["2024-01-01 00:00:00+00:00"]).as_unit("ns"),
+    )
+    with pytest.raises(CalendarMismatchError):
+        ube.run(
+            md,
+            from_target([1]),
+            BacktestConfig(
+                instrument=PRESETS["stocks"].instrument,
+                engine_overrides={"starting_balance": 100000.0},
+            ),
+            log_path=tmp_path / "e.db",
+        )

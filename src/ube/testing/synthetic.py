@@ -29,11 +29,13 @@ to.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
+from ube.core.calendar import resolve_calendar
 from ube.core.data import MarketData
 from ube.core.instrument import Instrument
 
@@ -205,6 +207,22 @@ def synthetic_bars(
 
     volume = rng.lognormal(mean=11.0, sigma=1.0, size=n_bars)
     index = _utc_index(start, n_bars, freq)
+    # Sessioned instruments (stocks/futures/commodities) must only carry bars that fall
+    # inside the declared trading calendar — §4.4 requires the data to respect it. Filter
+    # the 24/7 grid to in-session timestamps, padding the candidate window so we still
+    # return exactly ``n_bars`` bars. Prices/volumes/OHLC are RNG-derived independently of
+    # the index, so this only changes timestamps, never the price path.
+    cal = resolve_calendar(preset.instrument)
+    if not cal.is_always_open:
+        days = math.ceil(n_bars / 6.5) + 90
+        candidate = pd.date_range(start=start, periods=days * 24, freq=freq)
+        candidate = (
+            candidate.tz_localize("UTC")
+            if candidate.tz is None
+            else candidate.tz_convert("UTC")
+        )
+        mask = cal.session_mask(candidate)
+        index = candidate[mask][:n_bars]
 
     return MarketData(open=open_, high=high, low=low, close=close, volume=volume, index=index)
 
