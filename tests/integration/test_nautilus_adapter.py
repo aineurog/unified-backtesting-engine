@@ -760,6 +760,72 @@ def test_nautilus_cash_account_short_rejection_raises_engine_error():
         )
 
 
+def test_nautilus_last_bar_rejection_surfaces_after_run():
+    # Regression for failure mode B: a market-order rejection on the *final* bar has no
+    # subsequent on_bar to trip the per-bar market_rejection check, so the adapter must
+    # re-check it after engine.run() returns. The short signal is placed only on the last
+    # bar; on a cash account the order is rejected, and the run must raise rather than
+    # report success with a silently missing trade.
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import EngineError
+
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
+    with pytest.raises(EngineError, match="market order rejected by the venue"):
+        NautilusAdapter().run(
+            md,
+            from_target([0, 0, 0, 0, 0, -1]),
+            BacktestConfig(
+                instrument=PRESETS["stocks"].instrument,
+                engine_overrides={"account_type": "cash"},
+            ),
+        )
+
+
+def test_actor_index_for_raises_on_unknown_timestamp():
+    # Regression for failure mode A: a bar whose timestamp does not match any input bar is
+    # a genuine data/logic error and must raise, not silently fall back to "the bar after
+    # the last one".
+    from types import SimpleNamespace
+
+    from ube.adapters.nautilus_adapter.actor import UbeActor, UbeActorConfig
+    from ube.adapters.nautilus_adapter.adapter import (
+        build_instrument,
+        to_nautilus_bars,
+        to_signal_map,
+    )
+    from ube.core.config import BacktestConfig
+    from ube.core.errors import EngineError
+    from ube.core.risk.sizing import SizeModel
+
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
+    config = BacktestConfig(instrument=PRESETS["stocks"].instrument)
+    build = build_instrument(config.instrument, {})
+    _, bar_type = to_nautilus_bars(md, build)
+    signal_map = to_signal_map(md, from_target([0, 0, 0, 0, 0, 0]))
+
+    actor = UbeActor(
+        UbeActorConfig(
+            instrument_id=build.instrument_id,
+            bar_type=bar_type,
+            signal_map=signal_map,
+            asset_class=config.instrument.asset_class,
+        ),
+        market_data=md,
+        sizing=SizeModel(),
+        exits=(),
+        aux_atr=None,
+        leverage=1.0,
+        cost_model=None,
+    )
+
+    ts = int(md.timestamps.as_unit("ns").asi8[3])
+    assert actor._index_for(SimpleNamespace(ts_event=ts)) == 3
+
+    with pytest.raises(EngineError, match="not found in the known bar index"):
+        actor._index_for(SimpleNamespace(ts_event=999_999_999_999_999_999))
+
+
 # Reference mirror: rows 2026-08-03 12:00 -> 23:00 of the nautilus_trader
 # TRAILING_stop_test.csv feedstock with a 0.1% trailing stop.
 _TRAILING_REFERENCE_ROWS = [

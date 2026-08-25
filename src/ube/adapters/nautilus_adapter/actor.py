@@ -748,7 +748,18 @@ class UbeActor(Strategy):  # type: ignore[misc]
         return cfg.signal_map.get(int(bar.ts_event), _NO_SIGNAL)
 
     def _index_for(self, bar: Bar) -> int:
-        return self._ts_to_index.get(int(bar.ts_event), self._bar_count)
+        ts = int(bar.ts_event)
+        idx = self._ts_to_index.get(ts)
+        if idx is None:
+            # A genuine data/logic error: the engine delivered a bar whose timestamp does
+            # not match any input bar. Guessing "the bar after the last one" would compute
+            # against the wrong bar's data, so fail loudly instead of silently.
+            raise EngineError(
+                f"bar timestamp {ts} not found in the known bar index "
+                f"({len(self._ts_to_index)} bars); the engine produced a bar that does "
+                "not correspond to any input bar"
+            )
+        return idx
 
     def _open_position(self) -> Any | None:
         positions = self.cache.positions_open(instrument_id=self.instrument_id)

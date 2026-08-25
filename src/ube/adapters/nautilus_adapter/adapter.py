@@ -274,6 +274,13 @@ class NautilusAdapter(EngineAdapter):
                 raise EngineError(f"nautilus backtest failed: {exc}") from exc
             raise
 
+        # A market-order rejection raised inside the per-bar loop only fires if a later bar
+        # calls on_bar again (which re-checks market_rejection). A rejection on the very
+        # last bar has no subsequent on_bar, so surface it here — otherwise the run reports
+        # as fully successful while silently missing the trade that should have happened.
+        if actor.market_rejection is not None:
+            raise EngineError(f"market order rejected by the venue: {actor.market_rejection}")
+
         try:
             ledger = self._fold(
                 engine,
