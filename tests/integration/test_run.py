@@ -17,7 +17,12 @@ import ube
 from ube.adapters.base import _REGISTRY
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
-from ube.core.errors import CalendarMismatchError, ConfigError, InvalidSignalError
+from ube.core.errors import (
+    CalendarMismatchError,
+    ConfigError,
+    InvalidSignalError,
+    UndeclaredConfigError,
+)
 from ube.core.experiment_log import ExperimentLog
 from ube.core.result import BacktestResult, result_hash
 from ube.core.risk import RiskConfig
@@ -122,3 +127,43 @@ def test_run_rejects_out_of_session_stock_bars(tmp_path):
             ),
             log_path=tmp_path / "e.db",
         )
+
+
+def test_run_rejects_portfolio_without_base_currency(tmp_path):
+    # §4.7 / §7.1: a portfolio run (data is a Mapping of label -> bars) with no declared
+    # base_currency is rejected up-front by BacktestConfig.validate(), which run() now
+    # calls via config.validate(portfolio=isinstance(data, Mapping)). This locks in the
+    # previously-orphaned validate() method — a portfolio run can no longer silently run
+    # with an assumed base currency.
+    a = synthetic_bars(PRESETS["stocks"], seed=1, n_bars=4)
+    b = synthetic_bars(PRESETS["futures"], seed=2, n_bars=4)
+    portfolio_data = {"STOCK": a, "FUT": b}
+    config = BacktestConfig(
+        instrument=PRESETS["stocks"].instrument,
+        engine_overrides={"starting_balance": 100000.0},
+    )  # base_currency deliberately undeclared
+    with pytest.raises(UndeclaredConfigError, match="base_currency"):
+        ube.run(
+            portfolio_data,
+            from_target([1, 0, 1, 0]),
+            config,
+            log_path=tmp_path / "e.db",
+        )
+
+
+def test_run_single_instrument_does_not_require_base_currency(tmp_path):
+    # The §4.7 guard only fires for portfolio runs. A single-instrument run (data is a
+    # MarketData, not a Mapping) must NOT raise UndeclaredConfigError for an undeclared
+    # base_currency — the lone instrument's settlement currency is used instead (§7.1).
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=8)
+    config = BacktestConfig(
+        instrument=PRESETS["stocks"].instrument,
+        engine_overrides={"starting_balance": 100000.0},
+    )  # no base_currency
+    result = ube.run(
+        md,
+        from_target([1, 0, 1, 0, 1, 0, 1, 0]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    assert result is not None

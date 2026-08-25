@@ -168,6 +168,12 @@ def run(
     if not isinstance(config, BacktestConfig):
         raise ConfigError(f"run expects a BacktestConfig; got {type(config).__name__}")
 
+    # Run-mode cross-field validation (§4.7): reject portfolios without a declared
+    # base_currency (and paper-trading without an on_opposite_signal policy) up-front,
+    # before any computation — these have no safe default and guessing wrong yields
+    # confidently-wrong results.
+    config.validate(portfolio=isinstance(data, Mapping))
+
     config = _default_settlement_currency(config)
 
     # Portfolio (dict-keyed) inputs are forwarded as-is; the adapter decides support
