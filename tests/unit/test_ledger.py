@@ -770,3 +770,73 @@ def test_trade_table_open_row():
     assert row["trade_return_pct"] == pytest.approx(0.10)  # (110-100)/100
     assert row["realized_pnl"] == pytest.approx(0.0)
     assert row["balance"] == pytest.approx(1100.0)
+
+
+# ---------------------------------------------------------------------------
+# EquityCurve.returns / .resample — the data surface the external metrics layer
+# consumes (§10).
+# ---------------------------------------------------------------------------
+
+
+def test_equity_curve_returns_simple_returns():
+    curve = EquityCurve(
+        index=pd.RangeIndex(5), equity=np.array([100.0, 110.0, 99.0, 0.0, 120.0])
+    )
+    r = curve.returns
+    assert r[0] == 0.0
+    assert r[1] == pytest.approx(0.10)
+    assert r[2] == pytest.approx(-0.10)
+    assert r[3] == pytest.approx(-1.0)  # 99 -> 0 is a legitimate -100% return
+    assert np.isnan(r[4])  # prior equity 0 (<= 0) → undefined, surfaced as NaN
+
+
+def test_equity_curve_returns_nan_where_prior_equity_nonpositive():
+    curve = EquityCurve(index=pd.RangeIndex(4), equity=np.array([0.0, 10.0, -5.0, 8.0]))
+    r = curve.returns
+    assert r[0] == 0.0
+    assert np.isnan(r[1])  # prior equity 0
+    assert r[2] == pytest.approx(-1.5)  # 10 -> -5, prior equity 10 > 0
+    assert np.isnan(r[3])  # prior equity -5 <= 0
+
+
+def test_equity_curve_resample_last_then_derive_returns():
+    # Bars on Jan 1 and Jan 3 only; Jan 2 is an empty bucket and must carry the prior
+    # equity forward (no observation = no change), never summing/compounding bar returns.
+    idx = pd.to_datetime(["2024-01-01 12:00", "2024-01-03 12:00"]).tz_localize("UTC")
+    curve = EquityCurve(index=idx, equity=np.array([100.0, 121.0]))
+    daily = curve.resample("D")
+    assert daily.equity.tolist() == pytest.approx([100.0, 100.0, 121.0])
+    assert daily.returns.tolist() == pytest.approx([0.0, 0.0, 0.21])
+
+
+def test_equity_curve_resample_requires_datetime_index():
+    curve = EquityCurve(index=pd.RangeIndex(3), equity=np.array([1.0, 2.0, 3.0]))
+    with pytest.raises(DataShapeError):
+        curve.resample("D")
+
+
+def test_ledger_orders_and_fills_accessors():
+    ledger = EventLedger(
+        [
+            LedgerEvent(
+                EventType.ORDER_SUBMITTED, 1, "A", order_id="o1", side=1, quantity=5
+            ),
+            LedgerEvent(
+                EventType.FILL, 2, "A", order_id="o1", side=1, quantity=5, price=10.0
+            ),
+            LedgerEvent(
+                EventType.FILL, 3, "A", order_id="o2", side=-1, quantity=5, price=11.0
+            ),
+            LedgerEvent(EventType.SIGNAL_EVALUATED, 4, "A", action="hold"),
+        ]
+    )
+    assert [e.order_id for e in ledger.orders()] == ["o1"]
+    assert [e.order_id for e in ledger.fills()] == ["o1", "o2"]
+    # Only the submitted-order / fill streams; no lifecycle events are synthesized.
+    assert all(e.event_type is EventType.ORDER_SUBMITTED for e in ledger.orders())
+    assert all(e.event_type is EventType.FILL for e in ledger.fills())
+
+
+def test_ledger_orders_and_fills_empty():
+    assert EventLedger().orders() == ()
+    assert EventLedger().fills() == ()

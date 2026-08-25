@@ -7,7 +7,6 @@ implemented engine) and verify the benchmark attachment and the unconditional
 experiment-log record.
 """
 
-import math
 from dataclasses import replace
 
 import numpy as np
@@ -73,29 +72,23 @@ def test_run_end_to_end_attaches_benchmark_and_logs(tmp_path):
         assert record.result_hash == result_hash(result)
 
 
-def test_run_populates_metrics_with_benchmark_comparison(tmp_path):
-    from ube.core.metrics import Metrics
-
+def test_run_attaches_benchmark(tmp_path):
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=300)
     signals = from_target([0] + [1] * 100 + [0] * 100 + [-1] * 99)
     result = ube.run(md, signals, _config(), log_path=tmp_path / "experiments.db")
 
-    assert isinstance(result.metrics, Metrics)
-    # Standard set present and finite where defined.
-    assert math.isfinite(result.metrics.total_return)
-    assert result.metrics.max_drawdown <= 0.0
-    assert result.metrics.trade_count == len(result.trades)
-    # Benchmark is the default buy-and-hold, so the comparison must be populated.
-    assert result.metrics.excess_return is not None
-    assert result.metrics.information_ratio is not None
-    # 300 hourly bars << 1 year of calendar days -> flagged low confidence.
-    assert result.metrics.low_confidence is True
-    assert result.metrics.bar_period_ns > 0
-    # The metrics object is stable across a pickle round-trip (§7.3 persistence).
+    # Metrics are computed by an external library, not by ube: the field stays None.
+    assert result.metrics is None
+    # The benchmark is the default buy-and-hold, attached on the single-asset path and
+    # positionally aligned with the strategy equity curve (§10).
+    assert result.benchmark is not None
+    assert result.benchmark.returns.shape[0] == result.equity_curve.equity.shape[0]
+    # The result (with its None metrics slot) is stable across a pickle round-trip.
     import pickle
 
     restored = pickle.loads(pickle.dumps(result))
-    assert restored.metrics.total_return == result.metrics.total_return
+    assert restored.metrics is None
+    assert restored.benchmark is not None
 
 
 def test_run_standardizes_dataframe_and_signals_dataframe(tmp_path):

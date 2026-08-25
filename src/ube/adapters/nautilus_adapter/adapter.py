@@ -409,6 +409,7 @@ class NautilusAdapter(EngineAdapter):
                     side=side,
                     quantity=quantity,
                     price=price,
+                    order_id=str(client_order_id),
                     exit_reason=actor.exit_reasons.get(str(client_order_id)),
                 ),
                 ts,

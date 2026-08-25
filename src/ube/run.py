@@ -45,7 +45,6 @@ from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
 from ube.core.experiment_log import DataReference, ExperimentLog, PortfolioDataReference
-from ube.core.metrics import compute_metrics
 from ube.core.result import BacktestResult, result_hash
 from ube.core.signals import Signals
 
@@ -275,7 +274,7 @@ def run(
     config = _default_settlement_currency(config)
 
     # Portfolio (dict-keyed) inputs are forwarded as-is; the adapter decides support
-    # (§7.1). Benchmark/metrics comparison is a single-instrument concept (it lines up two
+    # (§7.1). Benchmark comparison is a single-instrument concept (it lines up two
     # curves bar-for-bar), so it is only attached on the single-asset path below. The
     # experiment log, however, is unconditional (§4.8) and must record BOTH branches.
     data_reference: DataReference | PortfolioDataReference
@@ -327,16 +326,10 @@ def run(
         # warmup-excluded bars — not the raw (or merely date_range-sliced) input.
         benchmark_md = _warmup_slice_market_data(md, config.warmup_bars)
         benchmark = build_benchmark(config.benchmark, benchmark_md)
-        # Recompute metrics against the now-attached benchmark (the adapter built the result
-        # without one). Benchmark and strategy curves are positionally aligned (both warm-up /
-        # date-range sliced), so excess return + information ratio can be populated here (§10).
-        result = replace(
-            result,
-            benchmark=benchmark,
-            metrics=compute_metrics(
-                result.equity_curve, benchmark=benchmark, trades=result.trades
-            ),
-        )
+        # Attach the benchmark to the result. Benchmark and strategy curves are
+        # positionally aligned (both warm-up / date-range sliced), so the external
+        # metrics layer can compare them (§10); ``ube`` computes no metrics itself.
+        result = replace(result, benchmark=benchmark)
         data_reference = DataReference.from_market_data(md, config.instrument)
 
     # §4.8: unconditional, every run — single-instrument or portfolio. This is reached on
