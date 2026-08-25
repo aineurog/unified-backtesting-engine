@@ -35,6 +35,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from ube.adapters import get_engine, register_engine, resolve_engine_name
@@ -42,10 +43,85 @@ from ube.core.benchmark import build_benchmark
 from ube.core.calendar import resolve_calendar, validate_in_session
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
-from ube.core.errors import ConfigError, InvalidSignalError
+from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
 from ube.core.experiment_log import DataReference, ExperimentLog
 from ube.core.result import BacktestResult, result_hash
 from ube.core.signals import Signals
+
+
+def _as_utc_timestamp(value: Any) -> pd.Timestamp:
+    """Coerce a ``date_range`` bound to a tz-aware UTC ``Timestamp`` (§7.2)."""
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def _window_mask(index: pd.DatetimeIndex, start: Any, end: Any) -> np.ndarray:
+    """Boolean mask of bars inside the inclusive ``[start, end]`` window."""
+    mask = np.ones(len(index), dtype=bool)
+    if start is not None:
+        mask &= index >= _as_utc_timestamp(start)
+    if end is not None:
+        mask &= index <= _as_utc_timestamp(end)
+    return mask
+
+
+def _slice_market_data(md: MarketData, start: Any, end: Any) -> tuple[MarketData, np.ndarray]:
+    """Restrict ``md`` to the inclusive ``[start, end]`` window (§7.2).
+
+    Returns the sliced ``MarketData`` and the boolean mask (over the original bars) so
+    aligned ``aux_data`` can be sliced by the same positions. Raises ``DataShapeError``
+    when the window excludes every bar — never a silent empty run.
+    """
+    # MarketData guarantees a tz-aware DatetimeIndex (raised at construction otherwise),
+    # so this narrows the declared ``pd.Index`` to what _window_mask needs.
+    index = md.index
+    assert isinstance(index, pd.DatetimeIndex), "MarketData.index must be a DatetimeIndex"
+    mask = _window_mask(index, start, end)
+    if not mask.any():
+        raise DataShapeError(
+            f"date_range {start!r}..{end!r} excludes every bar "
+            f"(data spans {md.index[0]}..{md.index[-1]})"
+        )
+    sliced = MarketData(
+        open=md.open[mask],
+        high=md.high[mask],
+        low=md.low[mask],
+        close=md.close[mask],
+        volume=md.volume[mask],
+        index=md.index[mask],
+    )
+    return sliced, mask
+
+
+def _slice_aux_data(
+    aux_data: Mapping[str, Any],
+    mask: np.ndarray,
+    start: object,
+    end: object,
+) -> Mapping[str, Any]:
+    """Slice ``aux_data`` to match a date_range-sliced single-instrument run.
+
+    Precomputed arrays are sliced by ``mask`` (length-aligned to the data bars); an
+    ``aux_data`` ``MarketData`` is sliced to the same timestamp window.
+    """
+    out: dict[str, Any] = {}
+    for name, val in aux_data.items():
+        if isinstance(val, MarketData):
+            out[name] = _slice_market_data(val, start, end)[0]
+        else:
+            out[name] = np.asarray(val)[mask]
+    return out
+
+
+def _slice_signals(sig: Signals, mask: np.ndarray) -> Signals:
+    """Slice the four boolean signal columns by the same bar ``mask`` (§6.1, §7.2)."""
+    return Signals(
+        long_entry=sig.long_entry[mask],
+        long_exit=sig.long_exit[mask],
+        short_entry=sig.short_entry[mask],
+        short_exit=sig.short_exit[mask],
+    )
+
 
 __all__ = ["run", "ensure_builtin_engines_registered"]
 
@@ -129,7 +205,11 @@ def run(
     Orchestrates the Phase-1 pipeline in order:
 
     1. Validate ``config`` and default any omitted settlement currency.
-    2. For a single-instrument run, standardize ``data``/``signals`` to the canonical
+    2. Apply ``config.date_range`` (§7.2): restrict the bars (and aligned ``aux_data``)
+       to the declared ``(start, end)`` window before the engine sees them — a window
+       that excludes every bar raises ``DataShapeError``. The full dataset is never
+       silently run when a ``date_range`` is set.
+    3. For a single-instrument run, standardize ``data``/``signals`` to the canonical
        containers; a portfolio (dict-keyed) run is forwarded to the adapter as-is.
     3. Lazily register the installed built-in engine, then resolve ``config.engine``
        (``"auto"`` → first installed) to the adapter class.
@@ -180,6 +260,11 @@ def run(
     # (§7.1). Benchmark and experiment-log data-reference are single-instrument concepts,
     # so they are only attached on the single-asset path below.
     if isinstance(data, Mapping):
+        # §7.2: restrict each instrument's bars to the declared date_range window before
+        # the adapter sees them. A window that excludes every bar raises DataShapeError.
+        if config.date_range is not None:
+            start, end = config.date_range
+            data = {k: _slice_market_data(v, start, end)[0] for k, v in data.items()}
         ensure_builtin_engines_registered()
         engine_name = resolve_engine_name(config.engine)
         adapter_cls = get_engine(engine_name)
@@ -190,6 +275,16 @@ def run(
 
     md = _standardize_data(data)
     sig = _standardize_signals(signals)
+
+    # §7.2: restrict the bars to the declared date_range window before the adapter sees
+    # them, so the backtest only covers the requested bounds. Aligned aux_data (e.g. a
+    # named ATR series) is sliced by the same positions to keep lengths consistent.
+    if config.date_range is not None:
+        start, end = config.date_range
+        md, mask = _slice_market_data(md, start, end)
+        sig = _slice_signals(sig, mask)
+        if aux_data:
+            aux_data = _slice_aux_data(aux_data, mask, start, end)
 
     # Calendar validation (§4.4): a bar whose timestamp falls where the declared trading
     # calendar says the market is closed is a §15 data error, never silently accepted.

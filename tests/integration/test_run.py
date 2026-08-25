@@ -20,6 +20,7 @@ from ube.core.data import MarketData
 from ube.core.errors import (
     CalendarMismatchError,
     ConfigError,
+    DataShapeError,
     InvalidSignalError,
     UndeclaredConfigError,
 )
@@ -167,3 +168,76 @@ def test_run_single_instrument_does_not_require_base_currency(tmp_path):
         log_path=tmp_path / "e.db",
     )
     assert result is not None
+
+
+def _constant_bars(n: int = 10, start: str = "2024-01-01") -> MarketData:
+    """Hourly constant-price bars with a known, tz-aware UTC index (for date_range tests)."""
+    idx = pd.date_range(start, periods=n, freq="h", tz="UTC")
+    prices = np.arange(10.0, 10.0 + n)
+    return MarketData(
+        open=prices,
+        high=prices + 1.0,
+        low=prices - 1.0,
+        close=prices,
+        volume=np.ones(n),
+        index=idx,
+    )
+
+
+def test_run_date_range_restricts_bars_to_window(tmp_path):
+    # §7.2: date_range must actually slice the data, not validate-and-ignore. With an
+    # hourly 10-bar dataset and date_range ("... 02:00" .. "... 06:00"), only bars 2..6
+    # (inclusive) reach the engine, so the resulting equity curve is exactly those 5 bars.
+    md = _constant_bars(10)
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        date_range=("2024-01-01 02:00", "2024-01-01 06:00"),
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    result = ube.run(
+        md,
+        from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    eq_idx = result.equity_curve.index
+    assert len(eq_idx) == 5
+    assert eq_idx[0] == pd.Timestamp("2024-01-01 02:00", tz="UTC")
+    assert eq_idx[-1] == pd.Timestamp("2024-01-01 06:00", tz="UTC")
+
+
+def test_run_date_range_excluding_all_bars_raises_data_shape_error(tmp_path):
+    # §7.2: a date_range that excludes every bar must raise DataShapeError — never return
+    # an empty/zeroed result silently.
+    md = _constant_bars(10)
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        date_range=("2030-01-01", "2030-02-01"),
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    with pytest.raises(DataShapeError, match="excludes every bar"):
+        ube.run(
+            md,
+            from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+            config,
+            log_path=tmp_path / "e.db",
+        )
+
+
+def test_run_date_range_with_open_start_bound(tmp_path):
+    # An open lower bound keeps everything up to `end`. date_range (None, "... 04:00") on
+    # the 10-bar set keeps bars 0..4 inclusive → 5 bars ending at 04:00.
+    md = _constant_bars(10)
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        date_range=(None, "2024-01-01 04:00"),
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    result = ube.run(
+        md,
+        from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0]),
+        config,
+        log_path=tmp_path / "e.db",
+    )
+    assert len(result.equity_curve.index) == 5
+    assert result.equity_curve.index[-1] == pd.Timestamp("2024-01-01 04:00", tz="UTC")
