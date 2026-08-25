@@ -22,7 +22,7 @@ from ube.adapters.nautilus_adapter.overrides import (
     validate_overrides,
 )
 from ube.core.data import MarketData
-from ube.core.errors import ConfigError, DataShapeError, InvalidInstrumentError, InvalidSignalError
+from ube.core.errors import ConfigError, InvalidInstrumentError, InvalidSignalError
 from ube.core.signals import from_target
 from ube.testing.synthetic import PRESETS, synthetic_bars
 
@@ -444,21 +444,6 @@ def test_build_instrument_rejects_unsupported_asset_class():
 # ---------------------------------------------------------------------------
 # Step 4: Data + signal bridge (MarketData/Signals -> Nautilus bars + lookup).
 # ---------------------------------------------------------------------------
-
-
-def test_derive_bar_period_ns_is_median_positive_spacing():
-    from ube.adapters.nautilus_adapter.adapt_data import derive_bar_period_ns
-
-    md = synthetic_bars(PRESETS["futures"], n_bars=48)
-    assert derive_bar_period_ns(md) == 3_600_000_000_000
-
-
-def test_derive_bar_period_ns_single_bar_raises():
-    from ube.adapters.nautilus_adapter.adapt_data import derive_bar_period_ns
-
-    md = synthetic_bars(PRESETS["futures"], n_bars=1)
-    with pytest.raises(DataShapeError, match="at least two bars"):
-        derive_bar_period_ns(md)
 
 
 def test_to_nautilus_bars_builds_hourly_bar_type_and_matches_every_bar():
@@ -943,9 +928,9 @@ def test_nautilus_trailing_and_chandelier_ratchet_without_lookahead():
         (25.0, 101.57, "chandelier"),
         (975.0, 101.56, "chandelier"),
     ]
-    assert chandelier_level(
-        ChandelierExit(2), data, side=1, entry_bar=0, atr_series=atr(data)
-    )[1] == pytest.approx(101.5714, abs=1e-3)
+    assert chandelier_level(ChandelierExit(2), data, side=1, entry_bar=0, atr_series=atr(data))[
+        1
+    ] == pytest.approx(101.5714, abs=1e-3)
     assert (
         chandelier_level(ChandelierExit(2), data, side=1, entry_bar=0, atr_series=atr(data))[2]
         < 101.5
@@ -985,9 +970,7 @@ def test_nautilus_actor_entry_sized_in_integer_contracts():
     assert sum(e.quantity for e in fills) == pytest.approx(20.0, abs=1e-9)
     assert result.trades == ()
     (position_value,) = [
-        e.position_after
-        for e in result.ledger
-        if e.event_type is EventType.POSITION_CHANGE
+        e.position_after for e in result.ledger if e.event_type is EventType.POSITION_CHANGE
     ]
     assert position_value == 20.0  # remains flat after entry, one contract block
 
@@ -1066,10 +1049,9 @@ def test_nautilus_actor_atr_stop_touched_fills_at_trigger():
     assert trade.exit_price == pytest.approx(97.28, abs=1e-2)
     assert trade.net_pnl == pytest.approx(-3213.35, rel=1e-3)
     # The ratcheted trigger is the level on the last completed bar (no lookahead).
-    assert (
-        exit_level(ATRStop(2), market_data=data, side=1, entry_price=100.5, entry_bar=0)[1]
-        == pytest.approx(97.2857, abs=1e-3)
-    )
+    assert exit_level(ATRStop(2), market_data=data, side=1, entry_price=100.5, entry_bar=0)[
+        1
+    ] == pytest.approx(97.2857, abs=1e-3)
     assert float(result.equity_curve.equity[-1]) == pytest.approx(96786.65, rel=1e-6)
 
 

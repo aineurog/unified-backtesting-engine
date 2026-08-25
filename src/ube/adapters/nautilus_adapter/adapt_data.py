@@ -20,20 +20,18 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
-import numpy as np
 from nautilus_trader.model.data import Bar, BarSpecification, BarType
 from nautilus_trader.model.enums import BarAggregation, PriceType
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 
 from ube.adapters.nautilus_adapter.instrument_map import NautilusInstrumentBuild
-from ube.core.data import MarketData
-from ube.core.errors import DataShapeError, InvalidSignalError
+from ube.core.data import MarketData, derive_bar_period_ns
+from ube.core.errors import InvalidSignalError
 from ube.core.signals import Signals
 
 __all__ = [
     "build_bar_type",
-    "derive_bar_period_ns",
     "to_nautilus_bars",
     "to_signal_map",
 ]
@@ -49,26 +47,6 @@ _AGG_BY_NS: Sequence[tuple[BarAggregation, int]] = (
     (BarAggregation.SECOND, 1_000_000_000),
     (BarAggregation.MILLISECOND, 1_000_000),
 )
-
-
-def derive_bar_period_ns(market_data: MarketData) -> int:
-    """Median positive inter-bar spacing in nanoseconds (requirements §4.9).
-
-    ``MarketData`` guarantees a sorted, unique, tz-aware UTC index, so every
-    consecutive delta is strictly positive.
-
-    Raises:
-        DataShapeError: fewer than two bars (no spacing to infer a period from).
-    """
-    if market_data.n_bars < 2:
-        raise DataShapeError(
-            f"cannot derive a bar period from {market_data.n_bars} bar(s); "
-            "require at least two bars"
-        )
-    deltas = np.diff(
-        market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
-    )
-    return int(np.median(deltas[deltas > 0]))
 
 
 def _is_valid_step(step: int, aggregation: BarAggregation) -> bool:

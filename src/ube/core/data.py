@@ -36,6 +36,7 @@ __all__ = [
     "OHLC_COLUMNS",
     "VOLUME_COLUMN",
     "OHLCV_COLUMNS",
+    "derive_bar_period_ns",
 ]
 
 OHLC_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close")
@@ -77,13 +78,14 @@ def _coerce_numeric(values: object, name: str) -> np.ndarray:
         raise DataShapeError(f"column {name!r} is not numeric") from exc
 
 
-def _validate_ohlc(
-    open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray
-) -> None:
+def _validate_ohlc(open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> None:
     """Validate the structural OHLC invariants listed in §15, vectorized."""
-    if np.isnan(open_).any() or np.isnan(high).any() or np.isnan(low).any() or np.isnan(
-        close
-    ).any():
+    if (
+        np.isnan(open_).any()
+        or np.isnan(high).any()
+        or np.isnan(low).any()
+        or np.isnan(close).any()
+    ):
         raise DataShapeError("NaN values in OHLC columns")
     if (open_ <= 0).any() or (high <= 0).any() or (low <= 0).any() or (close <= 0).any():
         raise DataShapeError("non-positive prices in OHLC columns")
@@ -108,9 +110,7 @@ def _parse_timestamps(timestamps: object) -> pd.DatetimeIndex:
         raise DataShapeError("timestamps could not be parsed as datetimes") from exc
 
 
-def _timestamp_from_columns(
-    df: pd.DataFrame, timestamp_col: str | None
-) -> pd.Series | None:
+def _timestamp_from_columns(df: pd.DataFrame, timestamp_col: str | None) -> pd.Series | None:
     """Resolve the timestamp column for columnar (dict/records) inputs."""
     name = timestamp_col if timestamp_col is not None else _DEFAULT_TIMESTAMP_COL
     if name in df.columns:
@@ -149,9 +149,7 @@ class MarketData:
             raise DataShapeError("no bars provided (empty input)")
         for name, arr in (("high", high), ("low", low), ("close", close)):
             if arr.shape[0] != n:
-                raise DataShapeError(
-                    f"column {name!r} has {arr.shape[0]} rows, expected {n}"
-                )
+                raise DataShapeError(f"column {name!r} has {arr.shape[0]} rows, expected {n}")
         volume = _coerce_numeric(self.volume, "volume")
         if volume.shape[0] != n:
             raise DataShapeError(f"column 'volume' has {volume.shape[0]} rows, expected {n}")
@@ -163,8 +161,7 @@ class MarketData:
             raise DataShapeError(f"index has {len(index)} entries, expected {n}")
         if not isinstance(index, pd.DatetimeIndex):
             raise DataShapeError(
-                "bars require a DatetimeIndex — every bar carries the time at "
-                "which each bar formed"
+                "bars require a DatetimeIndex — every bar carries the time at which each bar formed"
             )
         if not index.is_monotonic_increasing:
             raise DataShapeError("bar index is not sorted ascending")
@@ -239,9 +236,7 @@ class MarketData:
         source = _canonical_to_source(column_map)
         missing = [c for c in OHLC_COLUMNS if source[c] not in df.columns]
         if missing:
-            raise DataShapeError(
-                f"missing required columns: {[source[c] for c in missing]}"
-            )
+            raise DataShapeError(f"missing required columns: {[source[c] for c in missing]}")
         open_ = df[source["open"]].to_numpy()
         high = df[source["high"]].to_numpy()
         low = df[source["low"]].to_numpy()
@@ -355,19 +350,13 @@ class MarketData:
     ) -> MarketData:
         """Dispatch on the input shape and standardize to a canonical ``MarketData``."""
         if isinstance(data, pd.DataFrame):
-            return cls.from_dataframe(
-                data, column_map=column_map, timestamp_col=timestamp_col
-            )
+            return cls.from_dataframe(data, column_map=column_map, timestamp_col=timestamp_col)
         if isinstance(data, np.ndarray):
             return cls.from_array(data, timestamps=timestamps)
         if isinstance(data, Mapping):
-            return cls.from_dict(
-                data, column_map=column_map, timestamp_col=timestamp_col
-            )
+            return cls.from_dict(data, column_map=column_map, timestamp_col=timestamp_col)
         if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
-            return cls.from_records(
-                data, column_map=column_map, timestamp_col=timestamp_col
-            )
+            return cls.from_records(data, column_map=column_map, timestamp_col=timestamp_col)
         raise DataShapeError(f"unsupported input type {type(data).__name__}")
 
     # -- helpers --------------------------------------------------------------
@@ -404,3 +393,31 @@ class MarketData:
             },
             index=self.index,
         )
+
+
+def derive_bar_period_ns(market_data: MarketData) -> int:
+    """Median positive inter-bar spacing in nanoseconds (requirements §4.9).
+
+    The bar period is *inferred from the data*, not assumed from a hard-coded label, so
+    annualization is correct regardless of which engine produced the backtest (§4.9 frames
+    this as a core concern). ``MarketData`` guarantees a sorted, unique, tz-aware UTC index,
+    so every consecutive delta is strictly positive.
+
+    Args:
+        market_data: The canonical bars whose period is to be inferred.
+
+    Returns:
+        The median positive inter-bar spacing, in nanoseconds.
+
+    Raises:
+        DataShapeError: fewer than two bars (no spacing to infer a period from).
+    """
+    if market_data.n_bars < 2:
+        raise DataShapeError(
+            f"cannot derive a bar period from {market_data.n_bars} bar(s); "
+            "require at least two bars"
+        )
+    deltas = np.diff(
+        market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    )
+    return int(np.median(deltas[deltas > 0]))
