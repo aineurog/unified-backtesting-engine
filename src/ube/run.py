@@ -44,7 +44,7 @@ from ube.core.calendar import resolve_calendar, validate_in_session
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
-from ube.core.experiment_log import DataReference, ExperimentLog
+from ube.core.experiment_log import DataReference, ExperimentLog, PortfolioDataReference
 from ube.core.metrics import compute_metrics
 from ube.core.result import BacktestResult, result_hash
 from ube.core.signals import Signals
@@ -275,8 +275,10 @@ def run(
     config = _default_settlement_currency(config)
 
     # Portfolio (dict-keyed) inputs are forwarded as-is; the adapter decides support
-    # (§7.1). Benchmark and experiment-log data-reference are single-instrument concepts,
-    # so they are only attached on the single-asset path below.
+    # (§7.1). Benchmark/metrics comparison is a single-instrument concept (it lines up two
+    # curves bar-for-bar), so it is only attached on the single-asset path below. The
+    # experiment log, however, is unconditional (§4.8) and must record BOTH branches.
+    data_reference: DataReference | PortfolioDataReference
     if isinstance(data, Mapping):
         # §7.2: restrict each instrument's bars to the declared date_range window before
         # the adapter sees them. A window that excludes every bar raises DataShapeError.
@@ -289,57 +291,65 @@ def run(
         # Forwarded as-is: the single-instrument adapter contract types ``data``/``signals``
         # as MarketData/Signals, but a portfolio run passes dict-keyed inputs that only a
         # portfolio-capable adapter understands (it validates at runtime, §7.1).
-        return adapter_cls().run(data, signals, config, aux_data=aux_data)  # type: ignore[arg-type]
+        result = adapter_cls().run(data, signals, config, aux_data=aux_data)  # type: ignore[arg-type]
+        # §4.8: a multi-instrument run is still a run — log it so the true attempt count
+        # (PBO/DSR honesty, §11) is complete. Build the portfolio fingerprint.
+        data_reference = PortfolioDataReference.from_market_data_mapping(data)
+    else:
+        md = _standardize_data(data)
+        sig = _standardize_signals(signals)
 
-    md = _standardize_data(data)
-    sig = _standardize_signals(signals)
+        # §7.2: restrict the bars to the declared date_range window before the adapter sees
+        # them, so the backtest only covers the requested bounds. Aligned aux_data (e.g. a
+        # named ATR series) is sliced by the same positions to keep lengths consistent.
+        if config.date_range is not None:
+            start, end = config.date_range
+            md, mask = _slice_market_data(md, start, end)
+            sig = _slice_signals(sig, mask)
+            if aux_data:
+                aux_data = _slice_aux_data(aux_data, mask, start, end)
 
-    # §7.2: restrict the bars to the declared date_range window before the adapter sees
-    # them, so the backtest only covers the requested bounds. Aligned aux_data (e.g. a
-    # named ATR series) is sliced by the same positions to keep lengths consistent.
-    if config.date_range is not None:
-        start, end = config.date_range
-        md, mask = _slice_market_data(md, start, end)
-        sig = _slice_signals(sig, mask)
-        if aux_data:
-            aux_data = _slice_aux_data(aux_data, mask, start, end)
+        # Calendar validation (§4.4): a bar whose timestamp falls where the declared trading
+        # calendar says the market is closed is a §15 data error, never silently accepted.
+        # Crypto's "24/7" calendar is a no-op. This is the single integration point so the
+        # check runs for every single-instrument run, regardless of adapter.
+        validate_in_session(md, resolve_calendar(config.instrument))
 
-    # Calendar validation (§4.4): a bar whose timestamp falls where the declared trading
-    # calendar says the market is closed is a §15 data error, never silently accepted.
-    # Crypto's "24/7" calendar is a no-op. This is the single integration point so the
-    # check runs for every single-instrument run, regardless of adapter.
-    validate_in_session(md, resolve_calendar(config.instrument))
+        ensure_builtin_engines_registered()
+        engine_name = resolve_engine_name(config.engine)
+        adapter_cls = get_engine(engine_name)
 
-    ensure_builtin_engines_registered()
-    engine_name = resolve_engine_name(config.engine)
-    adapter_cls = get_engine(engine_name)
+        result = adapter_cls().run(md, sig, config, aux_data=aux_data)
 
-    result = adapter_cls().run(md, sig, config, aux_data=aux_data)
+        # §10: the benchmark comparison (excess return, information ratio) assumes the
+        # benchmark and strategy curves line up positionally, bar for bar. The adapter
+        # already warm-up-slices the strategy outputs, so build the benchmark from the same
+        # warmup-excluded bars — not the raw (or merely date_range-sliced) input.
+        benchmark_md = _warmup_slice_market_data(md, config.warmup_bars)
+        benchmark = build_benchmark(config.benchmark, benchmark_md)
+        # Recompute metrics against the now-attached benchmark (the adapter built the result
+        # without one). Benchmark and strategy curves are positionally aligned (both warm-up /
+        # date-range sliced), so excess return + information ratio can be populated here (§10).
+        result = replace(
+            result,
+            benchmark=benchmark,
+            metrics=compute_metrics(
+                result.equity_curve, benchmark=benchmark, trades=result.trades
+            ),
+        )
+        data_reference = DataReference.from_market_data(md, config.instrument)
 
-    # §10: the benchmark comparison (excess return, information ratio) assumes the
-    # benchmark and strategy curves line up positionally, bar for bar. The adapter
-    # already warm-up-slices the strategy outputs, so build the benchmark from the same
-    # warmup-excluded bars — not the raw (or merely date_range-sliced) input.
-    benchmark_md = _warmup_slice_market_data(md, config.warmup_bars)
-    benchmark = build_benchmark(config.benchmark, benchmark_md)
-    # Recompute metrics against the now-attached benchmark (the adapter built the result
-    # without one). Benchmark and strategy curves are positionally aligned (both warm-up /
-    # date-range sliced), so excess return + information ratio can be populated here (§10).
-    result = replace(
-        result,
-        benchmark=benchmark,
-        metrics=compute_metrics(
-            result.equity_curve, benchmark=benchmark, trades=result.trades
-        ),
-    )
-
+    # §4.8: unconditional, every run — single-instrument or portfolio. This is reached on
+    # both branches above (the early `return` was removed) so no run category is silently
+    # exempt from logging.
     with ExperimentLog(path=log_path) as log:
         log.record(
             run_id=result.run_id,
             config=config,
             engine=engine_name,
-            data_reference=DataReference.from_market_data(md, config.instrument),
+            data_reference=data_reference,
             result_hash=result_hash(result),
         )
+    return result
 
     return result

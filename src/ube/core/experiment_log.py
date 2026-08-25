@@ -69,7 +69,7 @@ import importlib.metadata
 import json
 import os
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from enum import Enum
@@ -91,6 +91,7 @@ from ube.core.instrument import Instrument
 
 __all__ = [
     "DataReference",
+    "PortfolioDataReference",
     "ExperimentRecord",
     "RecordInput",
     "ExperimentLog",
@@ -235,6 +236,117 @@ class DataReference:
 
 
 @dataclass(frozen=True)
+class PortfolioDataReference:
+    """The content-addressable data reference for a multi-instrument (portfolio) run (§4.8).
+
+    A portfolio run passes a ``{symbol: MarketData}`` mapping; its fingerprint aggregates
+    every instrument: the **union** of their date ranges, the **total** bar count, and a
+    **combined** ``content_hash`` (each instrument's head+tail hash, keyed by symbol, folded
+    together). This is the multi-instrument analogue of :class:`DataReference` so portfolio
+    runs get a row in the experiment log on equal footing with single-instrument runs — the
+    §4.8 rule is "every run, through any entry point", and PBO/DSR honesty (§11) depends on
+    the *true* count of all attempts, portfolio included.
+
+    ``symbols`` is always available (the mapping keys); ``instruments`` is optional — when a
+    caller can supply a ``{symbol: Instrument}`` map, richer asset-class labels are recorded,
+    otherwise the asset-class column falls back to ``"portfolio"``. Either way the run is
+    fingerprinted and logged.
+
+    Attributes:
+        symbols: The traded symbols, sorted (deterministic identity).
+        instruments: The corresponding :class:`~ube.core.instrument.Instrument` metadata, or
+            an empty tuple when not supplied by the caller.
+        date_range: ``(first_bar, last_bar)`` timestamps across the union of instruments.
+        row_count: Total bars across all instruments.
+        content_hash: SHA-256 over each symbol + its :class:`DataReference` content_hash.
+    """
+
+    symbols: tuple[str, ...]
+    instruments: tuple[Instrument, ...]
+    date_range: tuple[str, str]
+    row_count: int
+    content_hash: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.symbols, tuple) or not all(
+            isinstance(s, str) for s in self.symbols
+        ):
+            raise ConfigError("symbols must be a tuple of strings")
+        if len(self.symbols) == 0:
+            raise ConfigError("symbols must be non-empty")
+        if not isinstance(self.instruments, tuple) or not all(
+            isinstance(i, Instrument) for i in self.instruments
+        ):
+            raise InvalidInstrumentError(
+                "PortfolioDataReference.instruments must be a tuple of Instrument"
+            )
+        if not isinstance(self.date_range, tuple) or len(self.date_range) != 2:
+            raise ConfigError("date_range must be a (start, end) 2-tuple of strings")
+        if not all(isinstance(v, str) for v in self.date_range):
+            raise ConfigError("date_range entries must be strings")
+        if isinstance(self.row_count, bool) or not isinstance(self.row_count, int) or (
+            self.row_count < 0
+        ):
+            raise ConfigError(
+                f"row_count must be a non-negative integer; got {self.row_count!r}"
+            )
+        if not isinstance(self.content_hash, str) or not self.content_hash:
+            raise ConfigError("content_hash must be a non-empty string")
+
+    @classmethod
+    def from_market_data_mapping(
+        cls,
+        market_data_map: Mapping[str, MarketData],
+        instruments_map: Mapping[str, Instrument] | None = None,
+    ) -> PortfolioDataReference:
+        """Build a :class:`PortfolioDataReference` from ``{symbol: MarketData}``.
+
+        Args:
+            market_data_map: The portfolio bar inputs keyed by symbol.
+            instruments_map: Optional ``{symbol: Instrument}`` metadata. Symbols absent from
+                this map are logged by symbol only (asset class falls back to ``"portfolio"``).
+
+        Raises:
+            DataShapeError: If ``market_data_map`` is empty or contains a non-MarketData / a
+                zero-bar series.
+        """
+        if not isinstance(market_data_map, Mapping) or not market_data_map:
+            raise DataShapeError(
+                "from_market_data_mapping expects a non-empty mapping of MarketData"
+            )
+        starts: list[str] = []
+        ends: list[str] = []
+        total_bars = 0
+        digest = hashlib.sha256()
+        symbols = sorted(market_data_map)
+        for symbol in symbols:
+            md = market_data_map[symbol]
+            if not isinstance(md, MarketData):
+                raise DataShapeError(
+                    f"portfolio input for {symbol!r} is not a MarketData"
+                )
+            if md.n_bars == 0:
+                raise DataShapeError(f"instrument {symbol!r} has zero bars")
+            starts.append(_index_repr(md.index[0]))
+            ends.append(_index_repr(md.index[md.n_bars - 1]))
+            total_bars += md.n_bars
+            digest.update(symbol.encode("utf-8"))
+            digest.update(_compute_content_hash(md).encode("utf-8"))
+        instruments = (
+            tuple(instruments_map[s] for s in symbols if s in instruments_map)
+            if instruments_map is not None
+            else ()
+        )
+        return cls(
+            symbols=tuple(symbols),
+            instruments=instruments,
+            date_range=(min(starts), max(ends)),
+            row_count=total_bars,
+            content_hash=digest.hexdigest(),
+        )
+
+
+@dataclass(frozen=True)
 class ExperimentRecord:
     """One recorded experiment-log entry, as returned by :meth:`ExperimentLog.get` and
     :meth:`ExperimentLog.list` (a read-only projection of the ``experiments`` table).
@@ -268,7 +380,7 @@ class RecordInput:
     run_id: str
     config: BacktestConfig
     engine: str
-    data_reference: DataReference
+    data_reference: DataReference | PortfolioDataReference
     code_version: str | None = None
     result_hash: str | None = None
     timestamp: str | None = None
@@ -322,7 +434,7 @@ class ExperimentLog:
         run_id: str,
         config: BacktestConfig,
         engine: str,
-        data_reference: DataReference,
+        data_reference: DataReference | PortfolioDataReference,
         code_version: str | None = None,
         result_hash: str | None = None,
         timestamp: str | None = None,
@@ -497,19 +609,33 @@ class ExperimentLog:
         engine = _require_nonempty(inp.engine, "engine")
         if not isinstance(inp.config, BacktestConfig):
             raise ConfigError("config must be a BacktestConfig")
-        if not isinstance(inp.data_reference, DataReference):
-            raise ConfigError("data_reference must be a DataReference")
+        if not isinstance(inp.data_reference, (DataReference, PortfolioDataReference)):
+            raise ConfigError(
+                "data_reference must be a DataReference or PortfolioDataReference"
+            )
         params = _config_to_json(inp.config)
         code_version = _resolve_code_version(inp.code_version)
         timestamp = inp.timestamp if inp.timestamp is not None else _utcnow_iso()
         dr = inp.data_reference
+        if isinstance(dr, PortfolioDataReference):
+            # A portfolio's identity is its symbols; asset class is the union (or a fallback
+            # label when per-symbol instrument metadata was not supplied).
+            instrument_label = "|".join(dr.symbols)
+            asset_class_label = (
+                "|".join(sorted({i.asset_class for i in dr.instruments}))
+                if dr.instruments
+                else "portfolio"
+            )
+        else:
+            instrument_label = dr.instrument.symbol
+            asset_class_label = dr.instrument.asset_class
         return (
             run_id,
             timestamp,
             engine,
             params,
-            dr.instrument.symbol,
-            dr.instrument.asset_class,
+            instrument_label,
+            asset_class_label,
             dr.date_range[0],
             dr.date_range[1],
             dr.row_count,

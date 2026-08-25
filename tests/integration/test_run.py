@@ -15,7 +15,7 @@ import pandas as pd
 import pytest
 
 import ube
-from ube.adapters.base import _REGISTRY
+from ube.adapters.base import _REGISTRY, EngineAdapter
 from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel
 from ube.core.data import MarketData
@@ -311,3 +311,95 @@ def test_run_default_all_in_reserves_fees_and_still_trades(tmp_path):
         log_path=tmp_path / "e.db",
     )
     assert len(result.trades) > 0
+
+
+# ---------------------------------------------------------------------------
+# Portfolio run experiment-log integration (§4.8).
+# ---------------------------------------------------------------------------
+
+
+class _FakePortfolioAdapter(EngineAdapter):
+    """Minimal adapter that accepts dict MarketData and returns a BacktestResult.
+
+    Used to exercise the `ube.run` portfolio branch and confirm the experiment log
+    records the portfolio reference (§4.8). The adapter does nothing interesting;
+    it just constructs a valid result object with per-instrument equity curves.
+    """
+
+    name = "fake_portfolio"
+
+    def run(
+        self,
+        data: dict[str, MarketData],
+        signals: dict[str, object],
+        config: BacktestConfig,
+        aux_data: dict | None = None,
+    ) -> BacktestResult:
+        # Build a trivial equity curve per instrument (2 bars = 1 return point).
+        import pandas as pd
+
+        from ube.core.ledger import EventLedger
+        from ube.core.result import EquityCurve
+
+        symbols = sorted(data.keys())
+        idx = pd.DatetimeIndex(
+            ["2024-01-01 00:00:00+00:00", "2024-01-01 01:00:00+00:00"], tz="UTC"
+        ).as_unit("ns")
+        equity_by_inst = {}
+        for s in symbols:
+            equity_by_inst[s] = EquityCurve(index=idx, equity=np.array([1.0, 1.01]))
+        # Combined equity curve (sum of instruments for portfolio view).
+        combined_eq = EquityCurve(index=idx, equity=np.array([1.0, 1.01]))
+        return BacktestResult(
+            run_id="test-portfolio-run",
+            config=config,
+            ledger=EventLedger(),
+            trades=(),
+            trade_table=pd.DataFrame(),
+            positions=None,
+            equity_curve=combined_eq,
+            equity_curve_by_instrument=equity_by_inst,
+            benchmark=None,
+            metrics=None,
+        )
+
+
+def test_run_portfolio_logs_experiment_record(tmp_path):
+    # Register a portfolio-capable fake adapter to exercise the Mapping branch of ube.run.
+    from ube.adapters.base import register_engine
+
+    register_engine("fake_portfolio", _FakePortfolioAdapter)
+
+    a = _constant_bars(10)
+    b = _constant_bars(10)
+    portfolio_data = {"SYM_A": a, "SYM_B": b}
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        base_currency="USDT",
+        engine="fake_portfolio",
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    signals = from_target([1, 0, 1, 0, 1, 0, 1, 0, 1, 0])
+    log_path = tmp_path / "exp.db"
+
+    result = ube.run(
+        portfolio_data,
+        signals,
+        config,
+        log_path=log_path,
+    )
+
+    # The run completed (adapter returned a result) and the experiment log was written.
+    assert isinstance(result, BacktestResult)
+    assert result.equity_curve_by_instrument is not None
+    assert set(result.equity_curve_by_instrument.keys()) == {"SYM_A", "SYM_B"}
+
+    with ExperimentLog(path=log_path) as log:
+        assert log.count() == 1
+        rec = log.get(result.run_id)
+        assert rec is not None
+        assert rec.instrument == "SYM_A|SYM_B"
+        assert rec.asset_class == "portfolio"
+        assert rec.row_count == 20  # 10 + 10 bars
+        assert rec.engine == "fake_portfolio"
+        assert rec.result_hash is not None
