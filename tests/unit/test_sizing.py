@@ -1,5 +1,6 @@
 """Tests for the position-sizing subsystem (§6.3)."""
 
+import math
 from dataclasses import FrozenInstanceError
 
 import numpy as np
@@ -17,6 +18,7 @@ from ube.core.risk import (
     size_position,
     volatility_target_size,
 )
+from ube.core.risk.sizing import _check_affordable, floor_to_step
 
 
 def test_size_kinds_constant():
@@ -211,3 +213,54 @@ def test_size_position_affordability_guard_passes_for_fee_aware_all_in():
         size_position("all_in", capital=10_000, price=50, cost_model=CostModel(commission=0.05))
     )
     assert units == pytest.approx(10_000 / (50 * 1.05))
+
+
+# ---------------------------------------------------------------------------
+# floor_to_step — lot-grid conversion for the adapter's final quantity (§7.1).
+# ---------------------------------------------------------------------------
+
+
+def test_floor_to_step_floors_fractional_lots():
+    assert float(floor_to_step(52.37, 1.0)) == 52.0
+    assert float(floor_to_step(9.987, 0.01)) == pytest.approx(9.98)
+    np.testing.assert_allclose(floor_to_step([52.37, 52.99], 1.0), [52.0, 52.0])
+
+
+def test_floor_to_step_epsilon_absorbs_float_representation_error():
+    # A value intended as an exact multiple of the step but stored just below it must
+    # floor UP to that multiple (3.0 -> 2.9999999996 floors to 3, not 2).
+    assert float(floor_to_step(3.0 - 4e-10, 1.0)) == 3.0
+
+
+def test_floor_to_step_never_rounds_up():
+    for raw in (52.37, 52.5, 52.99, 0.999):
+        assert float(floor_to_step(raw, 1.0)) <= raw
+
+
+def test_floor_to_step_rejects_bad_step():
+    with pytest.raises(ConfigError):
+        floor_to_step(1.0, 0.0)
+    with pytest.raises(ConfigError):
+        floor_to_step(1.0, -0.01)
+    with pytest.raises(ConfigError):
+        floor_to_step(1.0, "1")  # type: ignore[arg-type]
+
+
+def test_lot_conversion_regression_floor_passes_where_upround_breaches():
+    # §7.1 regression pin: the adapter's sequence is size -> floor to lot -> re-check.
+    # With $1,000,000 at price 100 and a 5% commission, all_in yields a fractional
+    # 9523.809... units. Rounding UP to the whole-share grid breaches capital by one
+    # lot's notional + fee; flooring does not, and the re-check on the FLOORED
+    # quantity must pass while the same check on the up-rounded quantity raises.
+    capital, price = 1_000_000.0, 100.0
+    cost = CostModel(commission=0.05)
+    raw = float(
+        size_position("all_in", capital=capital, price=price, cost_model=cost).ravel()[0]
+    )
+    floored = float(floor_to_step(raw, 1.0))
+    up_rounded = math.ceil(raw)
+    assert floored == 9523 and up_rounded == 9524
+
+    _check_affordable(capital, price, np.array([floored]), cost)  # no raise
+    with pytest.raises(ConfigError, match="exceeds available capital"):
+        _check_affordable(capital, price, np.array([float(up_rounded)]), cost)

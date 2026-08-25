@@ -693,8 +693,8 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
     fills = _fills(result)
     assert len(fills) == 2
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (1, 1.651, 60535.9, None),
-        (-1, 1.651, 60693.9, "signal"),
+        (1, 1.65, 60535.9, None),
+        (-1, 1.65, 60693.9, "signal"),
     ]
     commissions = _ledger_events(result, EventType.COMMISSION)
     fundings = _ledger_events(result, EventType.FUNDING_PAYMENT)
@@ -706,7 +706,7 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
     assert trade.exit_reason == "signal"
     # all_in now reserves the entry fee in the sized quantity (§7.1), so the entry fills
     # slightly fewer units and the net PnL/equity reflect the correctly-reserved fee.
-    assert trade.net_pnl == pytest.approx(90.6453, rel=1e-4)  # gross less fees + funding
+    assert trade.net_pnl == pytest.approx(90.5904, rel=1e-4)  # gross less fees + funding
     assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.6453, rel=1e-6)
 
 
@@ -730,17 +730,17 @@ def test_nautilus_full_loop_crypto_perp_short_pays_loss():
 
     fills = _fills(result)
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (-1, 1.651, 60535.9, None),
-        (1, 1.651, 60693.9, "signal"),
+        (-1, 1.65, 60535.9, None),
+        (1, 1.65, 60693.9, "signal"),
     ]
     (trade,) = result.trades
     assert trade.side == -1
     # all_in now reserves the entry fee in the sized quantity (§7.1), so the entry fills
     # slightly fewer units and the net PnL/equity reflect the correctly-reserved fee.
-    assert trade.net_pnl == pytest.approx(-431.0707, rel=1e-4)
+    assert trade.net_pnl == pytest.approx(-430.8096, rel=1e-4)
     assert len(_ledger_events(result, EventType.COMMISSION)) == 2
     assert len(_ledger_events(result, EventType.FUNDING_PAYMENT)) == 3
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(99568.9293, rel=1e-6)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(99569.1904, rel=1e-6)
 
 
 def test_nautilus_cash_account_short_rejection_raises_engine_error():
@@ -860,24 +860,25 @@ def test_nautilus_reference_trailing_stop_mirror():
         ),
     )
 
-    # Entry splits: all-in sizing on 100000 at ~65000 -> 1.538 BTC in two fills; the
-    # trailing stop is armed at the running peak * 0.999 and fires on the last (drop)
-    # bar — the reference journals its exit on this same 23:00 bar.
+    # Entry splits: all-in sizing on 100000 at ~65000 -> 1.537 BTC in two fills (the
+    # fee-aware all_in size is floored to the lot grid, §7.1); the trailing stop is
+    # armed at the running peak * 0.999 and fires on the last (drop) bar — the
+    # reference journals its exit on this same 23:00 bar.
     fills = _fills(result)
     assert len(fills) == 4
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
         (1, 0.25, 65000.0, None),
-        (1, 1.288, 65000.1, None),
+        (1, 1.287, 65000.1, None),
         (-1, 0.25, 65600.4, "trailing_stop"),
-        (-1, 1.288, 65600.3, "trailing_stop"),
+        (-1, 1.287, 65600.3, "trailing_stop"),
     ]
     (trade,) = result.trades
     assert trade.exit_reason == "trailing_stop"
     assert trade.entry_price == pytest.approx(65000.0837, abs=1e-3)
     assert trade.exit_price == pytest.approx(65600.4, abs=1e-1)
-    assert trade.net_pnl == pytest.approx(712.2074, rel=1e-4)
-    assert float(result.equity_curve.equity[0]) == pytest.approx(99939.8891, abs=1e-3)
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100712.2074, rel=1e-6)
+    assert trade.net_pnl == pytest.approx(711.7444, rel=1e-4)
+    assert float(result.equity_curve.equity[0]) == pytest.approx(99939.9282, abs=1e-3)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100711.7444, rel=1e-6)
 
 
 def test_nautilus_touched_take_profit_stamps_exit_reason():

@@ -43,6 +43,7 @@ __all__ = [
     "volatility_target_size",
     "all_in_size",
     "equal_weight_size",
+    "floor_to_step",
 ]
 
 SizeKind = Literal[
@@ -203,6 +204,27 @@ def _check_affordable(
             "position entry cost (notional + fees) exceeds available capital; "
             "the requested size cannot be funded"
         )
+
+
+def floor_to_step(units: ArrayLike, step: float) -> np.ndarray:
+    """Floor sized units onto the instrument's tradable lot grid (§7.1).
+
+    The adapter converts a sized float into the venue's lot size; that conversion must
+    never round **up**. An up-rounded quantity can exceed the exact size the
+    affordability guard verified (e.g. 52.37 whole-lot units flooring to 52 is safe, but a
+    venue rounding to 53 re-breaches capital by up to one lot's notional + fee — observed
+    as a small residual account shortfall and an internal engine halt). Flooring keeps the
+    final tradable quantity at or below the checked size. The tiny epsilon absorbs float
+    representation error so a value like ``3.0`` stored as ``2.9999999996`` floors to 3,
+    not 2.
+    """
+    if isinstance(step, bool) or not isinstance(step, (int, float)):
+        raise ConfigError(f"step must be a positive number; got {step!r}")
+    s = float(step)
+    if not math.isfinite(s) or s <= 0:
+        raise ConfigError(f"step must be finite and positive; got {step!r}")
+    arr = _as_float(units, "units")
+    return np.floor(arr / s + 1e-9) * s
 
 
 def fixed_fraction_size(fraction: float, *, capital: ArrayLike, price: ArrayLike) -> np.ndarray:

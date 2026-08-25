@@ -66,6 +66,7 @@ as a known divergence for the parity report.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -97,7 +98,13 @@ from ube.core.risk.exits import (
     exit_level,
     scale_out_plan,
 )
-from ube.core.risk.sizing import SizeModel, size_position
+from ube.core.risk.sizing import (
+    SizeModel,
+    _check_affordable,
+    _entry_fee_rate,
+    floor_to_step,
+    size_position,
+)
 
 __all__ = [
     "UbeActor",
@@ -524,6 +531,13 @@ class UbeActor(Strategy):  # type: ignore[misc]
         For ``volatility_target`` the vol estimate is the *entry bar's* value
         (``self._vol[idx]``) — never the whole series or its first element, which
         would silently mis-size every later entry.
+
+        For the fee-aware ``all_in`` / ``equal_weight`` sizers the lot-grid conversion
+        floors (never rounds up) and the affordability guard is re-run against the
+        **final** quantity (§7.1): ``size_position`` verifies the raw float, but
+        ``make_qty`` quantizes to the instrument's size precision and an up-rounded
+        quantity could exceed the verified size by up to one lot's notional + fee —
+        pushing the account negative and halting the engine silently.
         """
         if price <= 0.0 or self._instrument is None:
             return None
@@ -545,10 +559,42 @@ class UbeActor(Strategy):  # type: ignore[misc]
             ),
             dtype=np.float64,
         )
+        raw = float(units.ravel()[0])
+        # §7.1: for the FEE-AWARE all_in / equal_weight sizers the lot-grid conversion
+        # must floor (never round up): make_qty quantizes to the instrument's size
+        # precision and an up-rounded quantity can exceed the size the affordability
+        # guard verified by up to one lot's notional + fee — pushing the account
+        # negative and halting the engine silently. The gate is the RESOLVED entry-fee
+        # rate (not ``cost_model is not None``): the adapter always supplies a cost
+        # model (falling back to per-asset-class defaults), and a zero-rate model has
+        # no reserved fees to protect — fee-less runs keep the legacy conversion.
+        step = float(self._instrument.size_increment)
+        fee_rate = _entry_fee_rate(self._cost_model)
+        fee_aware = self._sizing.kind in ("all_in", "equal_weight") and fee_rate > 0.0
+        tradable = (
+            float(floor_to_step(raw, step))
+            if fee_aware and math.isfinite(step) and step > 0.0
+            else raw
+        )
         try:
-            return self._instrument.make_qty(float(units.ravel()[0]))
+            qty = self._instrument.make_qty(tradable)
         except ValueError:
             return None
+        final_units = float(qty.as_double())
+        if final_units <= 0.0:
+            return None
+        # Re-verify with the FINAL venue-quantized quantity (§7.1): nothing after the
+        # in-sizer guard may push the outlay past capital without a loud error.
+        # Zero-fee runs keep legacy semantics (the venue tolerates a sub-lot notional
+        # overhang; there is no fee to turn it into a shortfall).
+        if fee_rate > 0.0:
+            _check_affordable(
+                leveraged_balance,
+                price,
+                np.asarray([final_units], dtype=np.float64),
+                self._cost_model,
+            )
+        return qty
 
     def _submit_close(self, reason: str, fraction: float = 1.0, ts: int | None = None) -> None:
         """Submit a reduce-only market close of ``fraction`` of the remaining position.
