@@ -7,17 +7,15 @@ process, so a module-level singleton is sufficient (ports ``sim_nautilus.signals
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
-
 #: Per-bar signal tuple: (long_entry, long_exit, short_entry, short_exit).
-SignalTuple = Tuple[bool, bool, bool, bool]
+SignalTuple = tuple[bool, bool, bool, bool]
 
 
 class SignalRegistry:
     """Map ``ts_ns -> (le, lx, se, sx)`` for every bar published by the data client."""
 
     def __init__(self) -> None:
-        self._signals: Dict[int, SignalTuple] = {}
+        self._signals: dict[int, SignalTuple] = {}
         self.bars_published = 0
         self.bars_processed = 0
 

@@ -8,11 +8,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ube.core.config import BacktestConfig
+from ube.core.config import BacktestConfig, SignalConfig
+from ube.core.errors import InvalidSignalError
 from ube.core.instrument import Instrument
 from ube.core.ledger import trades
 from ube.core.signals import from_target
-from ube.core.errors import InvalidSignalError
 from ube.papertrading.config import PaperConfig
 from ube.papertrading.core import init, run_auto, step
 from ube.papertrading.errors import DuplicateBarError
@@ -20,9 +20,18 @@ from ube.papertrading.state import OpenPosition
 from ube.testing.synthetic import PRESETS, synthetic_bars
 
 
-def _config(asset_class: str = "crypto_perp", *, engine: str = "recording", **kw) -> PaperConfig:
+def _config(
+    asset_class: str = "crypto_perp",
+    *,
+    engine: str = "recording",
+    policy: str = "reverse",
+) -> PaperConfig:
     instrument = PRESETS[asset_class].instrument
-    return PaperConfig(base=BacktestConfig(instrument=instrument), engine=engine, **kw)
+    base = BacktestConfig(
+        instrument=instrument,
+        signal=SignalConfig(on_opposite_signal=policy),
+    )
+    return PaperConfig(base=base, engine=engine)
 
 
 def _data(asset_class: str = "crypto_perp", n_bars: int = 20):
@@ -70,7 +79,7 @@ def test_run_auto_streams_signal_fn() -> None:
         return 0
 
     state = init(cfg)
-    events = run_auto(data, fn, cfg, state=state)
+    run_auto(data, fn, cfg, state=state)
     instr = cfg.base.instrument
     closed = trades(state.ledger, instruments={instr.symbol: instr})
     assert len(closed) == 1
@@ -82,7 +91,7 @@ def test_on_opposite_signal_reverse() -> None:
     data = _data(n_bars=8)
     target = np.array([1, 1, 1, -1, -1, -1, -1, -1])
     signals = from_target(target)
-    cfg = _config(on_opposite_signal="reverse")
+    cfg = _config(policy="reverse")
     state = init(cfg)
     step(data, signals, state, cfg)
     # reverse: long then short → the long trade is closed and a short is open.
@@ -98,7 +107,7 @@ def test_on_opposite_signal_exit_only() -> None:
     data = _data(n_bars=8)
     target = np.array([1, 1, 1, -1, -1, -1, -1, -1])
     signals = from_target(target)
-    cfg = _config(on_opposite_signal="exit_only")
+    cfg = _config(policy="exit_only")
     state = init(cfg)
     step(data, signals, state, cfg)
     # exit_only: long then flat (no short opened).
@@ -112,7 +121,7 @@ def test_on_opposite_signal_ignore() -> None:
     data = _data(n_bars=8)
     target = np.array([1, 1, 1, -1, -1, -1, -1, -1])
     signals = from_target(target)
-    cfg = _config(on_opposite_signal="ignore")
+    cfg = _config(policy="ignore")
     state = init(cfg)
     step(data, signals, state, cfg)
     # ignore: the short signal is dropped; only the long trade (still open) exists.
@@ -127,7 +136,12 @@ def test_long_only_rejects_short() -> None:
     target = np.array([0, 0, 0, -1, -1, -1, -1, -1])
     signals = from_target(target)
     instr = Instrument("BTC", "crypto_spot")
-    cfg = PaperConfig(base=BacktestConfig(instrument=instr), engine="recording")
+    cfg = PaperConfig(
+        base=BacktestConfig(
+            instrument=instr, signal=SignalConfig(on_opposite_signal="reverse")
+        ),
+        engine="recording",
+    )
     state = init(cfg)
     with pytest.raises(InvalidSignalError):
         step(data, signals, state, cfg)

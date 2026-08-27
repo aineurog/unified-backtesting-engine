@@ -21,10 +21,12 @@ the ledger (deriving, never duplicating, the accounting).
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 from collections.abc import Callable
 
 import numpy as np
+import yaml
 
 from ube.core.data import MarketData
 from ube.core.errors import (
@@ -194,7 +196,9 @@ def init(config: PaperConfig, *, run_id: str = "default") -> PaperState:
         instrument_id=instrument.symbol,
         ledger=EventLedger(),
         last_processed_ns=None,
-        config_ref=run_id,
+        # Persist the resolved canonical config as YAML (plan blocker #10) so a resumed
+        # run is self-contained — the caller need not re-supply ``base`` (though it may).
+        config_ref=yaml.safe_dump(dataclasses.asdict(config.base)),
     )
 
 
@@ -233,6 +237,11 @@ def step(
     if not isinstance(config, PaperConfig):
         raise ConfigError("step expects a PaperConfig for config")
 
+    # Enforce the explicit-over-default position-change policy (§9.3/§4.7) before any
+    # backend work. This is the single source of truth for ``on_opposite_signal`` (plan
+    # blocker #1) — it lives on ``base.signal``, not on ``PaperConfig``.
+    config.base.validate(paper_trading=True)
+
     n = data.n_bars
     if signals.n_bars != n:
         raise InvalidSignalError(
@@ -247,13 +256,20 @@ def step(
 
     ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
     ts = np.asarray(ts, dtype=np.int64)
+    # Monotonicity of the *slice* guards against corrupt/out-of-order data (still a
+    # DuplicateBarError — these are effectively replays of already-seen bars).
     if not (np.diff(ts) > 0).all():
         raise DuplicateBarError("paper bars must be strictly increasing in time")
+    # Idempotency (§9.6): replay protection. A bar at or before the cursor is a
+    # stale/duplicate and must never be reprocessed.
     if state.last_processed_ns is not None and (ts <= state.last_processed_ns).any():
         raise DuplicateBarError(
             f"bar timestamp {int(ts[ts <= state.last_processed_ns][0])} is not after "
             f"last_processed_ns={state.last_processed_ns} (idempotency, §9.6)"
         )
+    # Gaps (bars skipped between runs) are *allowed* — they are inherent to streaming
+    # feeds and are not replays. The plan previously conflated gaps with stale/duplicate
+    # by requiring contiguity; that requirement is dropped (plan blocker #9).
 
     engine_cls = get_paper_engine(config.engine)
     try:
@@ -270,6 +286,10 @@ def step(
         state.ledger.append(event)
     if new_events:
         state.last_processed_ns = int(ts[-1])
+    # Persist the last close so equity can be derived on resume even though bars are not
+    # stored (plan blocker #5). Used to mark the open position to market on reload.
+    if n > 0:
+        state.last_price = float(data.close[-1])
     state.open_position = _open_position_from_ledger(state.ledger, state.instrument_id)
     return state, new_events
 
@@ -407,7 +427,7 @@ class RecordingBackend(PaperEngine):
         asset_class = instrument.asset_class if isinstance(instrument, Instrument) else ""
         cost_model = resolve_cost_model(instrument if isinstance(instrument, Instrument) else None)
         allow_short = allows_short(asset_class)
-        policy = config.on_opposite_signal
+        policy = config.base.signal.on_opposite_signal
 
         events: list[LedgerEvent] = []
         iid = state.instrument_id

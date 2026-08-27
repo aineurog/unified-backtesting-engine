@@ -11,8 +11,7 @@ The bar's 4-column signal is registered for the strategy.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from nautilus_trader.live.data_client import MarketDataClient
 from nautilus_trader.live.factories import LiveDataClientConfig, LiveDataClientFactory
@@ -31,8 +30,8 @@ BAR_SPEC = "EXTERNAL"
 class UbeDataClientConfig(LiveDataClientConfig):
     """Configuration for the ube ``MarketData``-backed data client."""
 
-    bars: List[Dict[str, Any]] = []  # each: {ts_ns, open, high, low, close, volume}
-    signal_map: Dict[int, tuple] = {}  # ts_ns -> (le, lx, se, sx)
+    bars: list[dict[str, Any]] = []  # each: {ts_ns, open, high, low, close, volume}
+    signal_map: dict[int, tuple] = {}  # ts_ns -> (le, lx, se, sx)
     bar_type: str = ""
     instrument_id: str = ""
     venue: str = ""
@@ -90,7 +89,7 @@ class UbeDataClient(MarketDataClient):  # type: ignore[misc]
         if get_ready_event() is not None:
             try:
                 await asyncio.wait_for(get_ready_event().wait(), timeout=5.0)
-            except asyncio.TimeoutError:  # pragma: no cover - defensive
+            except TimeoutError:  # pragma: no cover - defensive
                 self._log.warning("Timed out waiting for strategy subscription")
         await self._drain()
         self._log.info("Single-shot ube bar drain complete")
@@ -133,7 +132,7 @@ class UbeDataClient(MarketDataClient):  # type: ignore[misc]
         topic = f"data.{type(bar).__name__}.{self._venue}.{self._instrument_id.symbol}"
         self._msgbus.publish(topic=topic, msg=bar)
 
-    def _to_bar(self, ts_ns: int, row: Dict[str, Any]) -> Bar:
+    def _to_bar(self, ts_ns: int, row: dict[str, Any]) -> Bar:
         instr = self._instrument
         pp = instr.price_precision
         sp = instr.size_precision

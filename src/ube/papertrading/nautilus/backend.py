@@ -11,7 +11,6 @@ on nautilus-trader (lazy import, A5).
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -42,12 +41,11 @@ class NautilusPaperEngine(PaperEngine):
     def execute(
         self,
         *,
-        state: "PaperState",
-        data: "MarketData",
-        signals: "Signals",
-        config: "PaperConfig",
+        state: PaperState,
+        data: MarketData,
+        signals: Signals,
+        config: PaperConfig,
     ) -> list[LedgerEvent]:
-        from nautilus_trader.model.enums import OrderStatus
 
         canonical = config.base.instrument
         asset_class = canonical.asset_class if isinstance(canonical, Instrument) else ""
@@ -107,7 +105,7 @@ class NautilusPaperEngine(PaperEngine):
                 sizing=config.base.risk.sizing,
                 cost_model=cost_model,
                 no_short=no_short,
-                on_opposite_signal=config.on_opposite_signal,
+                on_opposite_signal=str(config.base.signal.on_opposite_signal),
                 balance=balance,
             )
             strategy = UbePaperStrategy(config=strat_cfg)
@@ -122,6 +120,7 @@ class NautilusPaperEngine(PaperEngine):
                 venue=venue,
                 leverage=leverage,
                 strategy=strategy,
+                overrides=overrides,
             )
 
             SIGNAL_REGISTRY.clear()

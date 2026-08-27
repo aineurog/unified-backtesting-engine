@@ -11,26 +11,26 @@ engine overrides.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 from ube.core.config import BacktestConfig
 
 __all__ = ["PaperConfig"]
-
-OnOppositeSignal = Literal["reverse", "exit_only", "ignore"]
 
 
 @dataclass(frozen=True)
 class PaperConfig:
     """Configuration for a paper-trading session (§9.1, §9.3, §9.5).
 
+    The position-change policy (§9.3 ``on_opposite_signal``) lives on the canonical
+    :class:`~ube.core.config.BacktestConfig.signal` — it is *not* re-declared here (single
+    source of truth, plan blocker #1). :meth:`BacktestConfig.validate(paper_trading=True)`
+    enforces that it is declared before a paper run.
+
     Attributes:
         base: The canonical :class:`~ube.core.config.BacktestConfig` (instrument,
-            risk/exits, cost model, engine overrides). Engine is ``"nautilus"`` for the
-            nautilus backend, implied here and not re-stored.
-        on_opposite_signal: Position-change policy (§9.3) when a signal opposes the open
-            position — ``reverse`` (close + reopen in the new direction), ``exit_only``
-            (close, do not reopen), or ``ignore`` (hold the position).
+            risk/exits, cost model, engine overrides, and the ``signal`` policy). Engine is
+            ``"nautilus"`` for the nautilus backend, implied here and not re-stored.
         state_path: sqlite path for :class:`PaperState` persistence (§9.5). ``None`` means
             the run is ephemeral (no resume).
         starting_balance: Convenience override of the venue starting balance; folded into
@@ -41,17 +41,11 @@ class PaperConfig:
     """
 
     base: BacktestConfig
-    on_opposite_signal: OnOppositeSignal = "reverse"
     state_path: str | None = None
     starting_balance: float | None = None
     engine: str = "nautilus"
 
     def __post_init__(self) -> None:
-        if self.on_opposite_signal not in ("reverse", "exit_only", "ignore"):
-            raise ValueError(
-                f"on_opposite_signal must be reverse/exit_only/ignore; "
-                f"got {self.on_opposite_signal!r}"
-            )
         if self.starting_balance is not None and self.starting_balance <= 0:
             raise ValueError("starting_balance must be > 0")
         # Fold the convenience balance into the engine overrides so the backend sees a

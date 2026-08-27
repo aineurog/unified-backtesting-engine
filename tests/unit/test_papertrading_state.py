@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
-from ube.core.ledger import EventLedger, EventType, LedgerEvent
 from ube.core.errors import StateCorruptionError
+from ube.core.ledger import EventLedger, EventType, LedgerEvent
 from ube.papertrading.state import OpenPosition, PaperState
 
 
@@ -14,7 +13,15 @@ def _sample_state() -> PaperState:
     ledger = EventLedger(
         [
             LedgerEvent(EventType.FILL, 1_000, "BTC-USDT", side=1, quantity=1.0, price=100.0),
-            LedgerEvent(EventType.FILL, 2_000, "BTC-USDT", side=-1, quantity=1.0, price=110.0, exit_reason="signal"),
+            LedgerEvent(
+                EventType.FILL,
+                2_000,
+                "BTC-USDT",
+                side=-1,
+                quantity=1.0,
+                price=110.0,
+                exit_reason="signal",
+            ),
             LedgerEvent(EventType.COMMISSION, 1_000, "BTC-USDT", amount=0.05, currency="USDT"),
         ]
     )
@@ -22,7 +29,9 @@ def _sample_state() -> PaperState:
         instrument_id="BTC-USDT",
         ledger=ledger,
         last_processed_ns=2_000,
-        open_position=OpenPosition(side=1, quantity=1.0, entry_price=100.0, entry_ns=1_000, trade_id="t1"),
+        open_position=OpenPosition(
+            side=1, quantity=1.0, entry_price=100.0, entry_ns=1_000, trade_id="t1"
+        ),
         pending_levels={"t1": {"tp": 120.0}},
         signal_fn_state={"targets": [1, 1, 0]},
         config_ref="run-1",

@@ -32,8 +32,19 @@ def build_node(
     venue: str,
     leverage: float = 1.0,
     strategy=None,
+    overrides: dict[str, Any] | None = None,
 ) -> TradingNode:
-    """Assemble a :class:`TradingNode` driving the ube data client + sandbox exec client."""
+    """Assemble a :class:`TradingNode` driving the ube data client + sandbox exec client.
+
+    ``account_type`` / ``oms_type`` have a single source of truth: the
+    :class:`~ube.adapters.nautilus_adapter.overrides.NautilusEngineOverrides` (plan
+    blocker #11). They are read from ``overrides`` (lowercase ``"margin"/"cash"`` and
+    ``"NETTING"/"HEDGING"``) and mapped to the sandbox's uppercase enum spellings.
+    """
+    overrides = overrides or {}
+    _acct = overrides.get("account_type", "margin")
+    account_type = "MARGIN" if _acct == "margin" else "CASH"
+    oms_type = overrides.get("oms_type", "NETTING")
     data_config = UbeDataClientConfig(
         bars=bars,
         signal_map=signal_map,
@@ -45,8 +56,8 @@ def build_node(
         venue=venue,
         starting_balances=[f"{balance} {quote}"],
         base_currency=quote,
-        oms_type="NETTING",
-        account_type="MARGIN",
+        oms_type=oms_type,
+        account_type=account_type,
         default_leverage=Decimal(str(leverage)),
         book_type="L1_MBP",
         frozen_account=False,

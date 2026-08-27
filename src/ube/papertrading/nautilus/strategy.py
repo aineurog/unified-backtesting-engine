@@ -14,16 +14,16 @@ from __future__ import annotations
 
 from typing import Any
 
-import pandas as pd
+import numpy as np
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
+from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.trading.strategy import Strategy
 
 from ube.core.ledger import EventType, LedgerEvent
-from ube.core.risk.sizing import SizeModel, floor_to_step, size_position
+from ube.core.risk.sizing import floor_to_step, size_position
 from ube.papertrading.core import decide_action
 
 from .bridge import commission_event, fill_event, position_change_event
@@ -167,24 +167,28 @@ class UbePaperStrategy(Strategy):
         return 1.0
 
     def _size_qty(self, price: float):
-        if self.config.sizing is None or price is None or price <= 0:
-            return self._instrument.make_qty(0.0)
-        units = size_position(
+        instr = self._instrument
+        if instr is None or self.config.sizing is None or price is None or price <= 0:
+            return instr.make_qty(0.0) if instr is not None else None
+        raw = size_position(
             self.config.sizing,
             capital=self.config.balance,
             price=price,
             cost_model=self.config.cost_model,
         )
+        # ``size_position`` returns a 0-d ``ndarray`` (plan blocker #13); reduce to a plain
+        # float via ``.item()`` so ``make_qty`` / ``floor_to_step`` get a scalar.
+        scalar = float(np.asarray(raw).item())
         step = self._lot_step()
-        units = floor_to_step(units, step)
-        return self._instrument.make_qty(float(units))
+        stepped = floor_to_step(scalar, step)
+        return instr.make_qty(float(stepped))
 
     def _submit_open(self, desired: int, price: float | None) -> None:
         if self._instrument is None or price is None:
             return
         side = OrderSide.BUY if desired == 1 else OrderSide.SELL
         qty = self._size_qty(price)
-        if float(qty.as_double()) <= 0.0:
+        if qty is None or float(qty.as_double()) <= 0.0:
             self.log.warning(f"Skipped open {side}: non-positive quantity")
             return
         order = self.order_factory.market(

@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS paper_state (
     run_id           TEXT PRIMARY KEY,
     instrument_id    TEXT NOT NULL,
     last_processed_ns INTEGER,
+    last_price       REAL,
     ledger           TEXT NOT NULL,
     open_position    TEXT,
     pending_levels   TEXT,
@@ -63,8 +64,8 @@ CREATE TABLE IF NOT EXISTS paper_state (
 
 _INSERT_SQL = (
     "INSERT OR REPLACE INTO paper_state "
-    "(run_id, instrument_id, last_processed_ns, ledger, open_position, "
-    "pending_levels, signal_fn_state, config_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    "(run_id, instrument_id, last_processed_ns, last_price, ledger, open_position, "
+    "pending_levels, signal_fn_state, config_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -117,6 +118,9 @@ class PaperState:
         ledger: The append-only :class:`~ube.core.ledger.EventLedger` — the audit trail.
         last_processed_ns: The idempotency cursor; the timestamp of the last bar fed
             (``None`` before any bar, §9.6).
+        last_price: The close of the last processed bar. Persisted so that equity can be
+            derived on resume even though bars are not stored (plan blocker #5) — the open
+            position is marked-to-market with this price.
         open_position: The currently-open trade, or ``None`` when flat.
         pending_levels: Per-open-trade TP/SL (and scale-out) levels the backend needs to
             rebuild working orders on resume.
@@ -131,6 +135,7 @@ class PaperState:
         instrument_id: str,
         ledger: EventLedger,
         last_processed_ns: int | None = None,
+        last_price: float | None = None,
         open_position: OpenPosition | None = None,
         pending_levels: dict[str, Any] | None = None,
         signal_fn_state: dict[str, Any] | None = None,
@@ -139,6 +144,7 @@ class PaperState:
         self.instrument_id = instrument_id
         self.ledger = ledger
         self.last_processed_ns = last_processed_ns
+        self.last_price = last_price
         self.open_position = open_position
         self.pending_levels: dict[str, Any] = pending_levels if pending_levels is not None else {}
         self.signal_fn_state: dict[str, Any] = (
@@ -164,6 +170,7 @@ class PaperState:
                     run_id,
                     self.instrument_id,
                     self.last_processed_ns,
+                    self.last_price,
                     _ledger_to_json(self.ledger),
                     _json(asdict(self.open_position)) if self.open_position else None,
                     _json(self.pending_levels),
@@ -188,8 +195,9 @@ class PaperState:
         try:
             conn = sqlite3.connect(str(path), isolation_level=None)
             row = conn.execute(
-                "SELECT instrument_id, last_processed_ns, ledger, open_position, "
-                "pending_levels, signal_fn_state, config_ref FROM paper_state "
+                "SELECT instrument_id, last_processed_ns, last_price, ledger, "
+                "open_position, pending_levels, signal_fn_state, config_ref "
+                "FROM paper_state "
                 "WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
@@ -199,7 +207,16 @@ class PaperState:
         if row is None:
             raise StateCorruptionError(f"no paper state for run_id={run_id!r} in {path}")
 
-        instrument_id, last_ns, ledger_text, open_text, pending_text, sfn_text, config_ref = row
+        (
+            instrument_id,
+            last_ns,
+            last_price,
+            ledger_text,
+            open_text,
+            pending_text,
+            sfn_text,
+            config_ref,
+        ) = row
         ledger = _ledger_from_json(ledger_text)
         open_position = None
         if open_text is not None:
@@ -211,6 +228,7 @@ class PaperState:
             instrument_id=instrument_id,
             ledger=ledger,
             last_processed_ns=last_ns,
+            last_price=last_price,
             open_position=open_position,
             pending_levels=_from_json(pending_text, {}),
             signal_fn_state=_from_json(sfn_text, {}),

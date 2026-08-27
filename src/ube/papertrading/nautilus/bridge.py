@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 def fill_event(
-    fill: "OrderFilled",
+    fill: OrderFilled,
     instrument_id: str,
     *,
     exit_reason: str | None,
@@ -42,7 +42,7 @@ def fill_event(
 
 
 def commission_event(
-    fill: "OrderFilled",
+    fill: OrderFilled,
     instrument_id: str,
     cost_model,
 ) -> LedgerEvent | None:
@@ -60,7 +60,7 @@ def commission_event(
 
 
 def position_change_event(
-    fill: "OrderFilled",
+    fill: OrderFilled,
     instrument_id: str,
     *,
     side: int,
