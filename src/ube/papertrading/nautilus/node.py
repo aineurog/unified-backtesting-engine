@@ -14,7 +14,7 @@ from typing import Any
 from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
 from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactory
 from nautilus_trader.config import LoggingConfig
-from nautilus_trader.live.node import TradingNode, TradingNodeConfig
+from nautilus_trader.live.node import TradingNode, TradingNodeConfig  # type: ignore[attr-defined]
 from nautilus_trader.model.enums import OrderStatus
 
 from .data_client import UbeDataClient, UbeDataClientConfig, UbeDataClientFactory
@@ -23,15 +23,15 @@ from .signals import SIGNAL_REGISTRY
 
 def build_node(
     *,
-    instrument,
-    bars: list[dict],
-    signal_map: dict[int, tuple],
+    instrument: Any,
+    bars: list[dict[str, Any]],
+    signal_map: dict[int, tuple[Any, ...]],
     bar_type: str,
     balance: float,
     quote: str,
     venue: str,
     leverage: float = 1.0,
-    strategy=None,
+    strategy: Any | None = None,
     overrides: dict[str, Any] | None = None,
 ) -> TradingNode:
     """Assemble a :class:`TradingNode` driving the ube data client + sandbox exec client.
@@ -93,6 +93,7 @@ def build_node(
 def run_node(node: TradingNode) -> None:
     """Run the node until the data client finishes, settle fills, then stop (one-shot)."""
     loop = node.get_event_loop()
+    assert loop is not None
 
     async def _settle() -> None:
         transient = {OrderStatus.INITIALIZED, OrderStatus.SUBMITTED}

@@ -26,7 +26,7 @@ import importlib
 from collections.abc import Callable
 
 import numpy as np
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from ube.core.data import MarketData
 from ube.core.errors import (
@@ -427,7 +427,7 @@ class RecordingBackend(PaperEngine):
         asset_class = instrument.asset_class if isinstance(instrument, Instrument) else ""
         cost_model = resolve_cost_model(instrument if isinstance(instrument, Instrument) else None)
         allow_short = allows_short(asset_class)
-        policy = config.base.signal.on_opposite_signal
+        policy = config.base.signal.on_opposite_signal or "reverse"
 
         events: list[LedgerEvent] = []
         iid = state.instrument_id

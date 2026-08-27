@@ -11,12 +11,12 @@ import pytest
 
 nautilus = pytest.importorskip("nautilus_trader")
 
-from ube.core.config import BacktestConfig, SignalConfig
-from ube.core.ledger import EventType, trades
-from ube.core.signals import from_target
-from ube.papertrading import init, step
-from ube.papertrading.config import PaperConfig
-from ube.testing.synthetic import PRESETS, synthetic_bars
+from ube.core.config import BacktestConfig, SignalConfig  # noqa: E402
+from ube.core.ledger import EventType, trades  # noqa: E402
+from ube.core.signals import from_target  # noqa: E402
+from ube.papertrading import init, step  # noqa: E402
+from ube.papertrading.config import PaperConfig  # noqa: E402
+from ube.testing.synthetic import PRESETS, synthetic_bars  # noqa: E402
 
 
 def _config(asset_class: str = "crypto_perp", **kw) -> PaperConfig:
@@ -30,8 +30,9 @@ def _config(asset_class: str = "crypto_perp", **kw) -> PaperConfig:
 
 def test_crypto_perp_entry_then_exit() -> None:
     data = synthetic_bars(PRESETS["crypto_perp"], n_bars=10, seed=1)
-    # long entry for 5 bars, then a long-exit signal (one closed long trade).
-    target = np.array([1, 1, 1, 1, 1, -1, -1, -1, -1, -1])
+    # long entry for 5 bars, then a long-exit signal (one closed long trade). The exit is
+    # to FLAT (0), not a reverse to short, so exactly two fills (entry + exit) occur.
+    target = np.array([1, 1, 1, 1, 1, 0, 0, 0, 0, 0])
     signals = from_target(target)
     cfg = _config()
     state = init(cfg)
@@ -44,15 +45,25 @@ def test_crypto_perp_entry_then_exit() -> None:
     assert closed[0].side == 1
     assert closed[0].exit_reason == "signal"
 
-    kinds = [e.kind for e in events]
+    kinds = [e.event_type for e in events]
     assert EventType.FILL in kinds
     assert EventType.COMMISSION in kinds
     assert EventType.POSITION_CHANGE in kinds
     # entry fill then exit fill
-    fills = [e for e in events if e.kind == EventType.FILL]
+    fills = [e for e in events if e.event_type == EventType.FILL]
     assert len(fills) == 2
     assert fills[0].exit_reason is None
     assert fills[1].exit_reason == "signal"
+
+    # §9.4 fill-timing parity: each market order is matched to the bar it was submitted
+    # against, so the fill price equals that bar's close. The entry is on bar 0 and the
+    # exit on bar 5 (the long-exit signal); a mismatch here would mean the sandbox matched
+    # the order to the wrong (later) bar.
+    assert abs(fills[0].price - float(data.close[0])) < 1e-6
+    assert abs(fills[1].price - float(data.close[5])) < 1e-6
+    hist_ts = data.timestamps.as_unit("ns").asi8
+    assert fills[0].timestamp == int(hist_ts[0])  # ledger stays on historical timeline
+    assert fills[1].timestamp == int(hist_ts[5])
 
 
 def test_crypto_perp_no_position_when_flat_signal() -> None:
@@ -66,5 +77,5 @@ def test_crypto_perp_no_position_when_flat_signal() -> None:
     _, events = step(data, signals, state, cfg)
     instr = cfg.base.instrument
     assert trades(state.ledger, instruments={instr.symbol: instr}) == ()
-    assert all(e.kind != EventType.FILL for e in events)
+    assert all(e.event_type != EventType.FILL for e in events)
     assert state.open_position is None

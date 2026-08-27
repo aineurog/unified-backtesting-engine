@@ -13,8 +13,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from nautilus_trader.live.data_client import MarketDataClient
-from nautilus_trader.live.factories import LiveDataClientConfig, LiveDataClientFactory
+from nautilus_trader.live.data_client import MarketDataClient  # type: ignore[attr-defined]
+from nautilus_trader.live.factories import (  # type: ignore[attr-defined]
+    LiveDataClientConfig,
+    LiveDataClientFactory,
+)
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import Instrument
@@ -27,11 +30,14 @@ BAR_AGGREGATION = "LAST"
 BAR_SPEC = "EXTERNAL"
 
 
-class UbeDataClientConfig(LiveDataClientConfig):
+class UbeDataClientConfig(LiveDataClientConfig):  # type: ignore[misc]
     """Configuration for the ube ``MarketData``-backed data client."""
 
     bars: list[dict[str, Any]] = []  # each: {ts_ns, open, high, low, close, volume}
-    signal_map: dict[int, tuple] = {}  # ts_ns -> (le, lx, se, sx)
+    # ts_ns -> (le, lx, se, sx, historical_ts_ns). Bar timestamps are live-clock (see
+    # ``backend.execute``); the historical ts is forwarded so the strategy can tag the
+    # ube ledger on the test-clock timeline.
+    signal_map: dict[int, tuple[Any, ...]] = {}
     bar_type: str = ""
     instrument_id: str = ""
     venue: str = ""
@@ -47,9 +53,9 @@ class UbeDataClient(MarketDataClient):  # type: ignore[misc]
         loop: asyncio.AbstractEventLoop,
         client_id: ClientId,
         venue: Venue | None,
-        msgbus,
-        cache,
-        clock,
+        msgbus: Any,
+        cache: Any,
+        clock: Any,
         config: UbeDataClientConfig,
     ) -> None:
         super().__init__(
@@ -66,7 +72,7 @@ class UbeDataClient(MarketDataClient):  # type: ignore[misc]
         self._instrument_id = InstrumentId.from_str(config.instrument_id)
         self._venue = config.venue
         self._instrument: Instrument | None = None
-        self._poll_task: asyncio.Task | None = None
+        self._poll_task: asyncio.Task[Any] | None = None
         if type(self).DONE is None:
             type(self).DONE = asyncio.Event()
 
@@ -113,20 +119,34 @@ class UbeDataClient(MarketDataClient):  # type: ignore[misc]
             for row in self._bars:
                 ts_ns = int(row["ts_ns"])
                 bar = self._to_bar(ts_ns, row)
-                self._handle_data(bar)
-                self._publish_to_venue(bar)
-                le, lx, se, sx = self._signal_map.get(
-                    ts_ns, (False, False, False, False)
+                # Register the signal BEFORE publishing the bar: ``_handle_data`` triggers
+                # the strategy's ``on_bar``, which reads ``SIGNAL_REGISTRY.at(ts_ns)``. If the
+                # signal were registered after, ``on_bar`` would see the previous bar's (or a
+                # default) signal and the strategy would act on the wrong bar.
+                le, lx, se, sx, hist = self._signal_map.get(
+                    ts_ns, (False, False, False, False, 0)
                 )
-                SIGNAL_REGISTRY.register(ts_ns, le, lx, se, sx)
+                SIGNAL_REGISTRY.register(ts_ns, le, lx, se, sx, hist)
+                self._handle_data(bar)
+                # Flush the event loop so the strategy's ``on_bar`` (and the resulting
+                # ``submit_order`` -> sandbox exchange) completes *before* this bar is
+                # published to the venue. The sandbox matches an order against the bar
+                # being processed, so the order must be in the exchange when its bar is
+                # published — otherwise the async latency lets several later bars through
+                # first and the fill lands on the wrong (later) bar. A few yields covers
+                # the message-bus + execution-client hops.
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                self._publish_to_venue(bar)
                 await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive
             self._log.error(f"UbeDataClient drain failed: {exc}")
         finally:
-            if type(self).DONE is not None and not type(self).DONE.is_set():
-                type(self).DONE.set()
+            done = type(self).DONE
+            if done is not None and not done.is_set():
+                done.set()
 
     def _publish_to_venue(self, bar: Bar) -> None:
         topic = f"data.{type(bar).__name__}.{self._venue}.{self._instrument_id.symbol}"
@@ -134,6 +154,7 @@ class UbeDataClient(MarketDataClient):  # type: ignore[misc]
 
     def _to_bar(self, ts_ns: int, row: dict[str, Any]) -> Bar:
         instr = self._instrument
+        assert instr is not None
         pp = instr.price_precision
         sp = instr.size_precision
         return Bar(
@@ -148,20 +169,20 @@ class UbeDataClient(MarketDataClient):  # type: ignore[misc]
         )
 
     # -- instrument serving ----------------------------------------------- #
-    def request_instrument(self, request) -> None:
+    def request_instrument(self, request: Any) -> None:
         self._handle_instrument(self._instrument_cached(), None, None, None, None)
 
-    def request_instruments(self, request) -> None:
+    def request_instruments(self, request: Any) -> None:
         self._handle_instruments(
             request.venue, [self._instrument_cached()], None, None, None, None
         )
 
-    def subscribe_bars(self, command) -> None:
+    def subscribe_bars(self, command: Any) -> None:
         # Push-based client: subscription is recorded by the DataEngine; we publish bars
         # directly via ``_handle_data`` + the venue topic. Nothing to do remotely.
         return None
 
-    def unsubscribe_bars(self, command) -> None:
+    def unsubscribe_bars(self, command: Any) -> None:
         return None
 
 
@@ -169,7 +190,14 @@ class UbeDataClientFactory(LiveDataClientFactory):
     """Node factory creating the ube ``MarketData``-backed data client."""
 
     @staticmethod
-    def create(loop, name: str, config, msgbus, cache, clock):
+    def create(
+        loop: Any,
+        name: str,
+        config: Any,
+        msgbus: Any,
+        cache: Any,
+        clock: Any,
+    ) -> UbeDataClient:
         return UbeDataClient(
             loop=loop,
             client_id=ClientId(f"{name}-001"),
@@ -178,7 +206,7 @@ class UbeDataClientFactory(LiveDataClientFactory):
             cache=cache,
             clock=clock,
             config=config,
-        )  # type: ignore[call-arg]
+        )
 
 
 __all__ = ["UbeDataClient", "UbeDataClientConfig", "UbeDataClientFactory"]

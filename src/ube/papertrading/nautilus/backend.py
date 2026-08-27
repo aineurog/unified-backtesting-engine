@@ -11,7 +11,9 @@ on nautilus-trader (lazy import, A5).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import asyncio
+import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -20,7 +22,7 @@ from ube.adapters.nautilus_adapter.instrument_map import build_instrument
 from ube.core.cost import resolve_cost_model
 from ube.core.errors import EngineError
 from ube.core.instrument import Instrument, allows_short
-from ube.core.ledger import LedgerEvent
+from ube.core.ledger import EventType, LedgerEvent
 from ube.papertrading.core import PaperEngine, register_paper_engine
 
 from .node import build_node, run_node
@@ -51,6 +53,15 @@ class NautilusPaperEngine(PaperEngine):
         asset_class = canonical.asset_class if isinstance(canonical, Instrument) else ""
         overrides = dict(config.base.engine_overrides) if config.base.engine_overrides else {}
         no_short = not allows_short(asset_class)
+        # Nautilus closes its event loop on ``node.dispose()``; a second ``step`` in the same
+        # process (e.g. a second integration test) would otherwise hit "Event loop is closed".
+        # Give every run a fresh live loop before the node is built.
+        try:
+            _loop = asyncio.get_event_loop()
+        except RuntimeError:
+            _loop = None
+        if _loop is None or _loop.is_closed():
+            asyncio.set_event_loop(asyncio.new_event_loop())
         try:
             build = build_instrument(canonical, overrides=overrides)
             instrument = build.instrument
@@ -66,13 +77,24 @@ class NautilusPaperEngine(PaperEngine):
             ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
             ts = np.asarray(ts, dtype=np.int64)
             n = data.n_bars
-            bars: list[dict[str, Any]] = []
-            signal_map: dict[int, tuple] = {}
+            period_ns = int(np.median(np.diff(ts))) if n > 1 else 60_000_000_000
+            # Bars are published to the sandbox with **live-clock** timestamps. The sandbox
+            # execution client advances its own (Test) clock by each bar's ``ts_init`` and
+            # matches an order only when the clock has passed the order's ``ts_init`` — and
+            # the order factory stamps orders with a *read-only* live clock we cannot
+            # override (it's a C-level slot in nautilus 1.231). So the bars must sit on the
+            # live timeline, strictly after "now", for every order to match the bar it was
+            # submitted against. The historical (test-clock) ts is preserved separately via
+            # ``signal_map`` so the ledger/trades stay comparable (§9.4).
+            live_base = int(time.time() * 1_000_000_000) + 10_000_000_000  # +10s headroom
+            bars = []
+            signal_map = {}
             for i in range(n):
-                t = int(ts[i])
+                t_live = int(live_base + i * period_ns)
+                t_hist = int(ts[i])
                 bars.append(
                     {
-                        "ts_ns": t,
+                        "ts_ns": t_live,
                         "open": float(data.open[i]),
                         "high": float(data.high[i]),
                         "low": float(data.low[i]),
@@ -80,14 +102,14 @@ class NautilusPaperEngine(PaperEngine):
                         "volume": float(data.volume[i]),
                     }
                 )
-                signal_map[t] = (
+                signal_map[t_live] = (
                     bool(signals.long_entry[i]),
                     bool(signals.long_exit[i]),
                     bool(signals.short_entry[i]),
                     bool(signals.short_exit[i]),
+                    t_hist,
                 )
 
-            period_ns = int(np.median(np.diff(ts))) if n > 1 else 60_000_000_000
             bar_type = build_bar_type(instrument_id, period_ns)
 
             balance = float(
@@ -125,7 +147,22 @@ class NautilusPaperEngine(PaperEngine):
 
             SIGNAL_REGISTRY.clear()
             run_node(node)
-            return list(strategy.events)
+            events = list(strategy.events)
+            # Starting balance booked as a cash inflow at the first bar boundary (§4.6
+            # step 4 — the cash leg of the equity curve). Emitted once per session (only
+            # on the first ``step`` slice, when the cursor has not advanced yet).
+            if state.last_processed_ns is None and len(ts) > 0:
+                events.insert(
+                    0,
+                    LedgerEvent(
+                        EventType.CASH_MOVEMENT,
+                        int(ts[0]),
+                        strategy._iid,
+                        amount=balance,
+                        currency=quote,
+                    ),
+                )
+            return events
         except Exception as exc:  # pragma: no cover - defensive
             raise EngineError(
                 f"nautilus paper backend failed: {exc}"

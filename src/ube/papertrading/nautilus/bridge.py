@@ -8,7 +8,7 @@ engines (nautilus plan A5.3 / §9.4). Per-fill ordering here matches the recordi
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ube.core.cost import fill_cost
 from ube.core.ledger import EventType, LedgerEvent
@@ -22,9 +22,15 @@ def fill_event(
     instrument_id: str,
     *,
     exit_reason: str | None,
+    ts_override: int | None = None,
 ) -> LedgerEvent:
-    """A single ube ``FILL`` ledger event from a nautilus ``OrderFilled``."""
-    t = int(fill.ts_init)
+    """A single ube ``FILL`` ledger event from a nautilus ``OrderFilled``.
+
+    ``ts_override`` lets the caller supply the historical (test-clock) timestamp: the
+    sandbox bars carry live-clock timestamps (so orders match correctly), but the ube
+    ledger must stay on the test-clock timeline for §9.4 comparability.
+    """
+    t = int(ts_override) if ts_override is not None else int(fill.ts_init)
     qty = float(fill.last_qty.as_double())
     price = float(fill.last_px.as_double())
     notional = qty * price
@@ -41,13 +47,34 @@ def fill_event(
     )
 
 
+def cash_movement_event(
+    instrument_id: str,
+    *,
+    amount: float,
+    currency: str,
+    ts_override: int | None = None,
+) -> LedgerEvent:
+    """A ube ``CASH_MOVEMENT`` ledger event — the cash leg of the equity curve (§4.6 step 4).
+
+    ``amount`` is signed (inflow positive); a buy pays notional out of the account
+    (``amount = -side * notional``), a sell pays it back in. Mirrors the recording backend's
+    cash fold so the paper ledger is self-financing and comparable to mode A (§9.4).
+    """
+    t = int(ts_override) if ts_override is not None else 0
+    return LedgerEvent(
+        EventType.CASH_MOVEMENT, t, instrument_id, amount=amount, currency=currency
+    )
+
+
 def commission_event(
     fill: OrderFilled,
     instrument_id: str,
-    cost_model,
+    cost_model: Any,
+    *,
+    ts_override: int | None = None,
 ) -> LedgerEvent | None:
     """A ube ``COMMISSION`` ledger event computed via ``core.cost.fill_cost``."""
-    t = int(fill.ts_init)
+    t = int(ts_override) if ts_override is not None else int(fill.ts_init)
     qty = float(fill.last_qty.as_double())
     price = float(fill.last_px.as_double())
     notional = qty * price
@@ -65,9 +92,10 @@ def position_change_event(
     *,
     side: int,
     position_after: float,
+    ts_override: int | None = None,
 ) -> LedgerEvent:
     """A ube ``POSITION_CHANGE`` ledger event after a fill resolved the net side."""
-    t = int(fill.ts_init)
+    t = int(ts_override) if ts_override is not None else int(fill.ts_init)
     return LedgerEvent(
         EventType.POSITION_CHANGE,
         t,
@@ -77,4 +105,9 @@ def position_change_event(
     )
 
 
-__all__ = ["fill_event", "commission_event", "position_change_event"]
+__all__ = [
+    "fill_event",
+    "cash_movement_event",
+    "commission_event",
+    "position_change_event",
+]
