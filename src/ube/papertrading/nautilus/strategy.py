@@ -46,6 +46,8 @@ class UbePaperConfig(StrategyConfig):  # type: ignore[misc]
     no_short: bool = False
     on_opposite_signal: str = "reverse"
     balance: float = 0.0
+    leverage: float = 1.0
+    multiplier: float = 1.0
     open_position: Any = None
 
 
@@ -65,7 +67,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._bar_type = BarType.from_str(config.bar_type) if config.bar_type else None
         # Bars are published to the sandbox with live-clock timestamps (so the sandbox's
         # own execution clock advances past the read-only live order timestamps and matches
-        # each order to its own bar — we cannot override the order clock in nautilus 1.231).
+        # each order to its own bar — we cannot override the order clock in nautilus 1.221).
         # The ube ledger must stay on the *historical* (test-clock) timeline, so every
         # ``LedgerEvent`` is tagged with the historical ts looked up from ``SIGNAL_REGISTRY``
         # (keyed by the bar's live ts). ``_hist_ts`` is that historical ts for the bar
@@ -78,6 +80,12 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._close_order_ids: set[Any] = set()
         self._events: list[LedgerEvent] = []
         self._quote = "USDT"
+        self._leverage = float(getattr(config, "leverage", 1.0) or 1.0)
+        self._multiplier = float(getattr(config, "multiplier", 1.0) or 1.0)
+        # Live cash balance for fee-aware sizing — mirrors backtest's
+        # account.balance_total() * leverage (starts at balance, then
+        # updated on each fill's cash leg + commission).
+        self._current_balance = float(config.balance)
 
     # -- lifecycle --------------------------------------------------------- #
     def on_start(self) -> None:
@@ -177,7 +185,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         side = 1 if event.is_buy else -1
         qty = float(event.last_qty.as_double())
         price = float(event.last_px.as_double())
-        notional = qty * price
+        notional = qty * price * self._multiplier
         # Cash leg of the fill (§4.6): a buy pays the notional out of the account, a sell
         # pays it back in. Together with the starting-balance cash_movement and the
         # mark-to-market of open positions this keeps the equity curve self-financing.
@@ -190,13 +198,27 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             )
         )
         self._events.append(
-            fill_event(event, self._iid, exit_reason=exit_reason, ts_override=hist)
+            fill_event(
+                event,
+                self._iid,
+                exit_reason=exit_reason,
+                ts_override=hist,
+                multiplier=self._multiplier,
+            )
         )
         comm = commission_event(
-            event, self._iid, self.config.cost_model, ts_override=hist
+            event,
+            self._iid,
+            self.config.cost_model,
+            ts_override=hist,
+            multiplier=self._multiplier,
+            currency=self._quote,
         )
+        # Update live balance for next sizing (mirrors account.balance_total).
+        self._current_balance += -side * notional
         if comm is not None:
             self._events.append(comm)
+            self._current_balance -= float(comm.amount)  # type: ignore[arg-type]
         self._events.append(
             position_change_event(
                 event,
@@ -228,9 +250,12 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         instr = self._instrument
         if instr is None or self.config.sizing is None or price is None or price <= 0:
             return instr.make_qty(0.0) if instr is not None else None
+        # Mirror backtest's account.balance_total() * leverage — paper uses
+        # live cash balance (updated on each fill) scaled by leverage.
+        capital = self._current_balance * self._leverage
         raw = size_position(
             self.config.sizing,
-            capital=self.config.balance,
+            capital=capital,
             price=price,
             cost_model=self.config.cost_model,
         )

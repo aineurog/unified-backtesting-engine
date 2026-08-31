@@ -23,17 +23,20 @@ def fill_event(
     *,
     exit_reason: str | None,
     ts_override: int | None = None,
+    multiplier: float = 1.0,
 ) -> LedgerEvent:
     """A single ube ``FILL`` ledger event from a nautilus ``OrderFilled``.
 
     ``ts_override`` lets the caller supply the historical (test-clock) timestamp: the
     sandbox bars carry live-clock timestamps (so orders match correctly), but the ube
     ledger must stay on the test-clock timeline for §9.4 comparability.
+    ``multiplier`` is the contract multiplier (e.g. 50 for ES futures) — notional is
+    ``qty * price * multiplier`` like the backtest (§4.6).
     """
     t = int(ts_override) if ts_override is not None else int(fill.ts_init)
     qty = float(fill.last_qty.as_double())
     price = float(fill.last_px.as_double())
-    notional = qty * price
+    notional = qty * price * multiplier
     side = 1 if fill.is_buy else -1
     return LedgerEvent(
         EventType.FILL,
@@ -43,6 +46,7 @@ def fill_event(
         quantity=qty,
         price=price,
         notional=notional,
+        order_id=str(fill.client_order_id),
         exit_reason=exit_reason,
     )
 
@@ -72,17 +76,24 @@ def commission_event(
     cost_model: Any,
     *,
     ts_override: int | None = None,
+    multiplier: float = 1.0,
+    currency: str = "USD",
 ) -> LedgerEvent | None:
-    """A ube ``COMMISSION`` ledger event computed via ``core.cost.fill_cost``."""
+    """A ube ``COMMISSION`` ledger event computed via ``core.cost.fill_cost``.
+
+    ``multiplier`` and ``currency`` mirror the backtest — notional includes the
+    contract multiplier and commission is booked in the instrument's settlement
+    currency, not hardcoded USD.
+    """
     t = int(ts_override) if ts_override is not None else int(fill.ts_init)
     qty = float(fill.last_qty.as_double())
     price = float(fill.last_px.as_double())
-    notional = qty * price
+    notional = qty * price * multiplier
     commission = float(fill_cost(cost_model, notional=notional))
     if commission <= 0.0:
         return None
     return LedgerEvent(
-        EventType.COMMISSION, t, instrument_id, amount=commission, currency="USD"
+        EventType.COMMISSION, t, instrument_id, amount=commission, currency=currency
     )
 
 

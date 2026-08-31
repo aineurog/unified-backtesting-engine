@@ -1,7 +1,7 @@
 """Shared runtime singletons for the one-shot nautilus paper node.
 
 The data client must not drain bars until the strategy has subscribed to the bar type.
-Nautilus 1.231 removed ``subscribed_bars`` from the data client, so we coordinate with a
+Nautilus 1.221 removed ``subscribed_bars`` from the data client, so we coordinate with a
 module-level ``asyncio.Event`` (one-shot per ``step`` run). It must live outside the
 msgspec configs (which JSON-encode their fields and cannot hold an ``Event``).
 """

@@ -82,11 +82,11 @@ class NautilusPaperEngine(PaperEngine):
             # execution client advances its own (Test) clock by each bar's ``ts_init`` and
             # matches an order only when the clock has passed the order's ``ts_init`` — and
             # the order factory stamps orders with a *read-only* live clock we cannot
-            # override (it's a C-level slot in nautilus 1.231). So the bars must sit on the
+            # override (it's a C-level slot in nautilus 1.221). So the bars must sit on the
             # live timeline, strictly after "now", for every order to match the bar it was
             # submitted against. The historical (test-clock) ts is preserved separately via
             # ``signal_map`` so the ledger/trades stay comparable (§9.4).
-            live_base = int(time.time() * 1_000_000_000) + 10_000_000_000  # +10s headroom
+            live_base = time.time_ns() + 10_000_000_000  # +10s headroom, ns precision
             bars = []
             signal_map = {}
             for i in range(n):
@@ -115,7 +115,7 @@ class NautilusPaperEngine(PaperEngine):
             starting_balance = float(
                 config.starting_balance
                 if config.starting_balance is not None
-                else overrides.get("starting_balance", 10_000.0)
+                else overrides.get("starting_balance", 100_000.0)
             )
             balance = starting_balance
             if state.ledger.events:
@@ -134,7 +134,24 @@ class NautilusPaperEngine(PaperEngine):
                 if has_cash:
                     balance = total_cash
 
-            leverage = 1.0 if no_short else float(overrides.get("leverage", 1.0))
+            # Leverage: mirror backtest's sizing * margin logic — sizing leverage
+            # dominates, override is fallback, cash accounts force 1.0 (§3.2).
+            sizing_lev = 1.0
+            try:
+                sizing_lev = float(getattr(config.base.risk.sizing, "leverage", 1.0))
+            except Exception:
+                sizing_lev = 1.0
+            override_lev = float(overrides.get("leverage", 0.0))
+            if no_short:
+                leverage = 1.0
+            else:
+                lev = max(sizing_lev, override_lev)
+                leverage = lev if lev > 0 else 1.0
+            multiplier = (
+                1.0
+                if canonical.contract_multiplier is None
+                else float(canonical.contract_multiplier)
+            )
             quote = str(getattr(instrument, "settlement_currency", "USDT"))
 
             # Reset per-run singletons — TradingNode closes its loop on dispose
@@ -154,6 +171,8 @@ class NautilusPaperEngine(PaperEngine):
                 no_short=no_short,
                 on_opposite_signal=str(config.base.signal.on_opposite_signal),
                 balance=balance,
+                leverage=leverage,
+                multiplier=multiplier,
                 open_position=state.open_position,
             )
             strategy = UbePaperStrategy(config=strat_cfg)

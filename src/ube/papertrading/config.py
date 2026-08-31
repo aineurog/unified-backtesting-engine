@@ -55,7 +55,10 @@ class PaperConfig:
                 dict(self.base.engine_overrides) if self.base.engine_overrides else {}
             )
             overrides["starting_balance"] = self.starting_balance
-            object.__setattr__(self.base, "engine_overrides", overrides)
+            import dataclasses
+
+            new_base = dataclasses.replace(self.base, engine_overrides=overrides)
+            object.__setattr__(self, "base", new_base)
 
     @property
     def overrides(self) -> dict[str, Any]:

@@ -120,14 +120,18 @@ class PaperState:
             (``None`` before any bar, §9.6).
         last_price: The close of the last processed bar. Persisted so that equity can be
             derived on resume even though bars are not stored (plan blocker #5) — the open
-            position is marked-to-market with this price.
+            position is marked-to-market with this price. Full historical equity curve
+            across gaps still requires the bar series (Point 9 — bars are not stored,
+            only the last mark).
         open_position: The currently-open trade, or ``None`` when flat.
         pending_levels: Per-open-trade TP/SL (and scale-out) levels the backend needs to
             rebuild working orders on resume.
         signal_fn_state: State carried by a streaming signal function (§9.5); ``{}`` when
             stateless.
-        config_ref: A pointer (e.g. a run id or config path) to the canonical config used;
-            the full config is re-supplied by the caller on resume, not persisted.
+        config_ref: YAML dump of the canonical ``BacktestConfig`` at ``init`` time
+            (via ``yaml.safe_dump(asdict(base))``). Stored for self-contained resume
+            but *not* auto-applied on ``load()`` — caller must pass ``config`` to
+            ``step()``/``run_auto()`` or reconstruct via ``get_config_dict()`` (Point 8).
     """
 
     def __init__(
@@ -151,6 +155,26 @@ class PaperState:
             signal_fn_state if signal_fn_state is not None else {}
         )
         self.config_ref = config_ref
+
+    def get_config_dict(self) -> dict[str, Any] | None:
+        """Return the stored ``BacktestConfig`` as a dict, or ``None`` if absent.
+
+        The dict is the ``yaml.safe_load`` of ``config_ref`` (the ``asdict`` of the
+        canonical ``BacktestConfig`` at ``init`` time). It is *not* auto-applied
+        on ``load()`` — caller must reconstruct ``BacktestConfig``/``PaperConfig``
+        explicitly if they want a fully self-contained resume (see T8).
+        """
+        if self.config_ref is None:
+            return None
+        import yaml  # type: ignore[import-untyped]
+
+        try:
+            data = yaml.safe_load(self.config_ref)
+        except Exception as exc:
+            raise StateCorruptionError(f"config_ref is not valid YAML: {exc}") from exc
+        if not isinstance(data, dict):
+            raise StateCorruptionError("config_ref YAML must be a mapping")
+        return data
 
     # ------------------------------------------------------------------
     # Persistence.

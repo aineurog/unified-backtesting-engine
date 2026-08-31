@@ -427,7 +427,10 @@ class RecordingBackend(PaperEngine):
         asset_class = instrument.asset_class if isinstance(instrument, Instrument) else ""
         cost_model = resolve_cost_model(instrument if isinstance(instrument, Instrument) else None)
         allow_short = allows_short(asset_class)
-        policy = config.base.signal.on_opposite_signal or "reverse"
+        # on_opposite_signal is explicit-over-default (§4.7) — validate() already
+        # guarantees it is set for paper trading, so no fallback is needed.
+        assert config.base.signal.on_opposite_signal is not None
+        policy = config.base.signal.on_opposite_signal
 
         events: list[LedgerEvent] = []
         iid = state.instrument_id

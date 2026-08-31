@@ -89,7 +89,7 @@ class UbeDataClient(MarketDataClient):  # type: ignore[misc]
 
     async def _connect(self) -> None:
         self._instrument = self._instrument_cached()
-        # Wait until the strategy has subscribed to the bar type (nautilus 1.231 removed
+        # Wait until the strategy has subscribed to the bar type (nautilus 1.221 removed
         # ``subscribed_bars`` from the client). Best-effort timeout so a misconfigured
         # run cannot hang forever.
         if get_ready_event() is not None:
