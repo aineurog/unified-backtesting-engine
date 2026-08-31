@@ -22,6 +22,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.trading.strategy import Strategy
 
+from ube.core.cost import fill_cost
 from ube.core.data import MarketData
 from ube.core.ledger import EventType, LedgerEvent
 from ube.core.risk.exits import Exit, exit_triggered, scale_out_fraction
@@ -280,6 +281,20 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # fill). This is what prevents ``decide_action`` from double-submitting on the
         # next bar. The fill handler only uses the order-id sets to tag open vs close
         # fills (and to set ``_sim_qty`` to the *actual* filled quantity).
+        # Optimistic close-credit for same-bar reverse sizing: the sandbox fills
+        # the close asynchronously, so ``_current_balance`` doesn't yet reflect the
+        # close proceeds when ``_submit_open`` calls ``_size_qty``.  Credit the
+        # expected net proceeds (notional − commission) before sizing, then restore
+        # after — the fill handlers will do the real accounting when they fire.
+        _close_credit = 0.0
+        if close_first and self._sim_qty > 0:
+            _close_notional = self._sim_qty * (self._last_close or 0.0) * self._multiplier
+            _close_comm = float(
+                fill_cost(self.config.cost_model, notional=_close_notional)
+            ) if self.config.cost_model else 0.0
+            _close_credit = _close_notional - _close_comm
+            self._current_balance += _close_credit
+
         if close_first:
             self._submit_close(self._last_close)
             self._sim_side = 0
@@ -293,6 +308,10 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self._entry_price = self._last_close
             # Funding: reset last funding timestamp on new entry.
             self._last_funding_ns = self._hist_ts
+
+        # Restore optimistic credit — fill handlers manage the real balance.
+        if _close_credit != 0.0:
+            self._current_balance -= _close_credit
 
         # — Funding carry (T5) — per-bar accrual when position is open.
         if self._sim_side != 0 and (self._funding_rate != 0.0 or self._borrow_rate != 0.0):
