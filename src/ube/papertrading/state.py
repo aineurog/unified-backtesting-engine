@@ -14,12 +14,17 @@ restore).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pandas as pd
+
+from ube.core.data import MarketData
 from ube.core.errors import StateCorruptionError
 from ube.core.ledger import EventLedger, EventType, LedgerEvent
 
@@ -58,14 +63,15 @@ CREATE TABLE IF NOT EXISTS paper_state (
     open_position    TEXT,
     pending_levels   TEXT,
     signal_fn_state  TEXT,
-    config_ref       TEXT
+    config_ref       TEXT,
+    aux_data         TEXT
 )
 """
 
 _INSERT_SQL = (
     "INSERT OR REPLACE INTO paper_state "
     "(run_id, instrument_id, last_processed_ns, last_price, ledger, open_position, "
-    "pending_levels, signal_fn_state, config_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "pending_levels, signal_fn_state, config_ref, aux_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -109,6 +115,58 @@ def _from_json(text: str | None, default: Any) -> Any:
         raise StateCorruptionError(f"state blob is not valid JSON: {exc}") from exc
 
 
+def _aux_to_json(aux: dict[str, Any] | None) -> str | None:
+    """Serialize aux_data (may contain MarketData or arrays) to JSON."""
+    if not aux:
+        return None
+    out: dict[str, Any] = {}
+    for k, v in aux.items():
+        if isinstance(v, MarketData):
+            # Store MarketData as dict of columns + index
+            out[k] = {
+                "_type": "MarketData",
+                "open": v.open.tolist(),
+                "high": v.high.tolist(),
+                "low": v.low.tolist(),
+                "close": v.close.tolist(),
+                "volume": v.volume.tolist(),
+                "index": v.index.astype("int64").tolist(),
+            }
+        elif isinstance(v, np.ndarray):
+            out[k] = {"_type": "ndarray", "data": v.tolist()}
+        else:
+            out[k] = v
+    return json.dumps(out)
+
+
+def _aux_from_json(text: str | None) -> dict[str, Any]:
+    """Deserialize aux_data from JSON, handling MarketData and ndarrays."""
+    if text is None:
+        return {}
+    try:
+        raw = json.loads(text)
+    except (ValueError, TypeError) as exc:
+        raise StateCorruptionError(f"aux_data blob is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise StateCorruptionError("aux_data blob must be a dict")
+    out: dict[str, Any] = {}
+    for k, v in raw.items():
+        if isinstance(v, dict) and v.get("_type") == "MarketData":
+            out[k] = MarketData(
+                open=np.array(v["open"], dtype=np.float64),
+                high=np.array(v["high"], dtype=np.float64),
+                low=np.array(v["low"], dtype=np.float64),
+                close=np.array(v["close"], dtype=np.float64),
+                volume=np.array(v["volume"], dtype=np.float64),
+                index=pd.to_datetime(v["index"], unit="ns", utc=True),  # type: ignore[arg-type]
+            )
+        elif isinstance(v, dict) and v.get("_type") == "ndarray":
+            out[k] = np.array(v["data"], dtype=np.float64)
+        else:
+            out[k] = v
+    return out
+
+
 class PaperState:
     """The resumable snapshot of a paper-trading run (§9.5).
 
@@ -144,6 +202,7 @@ class PaperState:
         pending_levels: dict[str, Any] | None = None,
         signal_fn_state: dict[str, Any] | None = None,
         config_ref: str | None = None,
+        aux_data: dict[str, Any] | None = None,
     ) -> None:
         self.instrument_id = instrument_id
         self.ledger = ledger
@@ -155,6 +214,7 @@ class PaperState:
             signal_fn_state if signal_fn_state is not None else {}
         )
         self.config_ref = config_ref
+        self.aux_data: dict[str, Any] = aux_data if aux_data is not None else {}
 
     def get_config_dict(self) -> dict[str, Any] | None:
         """Return the stored ``BacktestConfig`` as a dict, or ``None`` if absent.
@@ -188,6 +248,9 @@ class PaperState:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(path), isolation_level=None)
             conn.execute(_SCHEMA_SQL)
+            # Migrate old DBs that lack aux_data column (added after T8).
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE paper_state ADD COLUMN aux_data TEXT")
             conn.execute(
                 _INSERT_SQL,
                 (
@@ -200,6 +263,7 @@ class PaperState:
                     _json(self.pending_levels),
                     _json(self.signal_fn_state),
                     self.config_ref,
+                    _aux_to_json(self.aux_data),
                 ),
             )
             conn.close()
@@ -218,29 +282,56 @@ class PaperState:
             raise StateCorruptionError(f"paper state file {path} does not exist")
         try:
             conn = sqlite3.connect(str(path), isolation_level=None)
-            row = conn.execute(
-                "SELECT instrument_id, last_processed_ns, last_price, ledger, "
-                "open_position, pending_levels, signal_fn_state, config_ref "
-                "FROM paper_state "
-                "WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
+            # Ensure aux_data column exists for old DBs
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE paper_state ADD COLUMN aux_data TEXT")
+            try:
+                row = conn.execute(
+                    "SELECT instrument_id, last_processed_ns, last_price, ledger, "
+                    "open_position, pending_levels, signal_fn_state, config_ref, aux_data "
+                    "FROM paper_state "
+                    "WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = conn.execute(
+                    "SELECT instrument_id, last_processed_ns, last_price, ledger, "
+                    "open_position, pending_levels, signal_fn_state, config_ref "
+                    "FROM paper_state "
+                    "WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
             conn.close()
         except sqlite3.Error as exc:
             raise StateCorruptionError(f"could not read paper state at {path}: {exc}") from exc
         if row is None:
             raise StateCorruptionError(f"no paper state for run_id={run_id!r} in {path}")
 
-        (
-            instrument_id,
-            last_ns,
-            last_price,
-            ledger_text,
-            open_text,
-            pending_text,
-            sfn_text,
-            config_ref,
-        ) = row
+        # Handle schema with or without aux_data column (backward compat).
+        if len(row) == 8:
+            (
+                instrument_id,
+                last_ns,
+                last_price,
+                ledger_text,
+                open_text,
+                pending_text,
+                sfn_text,
+                config_ref,
+            ) = row
+            aux_text = None
+        else:
+            (
+                instrument_id,
+                last_ns,
+                last_price,
+                ledger_text,
+                open_text,
+                pending_text,
+                sfn_text,
+                config_ref,
+                aux_text,
+            ) = row
         ledger = _ledger_from_json(ledger_text)
         open_position = None
         if open_text is not None:
@@ -257,4 +348,5 @@ class PaperState:
             pending_levels=_from_json(pending_text, {}),
             signal_fn_state=_from_json(sfn_text, {}),
             config_ref=config_ref,
+            aux_data=_aux_from_json(aux_text),
         )

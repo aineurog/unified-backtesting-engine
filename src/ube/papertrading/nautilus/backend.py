@@ -152,6 +152,13 @@ class NautilusPaperEngine(PaperEngine):
                 if canonical.contract_multiplier is None
                 else float(canonical.contract_multiplier)
             )
+            # Funding: per-period rates from cost model + calendar interval.
+            from ube.core.instrument import resolve_funding_interval_hours
+
+            funding_rate = float(getattr(cost_model, "funding", 0.0) or 0.0) if cost_model else 0.0
+            borrow_rate = float(getattr(cost_model, "borrow", 0.0) or 0.0) if cost_model else 0.0
+            funding_interval_hours = resolve_funding_interval_hours(canonical)
+            interval_ns = int(funding_interval_hours * 3600 * 1_000_000_000)
             quote = str(getattr(instrument, "settlement_currency", "USDT"))
 
             # Reset per-run singletons — TradingNode closes its loop on dispose
@@ -173,6 +180,10 @@ class NautilusPaperEngine(PaperEngine):
                 balance=balance,
                 leverage=leverage,
                 multiplier=multiplier,
+                exits=tuple(config.base.risk.exit) if config.base.risk.exit else (),
+                funding_rate=funding_rate,
+                borrow_rate=borrow_rate,
+                funding_interval_ns=interval_ns,
                 open_position=state.open_position,
             )
             strategy = UbePaperStrategy(config=strat_cfg)
