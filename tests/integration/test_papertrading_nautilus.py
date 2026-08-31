@@ -14,8 +14,8 @@ nautilus = pytest.importorskip("nautilus_trader")
 from ube.core.config import BacktestConfig, SignalConfig  # noqa: E402
 from ube.core.data import MarketData  # noqa: E402
 from ube.core.ledger import EventType, trades  # noqa: E402
-from ube.core.signals import from_target  # noqa: E402
-from ube.papertrading import init, run_auto, step  # noqa: E402
+from ube.core.signals import Signals, from_target  # noqa: E402
+from ube.papertrading import init, step  # noqa: E402
 from ube.papertrading.config import PaperConfig  # noqa: E402
 from ube.testing.synthetic import PRESETS, synthetic_bars  # noqa: E402
 
@@ -83,17 +83,64 @@ def test_crypto_perp_no_position_when_flat_signal() -> None:
 
 
 def test_crypto_perp_resume() -> None:
+    """Resume across two separate step() calls — the real §9.1 'I'll call you' path.
+
+    Opens a long in the first slice (bars 0..5), then reuses the *same* state
+    to close it in the second slice (bars 6..9). The resume-seeding code in
+    backend.py / strategy.py / node.py (open_position → _sim_side / balance /
+    cache.add_position) is only exercised when engine.execute() is called a
+    second time with a state that already carries an open position — a single
+    run_auto() over the full window never reaches that path.
+    """
     data = synthetic_bars(PRESETS["crypto_perp"], n_bars=10, seed=1)
-
-    def sig_fn(d: MarketData) -> int:
-        return 1 if d.n_bars <= 6 else 0
-
+    signals_full = from_target(np.array([1, 1, 1, 1, 1, 1, 0, 0, 0, 0]))
     cfg = _config()
     state = init(cfg)
-    run_auto(data, sig_fn, cfg, state)
+
+    def slice_md(md: MarketData, sl: slice) -> MarketData:
+        # Bypass re-validation (same trick as MarketData.head) — any prefix
+        # of a validated MarketData is valid, so any slice is valid too.
+        sliced = MarketData.__new__(MarketData)  # type: ignore[call-arg]
+        object.__setattr__(sliced, "open", md.open[sl])
+        object.__setattr__(sliced, "high", md.high[sl])
+        object.__setattr__(sliced, "low", md.low[sl])
+        object.__setattr__(sliced, "close", md.close[sl])
+        object.__setattr__(sliced, "volume", md.volume[sl])
+        object.__setattr__(sliced, "index", md.index[sl])
+        return sliced
+
+    def slice_signals(sig: Signals, sl: slice) -> Signals:
+        return Signals(
+            long_entry=sig.long_entry[sl].copy(),
+            long_exit=sig.long_exit[sl].copy(),
+            short_entry=sig.short_entry[sl].copy(),
+            short_exit=sig.short_exit[sl].copy(),
+        )
+
+    # --- first slice: enter long and hold ---------------------------------
+    data_1 = slice_md(data, slice(0, 6))
+    sig_1 = slice_signals(signals_full, slice(0, 6))
+    _, ev1 = step(data_1, sig_1, state, cfg)
+    assert state.open_position is not None
+    assert state.open_position.side == 1
+    # exactly one entry fill so far
+    assert len([e for e in state.ledger.events if e.event_type == EventType.FILL]) == 1
+    assert len([e for e in ev1 if e.event_type == EventType.FILL]) == 1
+
+    # --- second slice: exit signal — must close via the resume path -------
+    data_2 = slice_md(data, slice(6, 10))
+    sig_2 = slice_signals(signals_full, slice(6, 10))
+    _, ev2 = step(data_2, sig_2, state, cfg)
 
     instr = cfg.base.instrument
     closed = trades(state.ledger, instruments={instr.symbol: instr})
     assert len(closed) == 1
     assert closed[0].exit_reason == "signal"
     assert state.open_position is None
+    # the second step itself produced the exit fill (not just the first)
+    fills2 = [e for e in ev2 if e.event_type == EventType.FILL]
+    assert len(fills2) == 1
+    assert fills2[0].exit_reason == "signal"
+    # fill landed on the bar it was submitted against (§9.4)
+    assert abs(fills2[0].price - float(data.close[6])) < 1e-6
+    assert fills2[0].timestamp == int(data.timestamps.as_unit("ns").asi8[6])

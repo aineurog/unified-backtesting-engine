@@ -85,47 +85,9 @@ def build_node(
     node.add_data_client_factory("MYDATA", UbeDataClientFactory)
     node.add_exec_client_factory("SANDBOX", SandboxLiveExecClientFactory)
     node.build()
-    if open_position is not None:
-        from nautilus_trader.core.uuid import UUID4
-        from nautilus_trader.model.enums import LiquiditySide, OrderSide, OrderType
-        from nautilus_trader.model.events import OrderFilled
-        from nautilus_trader.model.identifiers import (
-            AccountId,
-            ClientOrderId,
-            StrategyId,
-            TradeId,
-            TraderId,
-            VenueOrderId,
-        )
-        from nautilus_trader.model.objects import Currency, Money, Price, Quantity
-        from nautilus_trader.model.position import Position
-
-        order_side = OrderSide.BUY if open_position.side > 0 else OrderSide.SELL
-        fill = OrderFilled(
-            trader_id=TraderId("PAPER-001"),
-            strategy_id=StrategyId("UBE-001"),
-            instrument_id=instrument.id,
-            client_order_id=ClientOrderId(open_position.trade_id or "RESUME-ORDER-1"),
-            venue_order_id=VenueOrderId("RESUME-VENUE-1"),
-            account_id=AccountId(f"{venue}-001"),
-            trade_id=TradeId(open_position.trade_id or "RESUME-TRADE-1"),
-            position_id=None,
-            order_side=order_side,
-            order_type=OrderType.MARKET,
-            last_qty=Quantity.from_str(str(open_position.quantity)),
-            last_px=Price.from_str(str(open_position.entry_price)),
-            currency=Currency.from_str(quote),
-            commission=Money(Decimal("0"), Currency.from_str(quote)),
-            liquidity_side=LiquiditySide.TAKER,
-            event_id=UUID4(),
-            ts_event=open_position.entry_ns,
-            ts_init=open_position.entry_ns,
-        )
-        pos = Position(instrument, fill)
-        node.cache.add_position(pos, oms_type)
+    node.cache.add_instrument(instrument)
     if strategy is not None:
         node.trader.add_strategy(strategy)
-    node.cache.add_instrument(instrument)
     return node
 
 

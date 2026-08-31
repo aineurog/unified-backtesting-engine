@@ -137,6 +137,14 @@ class NautilusPaperEngine(PaperEngine):
             leverage = 1.0 if no_short else float(overrides.get("leverage", 1.0))
             quote = str(getattr(instrument, "settlement_currency", "USDT"))
 
+            # Reset per-run singletons — TradingNode closes its loop on dispose
+            # and UbeDataClient.DONE is a class-level Event that remains set
+            # after the previous run; without resetting, the next run's
+            # _stop_when_done sees an already-set event and stops before
+            # draining any bars.
+            from .data_client import UbeDataClient
+
+            UbeDataClient.DONE = None
             reset_ready_event()
             strat_cfg = UbePaperConfig(
                 instrument_id=str(instrument_id),
