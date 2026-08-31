@@ -112,11 +112,28 @@ class NautilusPaperEngine(PaperEngine):
 
             bar_type = build_bar_type(instrument_id, period_ns)
 
-            balance = float(
+            starting_balance = float(
                 config.starting_balance
                 if config.starting_balance is not None
                 else overrides.get("starting_balance", 10_000.0)
             )
+            balance = starting_balance
+            if state.ledger.events:
+                total_cash = 0.0
+                has_cash = False
+                for e in state.ledger.events:
+                    if e.event_type is EventType.CASH_MOVEMENT and e.amount is not None:
+                        has_cash = True
+                        total_cash += float(e.amount)
+                    elif (
+                        e.event_type in (EventType.COMMISSION, EventType.FUNDING_PAYMENT)
+                        and e.amount is not None
+                    ):
+                        has_cash = True
+                        total_cash -= float(e.amount)
+                if has_cash:
+                    balance = total_cash
+
             leverage = 1.0 if no_short else float(overrides.get("leverage", 1.0))
             quote = str(getattr(instrument, "settlement_currency", "USDT"))
 
@@ -129,6 +146,7 @@ class NautilusPaperEngine(PaperEngine):
                 no_short=no_short,
                 on_opposite_signal=str(config.base.signal.on_opposite_signal),
                 balance=balance,
+                open_position=state.open_position,
             )
             strategy = UbePaperStrategy(config=strat_cfg)
 
@@ -143,6 +161,7 @@ class NautilusPaperEngine(PaperEngine):
                 leverage=leverage,
                 strategy=strategy,
                 overrides=overrides,
+                open_position=state.open_position,
             )
 
             SIGNAL_REGISTRY.clear()

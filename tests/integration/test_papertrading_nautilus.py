@@ -12,9 +12,10 @@ import pytest
 nautilus = pytest.importorskip("nautilus_trader")
 
 from ube.core.config import BacktestConfig, SignalConfig  # noqa: E402
+from ube.core.data import MarketData  # noqa: E402
 from ube.core.ledger import EventType, trades  # noqa: E402
 from ube.core.signals import from_target  # noqa: E402
-from ube.papertrading import init, step  # noqa: E402
+from ube.papertrading import init, run_auto, step  # noqa: E402
 from ube.papertrading.config import PaperConfig  # noqa: E402
 from ube.testing.synthetic import PRESETS, synthetic_bars  # noqa: E402
 
@@ -78,4 +79,21 @@ def test_crypto_perp_no_position_when_flat_signal() -> None:
     instr = cfg.base.instrument
     assert trades(state.ledger, instruments={instr.symbol: instr}) == ()
     assert all(e.event_type != EventType.FILL for e in events)
+    assert state.open_position is None
+
+
+def test_crypto_perp_resume() -> None:
+    data = synthetic_bars(PRESETS["crypto_perp"], n_bars=10, seed=1)
+
+    def sig_fn(d: MarketData) -> int:
+        return 1 if d.n_bars <= 6 else 0
+
+    cfg = _config()
+    state = init(cfg)
+    run_auto(data, sig_fn, cfg, state)
+
+    instr = cfg.base.instrument
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "signal"
     assert state.open_position is None

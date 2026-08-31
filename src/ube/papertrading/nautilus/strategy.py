@@ -46,6 +46,7 @@ class UbePaperConfig(StrategyConfig):  # type: ignore[misc]
     no_short: bool = False
     on_opposite_signal: str = "reverse"
     balance: float = 0.0
+    open_position: Any = None
 
 
 class UbePaperStrategy(Strategy):  # type: ignore[misc]
@@ -70,8 +71,8 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # (keyed by the bar's live ts). ``_hist_ts`` is that historical ts for the bar
         # currently being processed.
         self._hist_ts = 0
-        self._sim_side = 0
-        self._sim_qty = 0.0
+        self._sim_side = config.open_position.side if config.open_position else 0
+        self._sim_qty = float(config.open_position.quantity) if config.open_position else 0.0
         self._last_close: float | None = None
         self._entry_order_ids: set[Any] = set()
         self._close_order_ids: set[Any] = set()
