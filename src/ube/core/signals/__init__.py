@@ -41,7 +41,6 @@ import pandas as pd
 
 from ube.core.data import MarketData
 from ube.core.errors import InvalidSignalError
-from ube.core.instrument import allows_short
 
 __all__ = [
     "SIGNAL_COLUMNS",
@@ -288,24 +287,15 @@ def from_callable(fn: Callable[[MarketData], int], bars: MarketData) -> Signals:
 
 
 def validate_long_only(signals: Signals, asset_class: str) -> None:
-    """Fail fast when a long-only asset class is asked to short (§4.5).
+    """Validate a signal series against a long-only asset class (§4.5).
 
-    ``crypto_spot`` is long-only: a ``short_entry`` opens a position that cannot
-    exist and a ``short_exit`` closes one, so either is a configuration error —
-    raised here (before the engine runs, §4.7) rather than silently dropped by the
-    engine. The first offending bar is named, matching the §6.1 conflict rule.
+    ``crypto_spot`` is long-only: a ``short_entry`` can never *open* a short, and a
+    ``short_exit`` has no short to close. The gate lives at the strategy level (the
+    paper ``decide_action`` and the nautilus actor both consult ``allows_short`` and
+    already turn a short signal into an exit-of-an-existing-long or a skip), so this
+    function no longer rejects the series — rejecting here would prevent that
+    exit-or-skip handling and contradict the reference shorting gate (backtrader
+    ``strategy.py``/nautilus ``signals.py``). It remains for call-site compatibility
+    and is a no-op for shortable classes; structural validation is left to the caller.
     """
-    if allows_short(asset_class):
-        return
-    if signals.short_entry.any():
-        i = int(np.argmax(signals.short_entry))
-        raise InvalidSignalError(
-            f"{asset_class} is long-only and cannot open a short position: "
-            f"short_entry is True at bar {i}"
-        )
-    if signals.short_exit.any():
-        i = int(np.argmax(signals.short_exit))
-        raise InvalidSignalError(
-            f"{asset_class} is long-only and cannot close a short position: "
-            f"short_exit is True at bar {i}"
-        )
+    return

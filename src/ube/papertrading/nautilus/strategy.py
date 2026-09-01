@@ -20,14 +20,23 @@ from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
 from ube.core.cost import fill_cost
 from ube.core.data import MarketData
 from ube.core.ledger import EventType, LedgerEvent
-from ube.core.risk.exits import Exit, exit_triggered, scale_out_fraction
+from ube.core.risk.exits import (
+    ATRStop,
+    ChandelierExit,
+    Exit,
+    TrailingStop,
+    exit_triggered,
+    scale_out_fraction,
+)
 from ube.core.risk.sizing import floor_to_step, size_position
 from ube.papertrading.core import decide_action
+from ube.papertrading.state import ExitSeed
 
 from .bridge import (
     cash_movement_event,
@@ -56,6 +65,7 @@ class UbePaperConfig(StrategyConfig):  # type: ignore[misc]
     borrow_rate: float = 0.0
     funding_interval_ns: int = 0
     open_position: Any = None
+    exit_seed: Any = None  # ube ExitSeed — seeds trailing/ATR exits on resume (issue C)
 
 
 class UbePaperStrategy(Strategy):  # type: ignore[misc]
@@ -111,6 +121,62 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._aux_data: dict[str, Any] = {}
         # Funding: track last funding timestamp to avoid double-counting.
         self._last_funding_ns: int | None = None
+        # Exit seed (issue C): on resume, the persistence layer writes the minimal exit
+        # statistics (running extreme price + ATR warmup window) so trailing / ATR exits are
+        # not degenerate on the first bars after a restart. Tracks:
+        #   _extreme_price — the running peak (long) / trough (short) since entry.
+        #   _atr_window    — a bounded rolling [high, low, close] window for ATR warmup.
+        # The bars for these are built in ``on_start`` (needs instrument precision) and the
+        # current values are exposed via :meth:`exit_seed` for the backend to persist.
+        self._seed: ExitSeed | None = config.exit_seed
+        self._extreme_price: float | None = (
+            float(config.exit_seed.extreme_price) if config.exit_seed else None
+        )
+        self._atr_window: list[list[float]] = []
+        self._atr_period = self._max_atr_period()
+
+    def _max_atr_period(self) -> int:
+        """Largest ``period`` among configured ATR-style exits; 0 if none."""
+        period = 0
+        for cfg in self._exits:
+            if isinstance(cfg, (ATRStop, ChandelierExit)):
+                period = max(period, int(getattr(cfg, "period", 14)))
+        return period
+
+    def exit_seed(self) -> ExitSeed | None:
+        """The current exit seed for the backend to persist (issue C).
+
+        Returns ``None`` when flat or no path-dependent exit needs seeding, so a resumed run
+        only carries the minimal statistics an actual exit requires. The extreme price is
+        tracked since entry; the ATR window holds the last ``period + 1`` real bars.
+        """
+        if self._sim_side == 0:
+            return None
+        extreme = self._extreme_price
+        if not self._has_trailing_exit():
+            extreme = None
+        window: list[list[float]] | None = None
+        if self._atr_period > 0 and self._atr_window:
+            window = [
+                [float(high), float(low), float(c)] for high, low, c in self._atr_window
+            ]
+        if extreme is None and window is None:
+            return None
+        return ExitSeed(extreme_price=extreme, atr_window=window)
+
+    def _has_trailing_exit(self) -> bool:
+        """Whether any configured exit needs the persisted running extreme (trailing)."""
+        for cfg in self._exits:
+            if isinstance(cfg, TrailingStop) or (
+                isinstance(cfg, (ATRStop, ChandelierExit)) and bool(getattr(cfg, "trailing", False))
+            ):
+                return True
+        return False
+
+    def _reset_exit_seed(self) -> None:
+        """Clear the exit-seed tracking (called when the position becomes flat)."""
+        self._extreme_price = None
+        self._atr_window = []
 
     # -- lifecycle --------------------------------------------------------- #
     def on_start(self) -> None:
@@ -120,10 +186,59 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self.stop()
             return
         self._quote = str(getattr(self._instrument, "settlement_currency", "USDT"))
+        # Issue C: seed the exit-level bar buffer with the persisted minimal statistics
+        # before any live bars are processed, so trailing/ATR exits are not degenerate on the
+        # first bars after a resume. These synthetic bars are used *only* for exit-level
+        # computation (via ``_build_market_data``); they are never published to the sandbox,
+        # so they cannot generate spurious orders.
+        self._seed_exit_bars()
         if self._bar_type is not None:
             self.subscribe_bars(self._bar_type)
         get_ready_event().set()
         self.log.info(f"UbePaperStrategy started for {self._venue_iid}")
+
+    def _seed_exit_bars(self) -> None:
+        """Prepend the persisted extreme + ATR-window seed bars to ``_bars`` (issue C)."""
+        if self._instrument is None or self._seed is None or self._sim_side == 0:
+            return
+        seed = self._seed
+        pp = self._instrument.price_precision
+        sp = self._instrument.size_precision
+        assert self._bar_type is not None
+        # An extreme-price bar first (running peak/trough for trailing stops). Its OHLC are
+        # all set to the extreme so ``_running_extreme_since`` ratchets correctly from bar 0.
+        if seed.extreme_price is not None:
+            p = Price(float(seed.extreme_price), pp)
+            self._bars.append(
+                Bar(
+                    bar_type=self._bar_type,
+                    open=p,
+                    high=p,
+                    low=p,
+                    close=p,
+                    volume=Quantity(0.0, sp),
+                    ts_event=0,
+                    ts_init=0,
+                )
+            )
+        # Then the ATR warmup window (last period+1 real bars' high/low/close).
+        if seed.atr_window:
+            for hlc in seed.atr_window:
+                self._bars.append(
+                    Bar(
+                        bar_type=self._bar_type,
+                        open=Price(float(hlc[2]), pp),
+                        high=Price(float(hlc[0]), pp),
+                        low=Price(float(hlc[1]), pp),
+                        close=Price(float(hlc[2]), pp),
+                        volume=Quantity(0.0, sp),
+                        ts_event=0,
+                        ts_init=0,
+                    )
+                )
+        # entry_bar is 0 (set in __init__ for a resumed position) — the extreme bar, when
+        # present, sits at index 0 so the running peak incorporates the persisted extreme.
+        self._entry_bar = 0
 
     @property
     def events(self) -> list[LedgerEvent]:
@@ -222,6 +337,24 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._last_close = float(bar.close.as_double())
         # Buffer bar for exit level computation.
         self._bars.append(bar)
+        # Issue C: maintain the running extreme price and ATR warmup window *before* the risk
+        # exit check, so the current bar contributes to the peak/ATR used to seed the next
+        # resume. Only tracked while a position is open and a path-dependent exit requires it.
+        if self._sim_side != 0:
+            hi = float(bar.high.as_double())
+            lo = float(bar.low.as_double())
+            if self._extreme_price is None:
+                self._extreme_price = hi if self._sim_side > 0 else lo
+            else:
+                self._extreme_price = (
+                    max(self._extreme_price, hi)
+                    if self._sim_side > 0
+                    else min(self._extreme_price, lo)
+                )
+            if self._atr_period > 0:
+                self._atr_window.append([hi, lo, float(bar.close.as_double())])
+                if len(self._atr_window) > self._atr_period + 1:
+                    self._atr_window.pop(0)
         # Bars carry live-clock timestamps for sandbox matching; recover the historical
         # (test-clock) ts from the registry so every emitted ``LedgerEvent`` stays on the
         # ube timeline (§9.4 comparability).
@@ -245,9 +378,49 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 self._sim_qty = 0.0
                 self._entry_bar = None
                 self._entry_price = None
+                self._reset_exit_seed()
             else:
                 self._sim_qty -= qty_to_close
             return
+
+        # — Funding carry (T5) — accrues on *every* bar the position is open, regardless of
+        # whether a signal fires this bar. Placed before the signal early-return so funding
+        # is not limited to signal bars (bars that only hold a position still accrue).
+        if self._sim_side != 0 and (self._funding_rate != 0.0 or self._borrow_rate != 0.0):
+            # Elapsed-time accrual: funding per bar = rate * notional * (bar_span / interval).
+            # For interval_ns==0, treat as per-bar rate (frac=1.0).
+            bar_span = 0
+            if len(self._bars) >= 2:
+                # Use historical timestamps for bar_span (not live ts).
+                prev_hist = int(SIGNAL_REGISTRY.at(self._bars[-2].ts_event)[4])
+                bar_span = self._hist_ts - prev_hist
+            elif self._last_funding_ns is not None:
+                bar_span = self._hist_ts - self._last_funding_ns
+            frac = 1.0
+            if self._funding_interval_ns > 0 and bar_span > 0:
+                frac = bar_span / float(self._funding_interval_ns)
+            notional = abs(self._sim_qty) * (self._last_close or 0.0) * self._multiplier
+            # Per-period carry, matching the canonical ledger adapter exactly
+            # (``ledger.funding_payments``, §24): amount = (funding + borrow * (side < 0))
+            # * notional * frac. Both terms are non-negative; positive = the trader pays.
+            # The short side adds the borrow cost but does *not* flip the funding sign —
+            # this is the single shared convention with the backtest adapter.
+            borrow = self._borrow_rate if self._sim_side < 0 else 0.0
+            amount = (self._funding_rate + borrow) * notional * frac
+            if amount != 0.0:
+                self._events.append(
+                    LedgerEvent(
+                        EventType.FUNDING_PAYMENT,
+                        self._hist_ts,
+                        self._iid,
+                        amount=amount,
+                        currency=self._quote,
+                    )
+                )
+                # Update live balance for next sizing. A negative amount is funding the trader
+                # *received* — credit it back to the balance; a positive amount is paid — deduct it.
+                self._current_balance -= amount
+                self._last_funding_ns = self._hist_ts
 
         if not (le or lx or se or sx):
             return
@@ -313,42 +486,6 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         if _close_credit != 0.0:
             self._current_balance -= _close_credit
 
-        # — Funding carry (T5) — per-bar accrual when position is open.
-        if self._sim_side != 0 and (self._funding_rate != 0.0 or self._borrow_rate != 0.0):
-            # Elapsed-time accrual: funding per bar = rate * notional * (bar_span / interval).
-            # For interval_ns==0, treat as per-bar rate (frac=1.0).
-            bar_span = 0
-            if len(self._bars) >= 2:
-                # Use historical timestamps for bar_span (not live ts).
-                prev_hist = int(SIGNAL_REGISTRY.at(self._bars[-2].ts_event)[4])
-                bar_span = self._hist_ts - prev_hist
-            elif self._last_funding_ns is not None:
-                bar_span = self._hist_ts - self._last_funding_ns
-            frac = 1.0
-            if self._funding_interval_ns > 0 and bar_span > 0:
-                frac = bar_span / float(self._funding_interval_ns)
-            notional = abs(self._sim_qty) * (self._last_close or 0.0) * self._multiplier
-            funding = self._funding_rate * notional * frac
-            borrow = self._borrow_rate * notional * frac if self._sim_side < 0 else 0.0
-            amount = funding + borrow
-            # Funding: long pays when rate>0, short receives.
-            if amount != 0.0:
-                # Adjust for short receiving funding when positive.
-                if self._sim_side < 0 and self._funding_rate != 0.0:
-                    amount = -self._funding_rate * notional * frac + borrow
-                self._events.append(
-                    LedgerEvent(
-                        EventType.FUNDING_PAYMENT,
-                        self._hist_ts,
-                        self._iid,
-                        amount=abs(amount),
-                        currency=self._quote,
-                    )
-                )
-                # Update live balance for next sizing (funding is a cost).
-                self._current_balance -= amount if amount > 0 else 0  # only deduct if paid
-                self._last_funding_ns = self._hist_ts
-
     # -- fills ------------------------------------------------------------- #
     def on_order_filled(self, event: Any) -> None:
         coid = event.client_order_id
@@ -369,6 +506,26 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self._entry_bar = len(self._bars) - 1
             self._entry_price = float(event.last_px.as_double())
             self._last_funding_ns = self._hist_ts
+            # Issue C: a fresh (non-resume) entry starts a new running extreme and ATR window
+            # from this bar; reset the previous position's seed state.
+            self._extreme_price = None
+            self._atr_window = []
+            # Recompute on this bar so the entry bar's high/low seeds the extreme.
+            if len(self._bars):
+                seg = self._bars[-1]
+                self._extreme_price = (
+                    float(seg.high.as_double())
+                    if self._sim_side > 0
+                    else float(seg.low.as_double())
+                )
+                if self._atr_period > 0:
+                    self._atr_window = [
+                        [
+                            float(seg.high.as_double()),
+                            float(seg.low.as_double()),
+                            float(seg.close.as_double()),
+                        ]
+                    ]
         elif is_close:
             exit_reason = close_reason or "signal"
             # For a reverse, the opening order is already in flight; let its fill set the
@@ -383,6 +540,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                     self._sim_qty = 0.0
                     self._entry_bar = None
                     self._entry_price = None
+                    self._reset_exit_seed()
         else:
             # Unknown fill (e.g. partial / rejected) — ignore rather than corrupt state.
             return

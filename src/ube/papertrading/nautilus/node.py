@@ -33,7 +33,6 @@ def build_node(
     leverage: float = 1.0,
     strategy: Any | None = None,
     overrides: dict[str, Any] | None = None,
-    open_position: Any | None = None,
 ) -> TradingNode:
     """Assemble a :class:`TradingNode` driving the ube data client + sandbox exec client.
 
@@ -41,6 +40,16 @@ def build_node(
     :class:`~ube.adapters.nautilus_adapter.overrides.NautilusEngineOverrides` (plan
     blocker #11). They are read from ``overrides`` (lowercase ``"margin"/"cash"`` and
     ``"NETTING"/"HEDGING"``) and mapped to the sandbox's uppercase enum spellings.
+
+    Note: the sandbox account is *not* seeded with a resumed position here. The
+    :class:`~ube.papertrading.nautilus.strategy.UbePaperStrategy` tracks the open
+    position in software (``_sim_side``/``_sim_qty``) and it is closed via a plain
+    opposite-side market order, so this works for MARGIN/shortable assets at the ledger
+    level. However, for CASH/no-short (spot) assets the reduce-only close with no real
+    position in the sandbox cache would be rejected. The backend guards against that case
+    (see ``NautilusPaperEngine.execute``), not this function. Real sandbox position
+    seeding is deferred until spot/no-short or ``use_reduce_only=True`` becomes a
+    requirement (see issue A in the remediation notes).
     """
     overrides = overrides or {}
     _acct = overrides.get("account_type", "margin")

@@ -499,7 +499,7 @@ def test_to_nautilus_bars_ts_event_equals_ts_init_and_matches_index():
     md = synthetic_bars(preset, n_bars=24)
     bars, _ = to_nautilus_bars(md, build_instrument(preset.instrument))
     for i, bar in enumerate(bars):
-        assert bar.ts_event == int(md.timestamps.asi8[i])
+        assert bar.ts_event == int(md.timestamps.as_unit("ns").asi8[i])  # type: ignore[attr-defined]
         assert bar.ts_init == bar.ts_event
 
 
@@ -551,7 +551,7 @@ def test_to_signal_map_aligns_to_bar_timestamps():
     sig = from_target([0, 1, 1, 0, -1, -1])
     mapping = to_signal_map(md, sig)
     assert len(mapping) == 6
-    ts = md.timestamps.asi8
+    ts = md.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
     assert mapping[int(ts[0])] == (False, False, False, False)
     assert mapping[int(ts[1])] == (True, False, False, False)
     assert mapping[int(ts[3])] == (False, True, False, False)
@@ -869,16 +869,16 @@ def test_nautilus_reference_trailing_stop_mirror():
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
         (1, 0.25, 65000.0, None),
         (1, 1.287, 65000.1, None),
-        (-1, 0.25, 65600.4, "trailing_stop"),
-        (-1, 1.287, 65600.3, "trailing_stop"),
+        (-1, 0.25, 65456.0, "trailing_stop"),
+        (-1, 1.287, 65455.9, "trailing_stop"),
     ]
     (trade,) = result.trades
     assert trade.exit_reason == "trailing_stop"
     assert trade.entry_price == pytest.approx(65000.0837, abs=1e-3)
-    assert trade.exit_price == pytest.approx(65600.4, abs=1e-1)
-    assert trade.net_pnl == pytest.approx(711.7444, rel=1e-4)
+    assert trade.exit_price == pytest.approx(65455.916, abs=1e-1)
+    assert trade.net_pnl == pytest.approx(489.9125, rel=1e-4)
     assert float(result.equity_curve.equity[0]) == pytest.approx(99939.9282, abs=1e-3)
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100711.7444, rel=1e-6)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100489.9125, rel=1e-6)
 
 
 def test_nautilus_touched_take_profit_stamps_exit_reason():
@@ -1361,18 +1361,23 @@ def test_nautilus_run_rejects_contradictory_signal_entries():
         )
 
 
-def test_nautilus_run_rejects_short_on_crypto_spot():
+def test_nautilus_run_skips_short_on_crypto_spot():
     from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
     from ube.core.config import BacktestConfig
-    from ube.core.errors import InvalidSignalError
     from ube.core.instrument import Instrument
 
     md = synthetic_bars(PRESETS["crypto_perp"], seed=7, n_bars=6)
-    cfg = BacktestConfig(instrument=Instrument("BTC-USDT", asset_class="crypto_spot"))
+    instr = Instrument(
+        "BTC-USDT", "crypto_spot", tick_size=0.1, calendar="24/7", settlement_currency="USDT"
+    )
+    cfg = BacktestConfig(
+        instrument=instr, engine_overrides={"starting_balance": 100000.0}
+    )
     # from_target([0, -1, ...]) emits short_entry at bar 1; spot is long-only, so the
-    # run fails fast (§4.5/§6.1) rather than silently dropping the short.
-    with pytest.raises(InvalidSignalError, match="long-only"):
-        NautilusAdapter().run(md, from_target([0, -1, -1, -1, -1, -1]), cfg)
+    # shorting gate at the strategy level (§4.5/§6.1) skips it — never a short, and
+    # never an error (mirrors the nautilus reference signals.py gate).
+    result = NautilusAdapter().run(md, from_target([0, -1, -1, -1, -1, -1]), cfg)
+    assert all(e.side >= 0 for e in _fills(result))
 
 
 def test_nautilus_engine_exception_wrapped_preserves_cause():

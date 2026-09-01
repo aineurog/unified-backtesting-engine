@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 
 from ube.core.config import BacktestConfig, SignalConfig
-from ube.core.errors import InvalidSignalError
 from ube.core.instrument import Instrument
 from ube.core.ledger import trades
 from ube.core.signals import from_target
@@ -129,9 +128,9 @@ def test_on_opposite_signal_ignore() -> None:
     assert state.open_position.side == 1
 
 
-def test_long_only_rejects_short() -> None:
-    # A crypto_spot instrument is long-only: a short_entry is a configuration error
-    # raised before the engine runs (validate_long_only, §4.5/§4.7).
+def test_long_only_skips_short_signals() -> None:
+    # A crypto_spot instrument is long-only: short signals are gated at the strategy
+    # level (decide_action/actor) — a short_entry on flat skips and never errors.
     data = _data(n_bars=8)
     target = np.array([0, 0, 0, -1, -1, -1, -1, -1])
     signals = from_target(target)
@@ -143,8 +142,30 @@ def test_long_only_rejects_short() -> None:
         engine="recording",
     )
     state = init(cfg)
-    with pytest.raises(InvalidSignalError):
-        step(data, signals, state, cfg)
+    step(data, signals, state, cfg)
+    # No short is ever opened on a long-only asset; the run completes flat.
+    assert state.open_position is None
+
+
+def test_long_only_short_signal_exits_existing_long() -> None:
+    # A short signal while already long on a long-only asset closes the long (the
+    # §9.3 exit-or-skip gate) instead of reversing into an impossible short.
+    data = _data(n_bars=8)
+    target = np.array([1, 1, 1, -1, -1, -1, -1, -1])
+    signals = from_target(target)
+    instr = Instrument("BTC", "crypto_spot")
+    cfg = PaperConfig(
+        base=BacktestConfig(
+            instrument=instr, signal=SignalConfig(on_opposite_signal="reverse")
+        ),
+        engine="recording",
+    )
+    state = init(cfg)
+    step(data, signals, state, cfg)
+    assert state.open_position is None
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].side == 1
 
 
 def test_open_position_recomputed_from_ledger() -> None:

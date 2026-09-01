@@ -209,3 +209,44 @@ def test_unknown_engine_raises() -> None:
         raise AssertionError("expected ConfigError/EngineError")
     except (ConfigError, Exception):
         pass
+
+
+def _crypto_spot_cfg(starting_balance: float = 100_000.0) -> PaperConfig:
+    from ube.core.instrument import Instrument
+
+    instr = Instrument(
+        "BTC-USDT", "crypto_spot", tick_size=0.1, calendar="24/7", settlement_currency="USDT"
+    )
+    bc = BacktestConfig(instrument=instr, signal=SignalConfig(on_opposite_signal="reverse"))
+    return PaperConfig(base=bc, engine="nautilus", starting_balance=starting_balance)
+
+
+def test_crypto_spot_short_signal_skipped_when_flat() -> None:
+    """Issue A — a short signal on a long-only crypto spot never errors; it skips."""
+    data = synthetic_bars(PRESETS["crypto_perp"], n_bars=8, seed=1)
+    signals = from_target(np.array([0, 0, -1, -1, -1, -1, 0, 0]))
+    cfg = _crypto_spot_cfg()
+    state = init(cfg)
+    _, events = step(data, signals, state, cfg)
+    assert state.open_position is None
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert fills == []
+
+
+def test_crypto_spot_short_signal_exits_existing_long() -> None:
+    """Issue A — a short signal while long on a long-only crypto spot closes the long."""
+    instr = _crypto_spot_cfg().base.instrument
+    data = synthetic_bars(PRESETS["crypto_perp"], n_bars=8, seed=1)
+    signals = from_target(np.array([1, 1, 1, -1, -1, -1, 0, 0]))
+    cfg = _crypto_spot_cfg()
+    state = init(cfg)
+    _, events = step(data, signals, state, cfg)
+    assert state.open_position is None
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert len(fills) == 2
+    assert fills[0].side == 1
+    assert fills[1].side == -1
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].side == 1
+    assert closed[0].exit_reason == "signal"

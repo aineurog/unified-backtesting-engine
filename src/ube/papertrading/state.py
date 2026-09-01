@@ -29,9 +29,31 @@ from ube.core.errors import StateCorruptionError
 from ube.core.ledger import EventLedger, EventType, LedgerEvent
 
 __all__ = [
+    "ExitSeed",
     "OpenPosition",
     "PaperState",
 ]
+
+
+@dataclass(frozen=True)
+class ExitSeed:
+    """Minimal sufficient statistics to rebuild trailing/ATR exits on resume (§8, issue C).
+
+    Persisting only these *bounded* values (not the full bar history — plan blocker #5 /
+    Point 9) lets a resumed run re-seed its exit-level computation so trailing / ATR exits
+    are not degenerate on the first bars after a resume.
+
+    Attributes:
+        extreme_price: The running peak (long) / trough (short) price reached since entry.
+            Seeds trailing-stop / chandelier ratcheting so a resume does not reset the stop
+            to the current bar. ``None`` when no trailing-style exit requires it.
+        atr_window: The last ``period + 1`` bars' high/low/close (as ``[high, low, close]``
+            per bar, in bar order) needed to seed Wilder ATR warmup. Bounded, so storage cost
+            is independent of history length. ``None`` when no ATR-based exit requires it.
+    """
+
+    extreme_price: float | None = None
+    atr_window: list[list[float]] | None = None
 
 
 @dataclass(frozen=True)
@@ -64,14 +86,16 @@ CREATE TABLE IF NOT EXISTS paper_state (
     pending_levels   TEXT,
     signal_fn_state  TEXT,
     config_ref       TEXT,
-    aux_data         TEXT
+    aux_data         TEXT,
+    exit_seed        TEXT
 )
 """
 
 _INSERT_SQL = (
     "INSERT OR REPLACE INTO paper_state "
     "(run_id, instrument_id, last_processed_ns, last_price, ledger, open_position, "
-    "pending_levels, signal_fn_state, config_ref, aux_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "pending_levels, signal_fn_state, config_ref, aux_data, exit_seed) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -190,6 +214,10 @@ class PaperState:
             (via ``yaml.safe_dump(asdict(base))``). Stored for self-contained resume
             but *not* auto-applied on ``load()`` — caller must pass ``config`` to
             ``step()``/``run_auto()`` or reconstruct via ``get_config_dict()`` (Point 8).
+        exit_seed: Minimal exit-level seed (extreme price + ATR warmup window) written by
+            the backend at the end of each ``execute`` and re-applied on resume so trailing /
+            ATR exits are not degenerate after a restart (issue C). ``None`` when flat or no
+            path-dependent exit needs it.
     """
 
     def __init__(
@@ -203,6 +231,7 @@ class PaperState:
         signal_fn_state: dict[str, Any] | None = None,
         config_ref: str | None = None,
         aux_data: dict[str, Any] | None = None,
+        exit_seed: ExitSeed | None = None,
     ) -> None:
         self.instrument_id = instrument_id
         self.ledger = ledger
@@ -215,6 +244,7 @@ class PaperState:
         )
         self.config_ref = config_ref
         self.aux_data: dict[str, Any] = aux_data if aux_data is not None else {}
+        self.exit_seed: ExitSeed | None = exit_seed
 
     def get_config_dict(self) -> dict[str, Any] | None:
         """Return the stored ``BacktestConfig`` as a dict, or ``None`` if absent.
@@ -251,6 +281,9 @@ class PaperState:
             # Migrate old DBs that lack aux_data column (added after T8).
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ALTER TABLE paper_state ADD COLUMN aux_data TEXT")
+            # Migrate DBs that lack exit_seed column (added with issue C).
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE paper_state ADD COLUMN exit_seed TEXT")
             conn.execute(
                 _INSERT_SQL,
                 (
@@ -264,6 +297,7 @@ class PaperState:
                     _json(self.signal_fn_state),
                     self.config_ref,
                     _aux_to_json(self.aux_data),
+                    _json(asdict(self.exit_seed)) if self.exit_seed else None,
                 ),
             )
             conn.close()
@@ -280,58 +314,64 @@ class PaperState:
         """
         if not Path(path).exists():
             raise StateCorruptionError(f"paper state file {path} does not exist")
+        aux_text: str | None = None
+        exit_seed_text: str | None = None
         try:
             conn = sqlite3.connect(str(path), isolation_level=None)
             # Ensure aux_data column exists for old DBs
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ALTER TABLE paper_state ADD COLUMN aux_data TEXT")
+            # Ensure exit_seed column exists for the newest schema
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE paper_state ADD COLUMN exit_seed TEXT")
             try:
                 row = conn.execute(
                     "SELECT instrument_id, last_processed_ns, last_price, ledger, "
-                    "open_position, pending_levels, signal_fn_state, config_ref, aux_data "
+                    "open_position, pending_levels, signal_fn_state, config_ref, aux_data, "
+                    "exit_seed "
                     "FROM paper_state "
                     "WHERE run_id = ?",
                     (run_id,),
                 ).fetchone()
             except sqlite3.OperationalError:
-                row = conn.execute(
-                    "SELECT instrument_id, last_processed_ns, last_price, ledger, "
-                    "open_position, pending_levels, signal_fn_state, config_ref "
-                    "FROM paper_state "
-                    "WHERE run_id = ?",
-                    (run_id,),
-                ).fetchone()
+                try:
+                    row = conn.execute(
+                        "SELECT instrument_id, last_processed_ns, last_price, ledger, "
+                        "open_position, pending_levels, signal_fn_state, config_ref, aux_data "
+                        "FROM paper_state "
+                        "WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    row = conn.execute(
+                        "SELECT instrument_id, last_processed_ns, last_price, ledger, "
+                        "open_position, pending_levels, signal_fn_state, config_ref "
+                        "FROM paper_state "
+                        "WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()
             conn.close()
         except sqlite3.Error as exc:
             raise StateCorruptionError(f"could not read paper state at {path}: {exc}") from exc
         if row is None:
             raise StateCorruptionError(f"no paper state for run_id={run_id!r} in {path}")
 
-        # Handle schema with or without aux_data column (backward compat).
-        if len(row) == 8:
-            (
-                instrument_id,
-                last_ns,
-                last_price,
-                ledger_text,
-                open_text,
-                pending_text,
-                sfn_text,
-                config_ref,
-            ) = row
-            aux_text = None
-        else:
-            (
-                instrument_id,
-                last_ns,
-                last_price,
-                ledger_text,
-                open_text,
-                pending_text,
-                sfn_text,
-                config_ref,
-                aux_text,
-            ) = row
+        # Handle schema variants: newest (10 cols with aux+exit_seed), middle (9 with aux
+        # only), oldest (8 without either). ``row[0:8]`` is stable across all three.
+        (
+            instrument_id,
+            last_ns,
+            last_price,
+            ledger_text,
+            open_text,
+            pending_text,
+            sfn_text,
+            config_ref,
+        ) = row[0:8]
+        if len(row) > 8:
+            aux_text = row[8]
+        if len(row) > 9:
+            exit_seed_text = row[9]
         ledger = _ledger_from_json(ledger_text)
         open_position = None
         if open_text is not None:
@@ -339,6 +379,12 @@ class PaperState:
                 open_position = OpenPosition(**_from_json(open_text, {}))
             except TypeError as exc:
                 raise StateCorruptionError(f"malformed open_position: {exc}") from exc
+        exit_seed = None
+        if exit_seed_text:
+            try:
+                exit_seed = ExitSeed(**_from_json(exit_seed_text, {}))
+            except (TypeError, ValueError) as exc:
+                raise StateCorruptionError(f"malformed exit_seed: {exc}") from exc
         return cls(
             instrument_id=instrument_id,
             ledger=ledger,
@@ -349,4 +395,5 @@ class PaperState:
             signal_fn_state=_from_json(sfn_text, {}),
             config_ref=config_ref,
             aux_data=_aux_from_json(aux_text),
+            exit_seed=exit_seed,
         )

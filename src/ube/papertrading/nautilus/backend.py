@@ -118,6 +118,11 @@ class NautilusPaperEngine(PaperEngine):
                 else overrides.get("starting_balance", 100_000.0)
             )
             balance = starting_balance
+            multiplier = (
+                1.0
+                if canonical.contract_multiplier is None
+                else float(canonical.contract_multiplier)
+            )
             if state.ledger.events:
                 total_cash = 0.0
                 has_cash = False
@@ -133,6 +138,18 @@ class NautilusPaperEngine(PaperEngine):
                         total_cash -= float(e.amount)
                 if has_cash:
                     balance = total_cash
+            # Issue B: mark the open position to market so a resumed run sizes against equity
+            # (cash + unrealized PnL), not deflated/inflated cash-only capital. This keeps a
+            # split run sizing identically to an uninterrupted run over the same bars. The
+            # equity = cash flows + unrealized PnL of the open position at ``state.last_price``.
+            if state.open_position is not None and state.last_price is not None:
+                unrealized = (
+                    (float(state.last_price) - float(state.open_position.entry_price))
+                    * float(state.open_position.quantity)
+                    * float(state.open_position.side)
+                    * multiplier
+                )
+                balance += unrealized
 
             # Leverage: mirror backtest's sizing * margin logic — sizing leverage
             # dominates, override is fallback, cash accounts force 1.0 (§3.2).
@@ -147,11 +164,6 @@ class NautilusPaperEngine(PaperEngine):
             else:
                 lev = max(sizing_lev, override_lev)
                 leverage = lev if lev > 0 else 1.0
-            multiplier = (
-                1.0
-                if canonical.contract_multiplier is None
-                else float(canonical.contract_multiplier)
-            )
             # Funding: per-period rates from cost model + calendar interval.
             from ube.core.instrument import resolve_funding_interval_hours
 
@@ -185,6 +197,7 @@ class NautilusPaperEngine(PaperEngine):
                 borrow_rate=borrow_rate,
                 funding_interval_ns=interval_ns,
                 open_position=state.open_position,
+                exit_seed=state.exit_seed,
             )
             strategy = UbePaperStrategy(config=strat_cfg)
 
@@ -199,12 +212,16 @@ class NautilusPaperEngine(PaperEngine):
                 leverage=leverage,
                 strategy=strategy,
                 overrides=overrides,
-                open_position=state.open_position,
             )
 
             SIGNAL_REGISTRY.clear()
             run_node(node)
             events = list(strategy.events)
+            # Issue C: persist the exit seed (minimal trailing/ATR statistics) so a future
+            # resume re-seeds exit-level computation instead of starting degenerate. Written
+            # by the backend because it owns the strategy lifecycle; ``step`` does not see the
+            # strategy's internal state. Cleared automatically when the position is flat.
+            state.exit_seed = strategy.exit_seed()
             # Starting balance booked as a cash inflow at the first bar boundary (§4.6
             # step 4 — the cash leg of the equity curve). Emitted once per session (only
             # on the first ``step`` slice, when the cursor has not advanced yet).
