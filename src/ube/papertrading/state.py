@@ -87,15 +87,16 @@ CREATE TABLE IF NOT EXISTS paper_state (
     signal_fn_state  TEXT,
     config_ref       TEXT,
     aux_data         TEXT,
-    exit_seed        TEXT
+    exit_seed        TEXT,
+    last_funding_ns  INTEGER
 )
 """
 
 _INSERT_SQL = (
     "INSERT OR REPLACE INTO paper_state "
     "(run_id, instrument_id, last_processed_ns, last_price, ledger, open_position, "
-    "pending_levels, signal_fn_state, config_ref, aux_data, exit_seed) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "pending_levels, signal_fn_state, config_ref, aux_data, exit_seed, last_funding_ns) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -232,6 +233,7 @@ class PaperState:
         config_ref: str | None = None,
         aux_data: dict[str, Any] | None = None,
         exit_seed: ExitSeed | None = None,
+        last_funding_ns: int | None = None,
     ) -> None:
         self.instrument_id = instrument_id
         self.ledger = ledger
@@ -245,6 +247,7 @@ class PaperState:
         self.config_ref = config_ref
         self.aux_data: dict[str, Any] = aux_data if aux_data is not None else {}
         self.exit_seed: ExitSeed | None = exit_seed
+        self.last_funding_ns: int | None = last_funding_ns
 
     def get_config_dict(self) -> dict[str, Any] | None:
         """Return the stored ``BacktestConfig`` as a dict, or ``None`` if absent.
@@ -284,6 +287,9 @@ class PaperState:
             # Migrate DBs that lack exit_seed column (added with issue C).
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ALTER TABLE paper_state ADD COLUMN exit_seed TEXT")
+            # Migrate DBs that lack last_funding_ns column (added with funding clock).
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE paper_state ADD COLUMN last_funding_ns INTEGER")
             conn.execute(
                 _INSERT_SQL,
                 (
@@ -298,6 +304,7 @@ class PaperState:
                     self.config_ref,
                     _aux_to_json(self.aux_data),
                     _json(asdict(self.exit_seed)) if self.exit_seed else None,
+                    self.last_funding_ns,
                 ),
             )
             conn.close()
@@ -316,6 +323,7 @@ class PaperState:
             raise StateCorruptionError(f"paper state file {path} does not exist")
         aux_text: str | None = None
         exit_seed_text: str | None = None
+        last_funding_ns: int | None = None
         try:
             conn = sqlite3.connect(str(path), isolation_level=None)
             # Ensure aux_data column exists for old DBs
@@ -324,11 +332,14 @@ class PaperState:
             # Ensure exit_seed column exists for the newest schema
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ALTER TABLE paper_state ADD COLUMN exit_seed TEXT")
+            # Ensure last_funding_ns column exists (funding clock)
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE paper_state ADD COLUMN last_funding_ns INTEGER")
             try:
                 row = conn.execute(
                     "SELECT instrument_id, last_processed_ns, last_price, ledger, "
                     "open_position, pending_levels, signal_fn_state, config_ref, aux_data, "
-                    "exit_seed "
+                    "exit_seed, last_funding_ns "
                     "FROM paper_state "
                     "WHERE run_id = ?",
                     (run_id,),
@@ -337,27 +348,36 @@ class PaperState:
                 try:
                     row = conn.execute(
                         "SELECT instrument_id, last_processed_ns, last_price, ledger, "
-                        "open_position, pending_levels, signal_fn_state, config_ref, aux_data "
+                        "open_position, pending_levels, signal_fn_state, config_ref, aux_data, "
+                        "exit_seed "
                         "FROM paper_state "
                         "WHERE run_id = ?",
                         (run_id,),
                     ).fetchone()
                 except sqlite3.OperationalError:
-                    row = conn.execute(
-                        "SELECT instrument_id, last_processed_ns, last_price, ledger, "
-                        "open_position, pending_levels, signal_fn_state, config_ref "
-                        "FROM paper_state "
-                        "WHERE run_id = ?",
-                        (run_id,),
-                    ).fetchone()
+                    try:
+                        row = conn.execute(
+                            "SELECT instrument_id, last_processed_ns, last_price, ledger, "
+                            "open_position, pending_levels, signal_fn_state, config_ref, aux_data "
+                            "FROM paper_state "
+                            "WHERE run_id = ?",
+                            (run_id,),
+                        ).fetchone()
+                    except sqlite3.OperationalError:
+                        row = conn.execute(
+                            "SELECT instrument_id, last_processed_ns, last_price, ledger, "
+                            "open_position, pending_levels, signal_fn_state, config_ref "
+                            "FROM paper_state "
+                            "WHERE run_id = ?",
+                            (run_id,),
+                        ).fetchone()
             conn.close()
         except sqlite3.Error as exc:
             raise StateCorruptionError(f"could not read paper state at {path}: {exc}") from exc
         if row is None:
             raise StateCorruptionError(f"no paper state for run_id={run_id!r} in {path}")
 
-        # Handle schema variants: newest (10 cols with aux+exit_seed), middle (9 with aux
-        # only), oldest (8 without either). ``row[0:8]`` is stable across all three.
+        # Handle schema variants: newest (11 cols), 10 with aux+exit_seed, 9 with aux only, 8 base.
         (
             instrument_id,
             last_ns,
@@ -372,6 +392,8 @@ class PaperState:
             aux_text = row[8]
         if len(row) > 9:
             exit_seed_text = row[9]
+        if len(row) > 10:
+            last_funding_ns = row[10]
         ledger = _ledger_from_json(ledger_text)
         open_position = None
         if open_text is not None:
@@ -396,4 +418,5 @@ class PaperState:
             config_ref=config_ref,
             aux_data=_aux_from_json(aux_text),
             exit_seed=exit_seed,
+            last_funding_ns=last_funding_ns,
         )

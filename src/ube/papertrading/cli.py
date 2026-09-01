@@ -11,9 +11,11 @@ The YAML shape mirrors what :func:`ube.papertrading.core.init` serializes
   * ``symbol`` / ``asset_class`` are the minimal instrument fields (the rest default).
   * nested configs (``risk``, ``signal``, ``benchmark``, ``cost_model``) are rebuilt from
     their dataclass dicts.
-  * exits may carry a ``_type`` discriminator (``TakeProfit``/``StopLoss``/``ATRStop``/
-    ``TrailingStop``/``TimeExit``/``ChandelierExit``) to disambiguate ``StopLoss`` vs
-    ``TrailingStop``, which share all fields.
+  * exits **must** carry a ``_type`` discriminator for ``StopLoss`` vs ``TrailingStop``
+    (both are ``percent``-only and indistinguishable without it); other exits may omit
+    ``_type`` and are inferred from keys. Supported ``_type`` values: ``TakeProfit``,
+    ``StopLoss``, ``ATRStop``, ``TrailingStop``, ``TimeExit``, ``ChandelierExit``.
+    Without ``_type`` for the ambiguous pair the loader raises ``ConfigError``.
   * an optional ``paper`` mapping on the top level carries ``PaperConfig``-only fields
     (``state_path``, ``starting_balance``, ``engine``).
 """
@@ -137,19 +139,9 @@ def _rebuild_instrument(data: Any) -> Instrument:
 
 def _load_base(data: dict[str, Any]) -> BacktestConfig:
     """Rebuild a ``BacktestConfig`` from its ``asdict``-style YAML mapping."""
-    needed_keys = {
-        "instrument",
-        "cost_model",
-        "risk",
-        "signal",
-        "benchmark",
-        "engine",
-        "engine_overrides",
-        "date_range",
-        "base_currency",
-        "warmup_bars",
-    }
-    unknown = set(data) - needed_keys - {"paper"}
+    # Derive allowed top-level keys from the dataclass (fix 9: no hard-coded allowlist).
+    allowed = set(BacktestConfig.__dataclass_fields__.keys()) | {"paper"}
+    unknown = set(data) - allowed
     if unknown:
         raise ConfigError(f"unrecognized config key(s): {sorted(unknown)}")
     instrument = _rebuild_instrument(data.get("instrument"))

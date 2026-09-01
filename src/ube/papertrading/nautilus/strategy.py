@@ -66,6 +66,8 @@ class UbePaperConfig(StrategyConfig):  # type: ignore[misc]
     funding_interval_ns: int = 0
     open_position: Any = None
     exit_seed: Any = None  # ube ExitSeed — seeds trailing/ATR exits on resume (issue C)
+    bar_period_ns: int = 0  # median bar period for seeding synthetic timestamps (issue 1)
+    last_funding_ns: int | None = None  # persisted funding clock (issue 2)
 
 
 class UbePaperStrategy(Strategy):  # type: ignore[misc]
@@ -119,16 +121,23 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         )
         # Aux data for ATR-based exits (from PaperState.aux_data, backtest parity §5.2).
         self._aux_data: dict[str, Any] = {}
-        # Funding: track last funding timestamp to avoid double-counting.
-        self._last_funding_ns: int | None = None
+        # Funding: track last funding timestamp to avoid double-counting. Persisted in
+        # PaperState.last_funding_ns so a resume continues from the exact saved point
+        # (issue 2) — not from bar spacing, which would be contaminated by synthetic seed bars.
+        _lf = getattr(config, "last_funding_ns", None)
+        self._last_funding_ns: int | None = int(_lf) if _lf is not None else None
+        self._bar_period_ns: int = int(getattr(config, "bar_period_ns", 0) or 0)
         # Exit seed (issue C): on resume, the persistence layer writes the minimal exit
         # statistics (running extreme price + ATR warmup window) so trailing / ATR exits are
         # not degenerate on the first bars after a restart. Tracks:
         #   _extreme_price — the running peak (long) / trough (short) since entry.
         #   _atr_window    — a bounded rolling [high, low, close] window for ATR warmup.
-        # The bars for these are built in ``on_start`` (needs instrument precision) and the
-        # current values are exposed via :meth:`exit_seed` for the backend to persist.
+        # The bars for these are built lazily on the first real bar (needs instrument
+        # precision + the first bar's live/hist timestamps to assign proper preceding
+        # timestamps — issue 1). The current values are exposed via :meth:`exit_seed` for
+        # the backend to persist.
         self._seed: ExitSeed | None = config.exit_seed
+        self._seeded: bool = False
         self._extreme_price: float | None = (
             float(config.exit_seed.extreme_price) if config.exit_seed else None
         )
@@ -186,59 +195,80 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self.stop()
             return
         self._quote = str(getattr(self._instrument, "settlement_currency", "USDT"))
-        # Issue C: seed the exit-level bar buffer with the persisted minimal statistics
-        # before any live bars are processed, so trailing/ATR exits are not degenerate on the
-        # first bars after a resume. These synthetic bars are used *only* for exit-level
-        # computation (via ``_build_market_data``); they are never published to the sandbox,
-        # so they cannot generate spurious orders.
-        self._seed_exit_bars()
+        # Issue C: seeding is now lazy in ``on_bar`` (needs the first real bar's
+        # live/hist timestamps and the bar period to assign proper preceding
+        # timestamps — issue 1). The synthetic bars are used *only* for exit-level
+        # computation (via ``_build_market_data``); they are never published to the
+        # sandbox, so they cannot generate spurious orders.
         if self._bar_type is not None:
             self.subscribe_bars(self._bar_type)
         get_ready_event().set()
         self.log.info(f"UbePaperStrategy started for {self._venue_iid}")
 
-    def _seed_exit_bars(self) -> None:
-        """Prepend the persisted extreme + ATR-window seed bars to ``_bars`` (issue C)."""
-        if self._instrument is None or self._seed is None or self._sim_side == 0:
+    def _ensure_seeded(self, bar: Bar, hist: int) -> None:
+        """Lazily prepend persisted seed bars with proper preceding timestamps (issue 1)."""
+        if self._seeded or self._seed is None or self._sim_side == 0 or self._instrument is None:
+            return
+        if self._bars:
+            # Already have bars (should only happen if on_start seeded); avoid double-seed
+            self._seeded = True
             return
         seed = self._seed
+        n_atr = len(seed.atr_window) if seed.atr_window else 0
+        has_extreme = seed.extreme_price is not None
+        n_seed = (1 if has_extreme else 0) + n_atr
+        if n_seed == 0:
+            self._seeded = True
+            return
+        period = self._bar_period_ns or 3_600_000_000_000
         pp = self._instrument.price_precision
         sp = self._instrument.size_precision
         assert self._bar_type is not None
-        # An extreme-price bar first (running peak/trough for trailing stops). Its OHLC are
-        # all set to the extreme so ``_running_extreme_since`` ratchets correctly from bar 0.
-        if seed.extreme_price is not None:
-            p = Price(float(seed.extreme_price), pp)
-            self._bars.append(
-                Bar(
+        # Create n_seed synthetic bars immediately before the first real bar,
+        # spaced by exactly one bar period, so elapsed-time calculations remain
+        # 1h→1h→1h and funding is not contaminated by a huge 0→hist gap.
+        # Both live (sandbox) and hist (ube) timelines are spaced.
+        for i in range(n_seed):
+            is_extreme = has_extreme and i == 0
+            # Synthetic bars are never published to the sandbox; their live clock is
+            # irrelevant. Store the historical (test-clock) timestamp in ts_event so
+            # _build_market_data can recover it without a registry entry. Spacing remains
+            # exactly one bar period, so no funding contamination (synthetic never accrues
+            # funding — funding uses the persisted _last_funding_ns, not _bars spacing).
+            h = int(hist) - (n_seed - i) * int(period)
+            if is_extreme:
+                price = float(seed.extreme_price)  # type: ignore[arg-type]
+                p = Price(price, pp)
+                b = Bar(
                     bar_type=self._bar_type,
                     open=p,
                     high=p,
                     low=p,
                     close=p,
                     volume=Quantity(0.0, sp),
-                    ts_event=0,
-                    ts_init=0,
+                    ts_event=h,
+                    ts_init=h,
                 )
-            )
-        # Then the ATR warmup window (last period+1 real bars' high/low/close).
-        if seed.atr_window:
-            for hlc in seed.atr_window:
-                self._bars.append(
-                    Bar(
-                        bar_type=self._bar_type,
-                        open=Price(float(hlc[2]), pp),
-                        high=Price(float(hlc[0]), pp),
-                        low=Price(float(hlc[1]), pp),
-                        close=Price(float(hlc[2]), pp),
-                        volume=Quantity(0.0, sp),
-                        ts_event=0,
-                        ts_init=0,
-                    )
+            else:
+                idx = i - (1 if has_extreme else 0)
+                hlc = seed.atr_window[idx]  # type: ignore[index]
+                b = Bar(
+                    bar_type=self._bar_type,
+                    open=Price(float(hlc[2]), pp),
+                    high=Price(float(hlc[0]), pp),
+                    low=Price(float(hlc[1]), pp),
+                    close=Price(float(hlc[2]), pp),
+                    volume=Quantity(0.0, sp),
+                    ts_event=h,
+                    ts_init=h,
                 )
-        # entry_bar is 0 (set in __init__ for a resumed position) — the extreme bar, when
-        # present, sits at index 0 so the running peak incorporates the persisted extreme.
+            self._bars.append(b)
         self._entry_bar = 0
+        self._seeded = True
+
+    def _seed_exit_bars(self) -> None:
+        """Deprecated: seeding is now lazy in ``on_bar`` with proper timestamps."""
+        return
 
     @property
     def events(self) -> list[LedgerEvent]:
@@ -256,7 +286,15 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         closes = np.array([float(b.close.as_double()) for b in self._bars], dtype=np.float64)
         volumes = np.array([float(b.volume.as_double()) for b in self._bars], dtype=np.float64)
         # Use historical timestamps for MarketData index (so exit levels align).
-        idx = np.array([int(SIGNAL_REGISTRY.at(b.ts_event)[4]) for b in self._bars], dtype=np.int64)
+        # Synthetic seed bars are not in SIGNAL_REGISTRY; their ts_event already
+        # is the historical timestamp (see _ensure_seeded), so fall back to it.
+        idx_vals = []
+        for b in self._bars:
+            hist = SIGNAL_REGISTRY.at(b.ts_event)[4]
+            if hist == 0:
+                hist = int(b.ts_event)
+            idx_vals.append(int(hist))
+        idx = np.array(idx_vals, dtype=np.int64)
         # Bypass validation — bars are already validated at ingestion.
         md = MarketData.__new__(MarketData)
         object.__setattr__(md, "open", opens)
@@ -334,6 +372,16 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         if self._instrument is None:
             return
         SIGNAL_REGISTRY.bars_processed += 1
+        # Bars carry live-clock timestamps for sandbox matching; recover the historical
+        # (test-clock) ts from the registry so every emitted ``LedgerEvent`` stays on the
+        # ube timeline (§9.4 comparability).
+        le, lx, se, sx, hist = SIGNAL_REGISTRY.at(bar.ts_event)
+        self._hist_ts = int(hist)
+        # Issue 1: lazily seed exit-level bar buffer with proper preceding timestamps
+        # (not 0) so elapsed-time calculations are not contaminated by a huge 0→hist gap.
+        # Seeding happens only on the first real bar after a resume, before the real bar
+        # is buffered, so spacing remains 1h→1h→1h.
+        self._ensure_seeded(bar, self._hist_ts)
         self._last_close = float(bar.close.as_double())
         # Buffer bar for exit level computation.
         self._bars.append(bar)
@@ -355,11 +403,6 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 self._atr_window.append([hi, lo, float(bar.close.as_double())])
                 if len(self._atr_window) > self._atr_period + 1:
                     self._atr_window.pop(0)
-        # Bars carry live-clock timestamps for sandbox matching; recover the historical
-        # (test-clock) ts from the registry so every emitted ``LedgerEvent`` stays on the
-        # ube timeline (§9.4 comparability).
-        le, lx, se, sx, hist = SIGNAL_REGISTRY.at(bar.ts_event)
-        self._hist_ts = int(hist)
 
         # — Risk exits (T4) — checked before signals, stop precedence.
         risk_exit = self._check_risk_exits()
@@ -385,17 +428,21 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
 
         # — Funding carry (T5) — accrues on *every* bar the position is open, regardless of
         # whether a signal fires this bar. Placed before the signal early-return so funding
-        # is not limited to signal bars (bars that only hold a position still accrue).
+        # is not limited to signal bars. Separated from synthetic indicator history:
+        # funding uses the persisted real-market clock (_last_funding_ns), not bar spacing
+        # derived from _bars (which contains synthetic seed bars). Synthetic bars never
+        # generate funding (issue 3).
         if self._sim_side != 0 and (self._funding_rate != 0.0 or self._borrow_rate != 0.0):
-            # Elapsed-time accrual: funding per bar = rate * notional * (bar_span / interval).
-            # For interval_ns==0, treat as per-bar rate (frac=1.0).
-            bar_span = 0
-            if len(self._bars) >= 2:
-                # Use historical timestamps for bar_span (not live ts).
-                prev_hist = int(SIGNAL_REGISTRY.at(self._bars[-2].ts_event)[4])
-                bar_span = self._hist_ts - prev_hist
-            elif self._last_funding_ns is not None:
-                bar_span = self._hist_ts - self._last_funding_ns
+            # Elapsed-time accrual using the persisted funding clock (issue 2).
+            # _last_funding_ns is set at entry and after each funding event; on resume it
+            # is restored from PaperState.last_funding_ns, so the next bar accrues
+            # hist - last_funding (correct even across a gap).
+            if self._last_funding_ns is None:
+                bar_span = 0
+            else:
+                bar_span = self._hist_ts - int(self._last_funding_ns)
+                if bar_span < 0:
+                    bar_span = 0
             frac = 1.0
             if self._funding_interval_ns > 0 and bar_span > 0:
                 frac = bar_span / float(self._funding_interval_ns)
@@ -424,16 +471,22 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
 
         if not (le or lx or se or sx):
             return
+        allow_short = not self.config.no_short
         action = decide_action(
             self._sim_side,
             long_entry=le,
             long_exit=lx,
             short_entry=se,
             short_exit=sx,
-            allow_short=not self.config.no_short,
+            allow_short=allow_short,
             policy=self.config.on_opposite_signal,
         )
         if action == "hold":
+            if not allow_short and (se or sx):
+                self.log.warning(
+                    f"Short signal ignored for long-only {self._iid}: se={se} sx={sx} "
+                    f"at bar {self._hist_ts} (flat or no short allowed)"
+                )
             return
 
         close_first = action in ("close", "reverse")
@@ -507,25 +560,33 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self._entry_price = float(event.last_px.as_double())
             self._last_funding_ns = self._hist_ts
             # Issue C: a fresh (non-resume) entry starts a new running extreme and ATR window
-            # from this bar; reset the previous position's seed state.
-            self._extreme_price = None
-            self._atr_window = []
-            # Recompute on this bar so the entry bar's high/low seeds the extreme.
+            # from this bar. The fill arrives asynchronously (one bar after submission), so
+            # the next bar's on_bar may have already set _extreme_price/_atr_window from
+            # that next bar's high/low. Preserve the more extreme value and prepend the
+            # entry bar to the window instead of overwriting (fix 6).
             if len(self._bars):
                 seg = self._bars[-1]
-                self._extreme_price = (
-                    float(seg.high.as_double())
-                    if self._sim_side > 0
-                    else float(seg.low.as_double())
-                )
+                seg_high = float(seg.high.as_double())
+                seg_low = float(seg.low.as_double())
+                seg_close = float(seg.close.as_double())
+                if self._extreme_price is None:
+                    self._extreme_price = seg_high if self._sim_side > 0 else seg_low
+                else:
+                    if self._sim_side > 0:
+                        self._extreme_price = max(self._extreme_price, seg_high)
+                    else:
+                        self._extreme_price = min(self._extreme_price, seg_low)
                 if self._atr_period > 0:
-                    self._atr_window = [
-                        [
-                            float(seg.high.as_double()),
-                            float(seg.low.as_double()),
-                            float(seg.close.as_double()),
-                        ]
-                    ]
+                    entry_hlc = [seg_high, seg_low, seg_close]
+                    if not self._atr_window:
+                        self._atr_window = [entry_hlc]
+                    elif self._atr_window[0] != entry_hlc:
+                        self._atr_window.insert(0, entry_hlc)
+                        if len(self._atr_window) > self._atr_period + 1:
+                            self._atr_window.pop()
+            else:
+                self._extreme_price = None
+                self._atr_window = []
         elif is_close:
             exit_reason = close_reason or "signal"
             # For a reverse, the opening order is already in flight; let its fill set the

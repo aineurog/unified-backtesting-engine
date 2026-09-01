@@ -53,6 +53,33 @@ class NautilusPaperEngine(PaperEngine):
         asset_class = canonical.asset_class if isinstance(canonical, Instrument) else ""
         overrides = dict(config.base.engine_overrides) if config.base.engine_overrides else {}
         no_short = not allows_short(asset_class)
+        # Explicit account-type mapping (fix 4): long-only (crypto_spot, stocks) => CASH
+        # in a true spot model, margined (crypto_perp, futures, etc.) => MARGIN.
+        # For paper trading, spot currently retains MARGIN to allow phantom closes on
+        # resume (sandbox not seeded — issue A deferred). True CASH would reject a
+        # reduce_only close without a real position.
+        if "account_type" not in overrides:
+            # Ideal: "cash" if no_short else "margin". Keep MARGIN for no_short until seeding.
+            overrides["account_type"] = "margin"
+            if no_short:
+                import warnings
+
+                warnings.warn(
+                    "Spot/stocks paper trading defaulting to MARGIN account for resume "
+                    "compatibility (sandbox not seeded with open position). For true "
+                    "CASH spot, set engine_overrides.account_type='cash'."
+                )
+        # Warn if resuming a CASH spot with open position (will be rejected without seeding)
+        _acct_tmp = overrides.get("account_type", "margin")
+        _acct_type_tmp = "MARGIN" if _acct_tmp == "margin" else "CASH"
+        if no_short and state.open_position is not None and _acct_type_tmp == "CASH":
+            import warnings
+
+            warnings.warn(
+                f"Resuming {asset_class!r} (CASH) with open_position {state.open_position} "
+                "but sandbox is not seeded — reduce_only close may be rejected. "
+                "Consider using MARGIN for paper spot or implementing position seeding."
+            )
         # Nautilus closes its event loop on ``node.dispose()``; a second ``step`` in the same
         # process (e.g. a second integration test) would otherwise hit "Event loop is closed".
         # Give every run a fresh live loop before the node is built.
@@ -198,6 +225,8 @@ class NautilusPaperEngine(PaperEngine):
                 funding_interval_ns=interval_ns,
                 open_position=state.open_position,
                 exit_seed=state.exit_seed,
+                bar_period_ns=period_ns,
+                last_funding_ns=state.last_funding_ns,
             )
             strategy = UbePaperStrategy(config=strat_cfg)
 
@@ -222,6 +251,15 @@ class NautilusPaperEngine(PaperEngine):
             # by the backend because it owns the strategy lifecycle; ``step`` does not see the
             # strategy's internal state. Cleared automatically when the position is flat.
             state.exit_seed = strategy.exit_seed()
+            # Issue 2: persist the funding clock so a resume continues from the exact
+            # saved point (not from bar spacing, which is contaminated by synthetic seed bars).
+            # Synthetic indicator history must never generate funding (issue 3).
+            try:
+                sim_side = int(getattr(strategy, "_sim_side", 0))
+                lf = getattr(strategy, "_last_funding_ns", None)
+                state.last_funding_ns = int(lf) if sim_side != 0 and lf is not None else None
+            except Exception:
+                state.last_funding_ns = None
             # Starting balance booked as a cash inflow at the first bar boundary (§4.6
             # step 4 — the cash leg of the equity curve). Emitted once per session (only
             # on the first ``step`` slice, when the cursor has not advanced yet).
