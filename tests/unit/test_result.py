@@ -13,7 +13,6 @@ from ube.core.data import MarketData
 from ube.core.errors import DataShapeError, UndeclaredConfigError
 from ube.core.instrument import Instrument
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, Trade, equity_curve
-from ube.core.metrics import Metrics
 from ube.core.result import BacktestResult, result_hash
 
 # ---------------------------------------------------------------------------
@@ -251,11 +250,8 @@ def test_metrics_populated_and_benchmark_optional():
     result = BacktestResult.from_ledger(
         ledger, config, market_data=market_data, instruments=instruments
     )
-    # metrics are always computed at construction; without a benchmark the comparison
-    # fields are None but the standard set is present.
-    assert isinstance(result.metrics, Metrics)
-    assert result.metrics.excess_return is None
-    assert result.metrics.information_ratio is None
+    # metrics are computed by an external library, not by ube: the field stays None.
+    assert result.metrics is None
     assert result.benchmark is None
 
 
@@ -430,9 +426,8 @@ def test_save_load_round_trip(tmp_path):
     assert list(loaded.trade_table.columns) == list(result.trade_table.columns)
     assert loaded.trade_table.to_dict("records") == result.trade_table.to_dict("records")
     assert loaded.config.base_currency == "USD"
-    # metrics survive the pickle round-trip (§7.3 persistence) intact.
-    assert isinstance(loaded.metrics, Metrics)
-    assert loaded.metrics.total_return == result.metrics.total_return
+    # metrics (external library) survive the pickle round-trip (§7.3 persistence) intact.
+    assert loaded.metrics is None
     # The loaded result is still frozen.
     with pytest.raises(FrozenInstanceError):
         loaded.metrics = 1.0  # type: ignore[misc]

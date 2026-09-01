@@ -197,8 +197,9 @@ class LedgerEvent:
         ``side`` (±1), ``quantity`` (positive magnitude — direction is ``side``),
         ``price`` (> 0), optional ``notional`` (≥ 0), optional ``exit_reason`` (the
         §4.6 reason a *closing* fill was generated — entry fills leave it ``None``),
-        and ``gap_fill`` — the §4.6 flag marking a fill that jumped the requested
-        level.
+        ``order_id`` (the submitted order this fill executed against — the
+        ``order_submitted`` link), and ``gap_fill`` — the §4.6 flag marking a fill
+        that jumped the requested level.
 
     ``funding_payment``
         ``amount`` (signed — negative funding is *received*), ``currency``.
@@ -339,6 +340,19 @@ class EventLedger:
         for e in self._events:
             seen.setdefault(e.instrument_id, None)
         return tuple(seen)
+
+    def orders(self) -> tuple[LedgerEvent, ...]:
+        """The submitted orders (``order_submitted`` events), in append order (§4.6).
+
+        Only orders actually *placed* are represented — there is no order lifecycle
+        (no acknowledged / rejected / cancelled states); fills are the separate
+        :meth:`fills` stream, linked back to their order via ``fill.order_id``.
+        """
+        return tuple(e for e in self._events if e.event_type is EventType.ORDER_SUBMITTED)
+
+    def fills(self) -> tuple[LedgerEvent, ...]:
+        """The ``fill`` events, in append order (§4.6)."""
+        return tuple(e for e in self._events if e.event_type is EventType.FILL)
 
     def __len__(self) -> int:
         return len(self._events)
@@ -509,6 +523,27 @@ class Positions:
         object.__setattr__(self, "position", position)
 
 
+def _period_returns(equity: np.ndarray) -> np.ndarray:
+    """Simple per-bar returns from a cumulative equity curve.
+
+    ``returns[0] = 0.0`` (no prior bar); ``returns[i] = equity[i] / equity[i-1] - 1``
+    for ``i >= 1``. Where the prior bar's equity is ``<= 0`` the return is undefined and
+    is emitted as ``NaN`` — an account-level event (insolvency / liquidation) that
+    consumers must flag, never silently absorb.
+    """
+    n = equity.shape[0]
+    returns = np.zeros(n, dtype=np.float64)
+    if n > 1:
+        ratios = np.divide(
+            equity[1:],
+            equity[:-1],
+            out=np.full(n - 1, np.nan, dtype=np.float64),
+            where=equity[:-1] > 0.0,
+        )
+        returns[1:] = ratios - 1.0
+    return returns
+
+
 @dataclass(frozen=True)
 class EquityCurve:
     """A derived equity curve over a bar grid (§4.6).
@@ -516,6 +551,8 @@ class EquityCurve:
     Attributes:
         index: The grid — a tz-aware UTC ``DatetimeIndex``.
         equity: float64[n] values in ``base_currency``, aligned to ``index``.
+        returns: (property) simple per-bar returns ``r[0] = 0``, ``NaN`` where the
+            prior bar's equity was ``<= 0`` (see :func:`_period_returns`).
     """
 
     index: pd.Index
@@ -532,6 +569,33 @@ class EquityCurve:
             )
         equity.setflags(write=False)
         object.__setattr__(self, "equity", equity)
+
+    @property
+    def returns(self) -> np.ndarray:
+        """Simple per-bar returns: ``r[0] = 0``; ``NaN`` where prior equity ``<= 0``.
+
+        The ``NaN`` marks an account-level condition (insolvency / liquidation) rather
+        than silently producing ``0.0`` or ``inf`` — the external metrics layer should
+        flag it. Derived fresh on access (the stored source of truth is ``equity``).
+        """
+        return _period_returns(self.equity)
+
+    def resample(self, rule: str) -> EquityCurve:
+        """Resample the equity curve to a coarser frequency.
+
+        Equity is resampled with the **last** value per bucket (never summed), and the
+        returned curve's ``returns`` are then derived from that resampled equity — the
+        per-bar returns are never compounded or summed directly. Empty buckets (a period
+        with no bar) carry the prior equity forward, so a "no observation" bucket
+        contributes a ``0.0`` return. Requires a ``DatetimeIndex``.
+        """
+        if not isinstance(self.index, pd.DatetimeIndex):
+            raise DataShapeError("EquityCurve.resample requires a DatetimeIndex")
+        series = pd.Series(self.equity, index=self.index)
+        resampled = series.resample(rule).last().ffill()
+        return EquityCurve(
+            index=resampled.index, equity=resampled.to_numpy(dtype=np.float64)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1378,6 +1442,11 @@ def trade_table(
     initial_capital: float | None = None,
 ) -> pd.DataFrame:
     """One row per trade (closed *and* open), joined with the equity curve (§4.6).
+
+    This is a *convenience / reporting* view, not a canonical source of truth: the
+    ledger (:class:`EventLedger`) and the ``trades`` / ``positions`` / ``equity_curve``
+    derived views are authoritative; this table joins those with the combined equity
+    curve for display.
 
     Closed rows come from the same round-trip fold as :func:`trades`; open rows are the
     positions still held at the end of the run, marked to their last close. Every row

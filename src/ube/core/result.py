@@ -39,10 +39,10 @@ Design notes:
   round-trips the full event ledger (parquet cannot carry the heterogeneous sealed event
   schema cleanly). Opt-in and user-driven (§7.3); results are never auto-stored.
 
-``metrics`` is populated here by :func:`~ube.core.metrics.compute_metrics` (§4.9, §10) —
-the standard performance report (returns, risk, drawdown, trade stats) plus the benchmark
-comparison (excess return, information ratio). It is computed once, at construction, from
-the equity curve and (optional) benchmark curve.
+``metrics`` is left as ``None`` here: performance metrics are computed by an external
+library, not by ``ube`` (§10). The result still exposes the clean data the external
+metrics layer consumes — ``ledger``, ``trades``, ``trade_table``, ``positions``,
+``equity_curve`` (+ ``.returns`` / ``.resample``) and the (optional) benchmark curve.
 """
 
 from __future__ import annotations
@@ -77,7 +77,6 @@ from ube.core.ledger import (
     trade_table,
     trades,
 )
-from ube.core.metrics import compute_metrics
 
 __all__ = ["BacktestResult", "result_hash"]
 
@@ -96,16 +95,16 @@ class BacktestResult:
             spec'd per-trade columns joined with the equity curve (``position_size_pct``,
             ``trade_return_pct``, ``realized_pnl``/``realized_pnl_pct``,
             ``cum_return_pct``, ``balance``, fee splits, ``reason``; the ``_pct`` columns
-            are fractions — ``0.05`` = 5%).
+            are fractions — ``0.05`` = 5%). A convenience / reporting view — not a
+            canonical source of truth (see :func:`~ube.core.ledger.trade_table`).
         positions: The combined position-over-time series when the ledger is
             single-instrument, else ``None`` (see the module docstring).
         equity_curve: The combined equity curve in ``base_currency`` (§4.6).
         equity_curve_by_instrument: The per-instrument equity breakdown, on the same
             combined grid (§4.6).
-        metrics: Performance metrics, populated at construction by
-            :func:`~ube.core.metrics.compute_metrics` (§4.9, §10). Always a
-            :class:`~ube.core.metrics.Metrics` instance on results built via
-            :meth:`from_ledger`.
+        metrics: Performance metrics — always ``None`` here. Metrics are computed by an
+            external library (§10), not by ``ube``; this field is the hand-off slot the
+            external layer may populate.
         benchmark: The benchmark curve for this run (``None`` when not computed).
     """
 
@@ -213,7 +212,7 @@ class BacktestResult:
             positions=positions_view,
             equity_curve=combined,
             equity_curve_by_instrument=by_instrument,
-            metrics=compute_metrics(combined, benchmark=benchmark, trades=trades_view),
+            metrics=None,
             benchmark=benchmark,
         )
 

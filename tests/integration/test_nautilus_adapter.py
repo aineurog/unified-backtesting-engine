@@ -1440,6 +1440,10 @@ def test_nautilus_emits_order_submitted_events():
     assert all(e.order_id for e in submitted)
     # Submissions land on the two acting bars, in order.
     assert submitted[0].timestamp < submitted[1].timestamp
+    # Every fill links back to its submitted order via order_id (§4.6).
+    fills = _ledger_events(result, EventType.FILL)
+    submitted_ids = {e.order_id for e in submitted}
+    assert fills and all(e.order_id in submitted_ids for e in fills)
 
 
 # ---------------------------------------------------------------------------
