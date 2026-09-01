@@ -67,7 +67,8 @@ class NautilusPaperEngine(PaperEngine):
                 warnings.warn(
                     "Spot/stocks paper trading defaulting to MARGIN account for resume "
                     "compatibility (sandbox not seeded with open position). For true "
-                    "CASH spot, set engine_overrides.account_type='cash'."
+                    "CASH spot, set engine_overrides.account_type='cash'.",
+                    stacklevel=2,
                 )
         # Warn if resuming a CASH spot with open position (will be rejected without seeding)
         _acct_tmp = overrides.get("account_type", "margin")
@@ -78,7 +79,8 @@ class NautilusPaperEngine(PaperEngine):
             warnings.warn(
                 f"Resuming {asset_class!r} (CASH) with open_position {state.open_position} "
                 "but sandbox is not seeded — reduce_only close may be rejected. "
-                "Consider using MARGIN for paper spot or implementing position seeding."
+                "Consider using MARGIN for paper spot or implementing position seeding.",
+                stacklevel=2,
             )
         # Nautilus closes its event loop on ``node.dispose()``; a second ``step`` in the same
         # process (e.g. a second integration test) would otherwise hit "Event loop is closed".
