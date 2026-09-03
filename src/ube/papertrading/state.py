@@ -32,6 +32,11 @@ __all__ = [
     "ExitSeed",
     "OpenPosition",
     "PaperState",
+    "get_or_create_run_id",
+    "save_trades",
+    "save_equity",
+    "load_trades",
+    "load_equity",
 ]
 
 
@@ -92,12 +97,164 @@ CREATE TABLE IF NOT EXISTS paper_state (
 )
 """
 
+_STRATEGIES_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS strategies (
+    strategy_name TEXT PRIMARY KEY,
+    run_id        TEXT NOT NULL,
+    instrument_id TEXT NOT NULL,
+    created_at    INTEGER NOT NULL
+)
+"""
+
+_TRADES_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS trades (
+    run_id          TEXT NOT NULL,
+    instrument_id   TEXT NOT NULL,
+    entry_timestamp INTEGER NOT NULL,
+    exit_timestamp  INTEGER,
+    entry_price     REAL NOT NULL,
+    exit_price      REAL,
+    side            INTEGER NOT NULL,
+    quantity        REAL NOT NULL,
+    status          TEXT NOT NULL,
+    entry_notional  REAL,
+    exit_notional   REAL,
+    gross_pnl       REAL,
+    commission      REAL,
+    funding         REAL,
+    net_pnl         REAL,
+    exit_reason     TEXT,
+    PRIMARY KEY (run_id, entry_timestamp, instrument_id)
+)
+"""
+
+_EQUITY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS equity (
+    run_id    TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    equity    REAL NOT NULL,
+    returns   REAL NOT NULL,
+    PRIMARY KEY (run_id, timestamp)
+)
+"""
+
 _INSERT_SQL = (
     "INSERT OR REPLACE INTO paper_state "
     "(run_id, instrument_id, last_processed_ns, last_price, ledger, open_position, "
     "pending_levels, signal_fn_state, config_ref, aux_data, exit_seed, last_funding_ns) "
     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
+
+# -- strategy registry helpers (§9.5 strategy_name → run_id) ----------------
+
+
+def _ensure_all_tables(conn: sqlite3.Connection) -> None:
+    """Create all paper-trading tables if missing (idempotent)."""
+    conn.execute(_SCHEMA_SQL)
+    conn.execute(_STRATEGIES_SCHEMA_SQL)
+    conn.execute(_TRADES_SCHEMA_SQL)
+    conn.execute(_EQUITY_SCHEMA_SQL)
+    # migrations for old DBs that predate new tables
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE paper_state ADD COLUMN aux_data TEXT")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE paper_state ADD COLUMN exit_seed TEXT")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE paper_state ADD COLUMN last_funding_ns INTEGER")
+
+
+def get_or_create_run_id(
+    db_path: str, strategy_name: str, instrument_id: str
+) -> str:
+    """Resolve strategy_name → run_id, creating the row if missing.
+
+    The run_id is the strategy_name itself (stable, human-readable) — no
+    separate surrogate needed. Stored in `strategies` for fast lookup and
+    also as `paper_state.run_id`.
+    """
+    if not isinstance(strategy_name, str) or not strategy_name.strip():
+        raise StateCorruptionError("strategy_name must be a non-empty string")
+    strategy_name = strategy_name.strip()
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        _ensure_all_tables(conn)
+        row = conn.execute(
+            "SELECT run_id FROM strategies WHERE strategy_name = ?", (strategy_name,)
+        ).fetchone()
+        if row is not None:
+            return str(row[0])
+        # create new
+        run_id = strategy_name
+        conn.execute(
+            "INSERT OR REPLACE INTO strategies (strategy_name, run_id, instrument_id, created_at) VALUES (?, ?, ?, ?)",
+            (strategy_name, run_id, instrument_id, int(pd.Timestamp.now(tz="UTC").value // 1_000_000_000)),
+        )
+        return run_id
+    finally:
+        conn.close()
+
+
+def save_trades(
+    db_path: str, run_id: str, trades_list: list[Any]
+) -> None:
+    """Upsert trade rows for run_id (from ube.core.ledger.trades)."""
+    if not trades_list:
+        return
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        _ensure_all_tables(conn)
+        for t in trades_list:
+            # t is ube.core.ledger.Trade
+            conn.execute(
+                "INSERT OR REPLACE INTO trades (run_id, instrument_id, entry_timestamp, exit_timestamp, entry_price, exit_price, side, quantity, status, entry_notional, exit_notional, gross_pnl, commission, funding, net_pnl, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    t.instrument_id,
+                    int(t.entry_timestamp),
+                    int(t.exit_timestamp),
+                    float(t.entry_price),
+                    float(t.exit_price),
+                    int(t.side),
+                    float(t.quantity),
+                    str(t.status),
+                    float(t.entry_notional),
+                    float(t.exit_notional),
+                    float(t.gross_pnl),
+                    float(t.commission),
+                    float(t.funding),
+                    float(t.net_pnl),
+                    t.exit_reason,
+                ),
+            )
+    finally:
+        conn.close()
+
+
+def save_equity(
+    db_path: str, run_id: str, equity_df: Any
+) -> None:
+    """Append equity points for run_id (expects DataFrame with timestamp/equity/returns)."""
+    if equity_df is None or len(equity_df) == 0:
+        return
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        _ensure_all_tables(conn)
+        for _, r in equity_df.iterrows():
+            # timestamp may be int ns or datetime
+            raw_ts = r["timestamp"] if "timestamp" in r else r.get("timestamp")
+            try:
+                ts = int(pd.to_datetime(raw_ts, utc=True).value)  # ns
+            except Exception:
+                ts = int(raw_ts)  # already int
+            conn.execute(
+                "INSERT OR REPLACE INTO equity (run_id, timestamp, equity, returns) VALUES (?, ?, ?, ?)",
+                (run_id, int(ts), float(r["equity"]), float(r["returns"])),
+            )
+    finally:
+        conn.close()
 
 
 def _ledger_to_json(ledger: EventLedger) -> str:
@@ -234,6 +391,8 @@ class PaperState:
         aux_data: dict[str, Any] | None = None,
         exit_seed: ExitSeed | None = None,
         last_funding_ns: int | None = None,
+        run_id: str | None = None,
+        db_path: str | None = None,
     ) -> None:
         self.instrument_id = instrument_id
         self.ledger = ledger
@@ -248,6 +407,8 @@ class PaperState:
         self.aux_data: dict[str, Any] = aux_data if aux_data is not None else {}
         self.exit_seed: ExitSeed | None = exit_seed
         self.last_funding_ns: int | None = last_funding_ns
+        self.run_id: str | None = run_id
+        self.db_path: str | None = db_path
 
     def get_config_dict(self) -> dict[str, Any] | None:
         """Return the stored ``BacktestConfig`` as a dict, or ``None`` if absent.
@@ -280,16 +441,7 @@ class PaperState:
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(path), isolation_level=None)
-            conn.execute(_SCHEMA_SQL)
-            # Migrate old DBs that lack aux_data column (added after T8).
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("ALTER TABLE paper_state ADD COLUMN aux_data TEXT")
-            # Migrate DBs that lack exit_seed column (added with issue C).
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("ALTER TABLE paper_state ADD COLUMN exit_seed TEXT")
-            # Migrate DBs that lack last_funding_ns column (added with funding clock).
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("ALTER TABLE paper_state ADD COLUMN last_funding_ns INTEGER")
+            _ensure_all_tables(conn)
             conn.execute(
                 _INSERT_SQL,
                 (
@@ -407,7 +559,7 @@ class PaperState:
                 exit_seed = ExitSeed(**_from_json(exit_seed_text, {}))
             except (TypeError, ValueError) as exc:
                 raise StateCorruptionError(f"malformed exit_seed: {exc}") from exc
-        return cls(
+        obj = cls(
             instrument_id=instrument_id,
             ledger=ledger,
             last_processed_ns=last_ns,
@@ -419,4 +571,61 @@ class PaperState:
             aux_data=_aux_from_json(aux_text),
             exit_seed=exit_seed,
             last_funding_ns=last_funding_ns,
+            run_id=run_id,
+            db_path=path,
         )
+        return obj
+
+    def trade_table(self, db_path: str) -> Any:
+        """Return the persisted trade table for this state's run_id (if any)."""
+        # deferred import to avoid circular
+        from ube.core.ledger import Trade
+
+        # run_id is not stored on the instance; caller must supply db_path + run_id via load
+        raise NotImplementedError("Use load_trades(db_path, run_id) instead")
+
+
+def load_trades(db_path: str, run_id: str = "default") -> Any:
+    """Load persisted trades for run_id as DataFrame (empty if none)."""
+    if not Path(db_path).exists():
+        return pd.DataFrame()
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        _ensure_all_tables(conn)
+        cur = conn.execute(
+            "SELECT instrument_id, entry_timestamp, exit_timestamp, entry_price, exit_price, side, quantity, status, entry_notional, exit_notional, gross_pnl, commission, funding, net_pnl, exit_reason FROM trades WHERE run_id = ? ORDER BY entry_timestamp",
+            (run_id,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame()
+        cols = [d[0] for d in cur.description]
+        df = pd.DataFrame(rows, columns=cols)
+        # convert ns timestamps to datetime for convenience
+        for c in ("entry_timestamp", "exit_timestamp"):
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], unit="ns", utc=True)
+        return df
+    finally:
+        conn.close()
+
+
+def load_equity(db_path: str, run_id: str = "default") -> Any:
+    """Load persisted equity curve for run_id as DataFrame."""
+    if not Path(db_path).exists():
+        return pd.DataFrame(columns=["timestamp", "equity", "returns"])
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        _ensure_all_tables(conn)
+        cur = conn.execute(
+            "SELECT timestamp, equity, returns FROM equity WHERE run_id = ? ORDER BY timestamp",
+            (run_id,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return pd.DataFrame(columns=["timestamp", "equity", "returns"])
+        df = pd.DataFrame(rows, columns=["timestamp", "equity", "returns"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ns", utc=True)
+        return df
+    finally:
+        conn.close()

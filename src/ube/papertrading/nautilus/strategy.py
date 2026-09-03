@@ -518,7 +518,8 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             _close_comm = float(
                 fill_cost(self.config.cost_model, notional=_close_notional)
             ) if self.config.cost_model else 0.0
-            _close_credit = _close_notional - _close_comm
+            # side-aware: long close (sell) credits +notional, short close (buy) debits -notional
+            _close_credit = float(self._sim_side) * _close_notional - _close_comm
             self._current_balance += _close_credit
 
         if close_first:

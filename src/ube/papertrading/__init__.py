@@ -16,6 +16,7 @@ from ube.papertrading.core import (
     get_paper_engine,
     init,
     register_paper_engine,
+    run,
     run_auto,
     step,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "get_paper_engine",
     "init",
     "register_paper_engine",
+    "run",
     "run_auto",
     "step",
 ]

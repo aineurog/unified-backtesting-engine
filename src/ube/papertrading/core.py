@@ -48,6 +48,7 @@ __all__ = [
     "get_paper_engine",
     "init",
     "register_paper_engine",
+    "run",
     "run_auto",
     "step",
 ]
@@ -179,12 +180,16 @@ def _open_position_from_ledger(
 # ---------------------------------------------------------------------------
 
 
-def init(config: PaperConfig, *, run_id: str = "default") -> PaperState:
+def init(
+    config: PaperConfig, *, run_id: str = "default", db_path: str | None = None
+) -> PaperState:
     """Create a fresh :class:`PaperState` for a session (§9.1).
 
     Args:
         config: The paper-trading configuration.
         run_id: Identifier used for sqlite persistence (§9.5).
+        db_path: Optional sqlite path for auto-save (when set, step() will
+            auto-persist after each call).
 
     Returns:
         A fresh state with an empty ledger and no cursor.
@@ -192,6 +197,9 @@ def init(config: PaperConfig, *, run_id: str = "default") -> PaperState:
     instrument = config.base.instrument
     if not isinstance(instrument, Instrument):
         raise ConfigError("PaperConfig.base.instrument must be a canonical Instrument")
+    # db_path may come from config.state_path if not explicitly passed
+    if db_path is None:
+        db_path = config.state_path
     return PaperState(
         instrument_id=instrument.symbol,
         ledger=EventLedger(),
@@ -199,6 +207,8 @@ def init(config: PaperConfig, *, run_id: str = "default") -> PaperState:
         # Persist the resolved canonical config as YAML (plan blocker #10) so a resumed
         # run is self-contained — the caller need not re-supply ``base`` (though it may).
         config_ref=yaml.safe_dump(dataclasses.asdict(config.base)),
+        run_id=run_id,
+        db_path=db_path,
     )
 
 
@@ -291,7 +301,144 @@ def step(
     if n > 0:
         state.last_price = float(data.close[-1])
     state.open_position = _open_position_from_ledger(state.ledger, state.instrument_id)
+    # Auto-save if the state knows its db_path (new scheduled-run behavior)
+    # The db_path may come from config.state_path or from PaperState.db_path
+    db_path = getattr(state, "db_path", None) or getattr(config, "state_path", None)
+    run_id = getattr(state, "run_id", None) or "default"
+    if db_path:
+        try:
+            # also ensure the strategy registry is up to date
+            state.db_path = db_path
+            state.run_id = run_id
+            # ensure strategy registry entry exists (for strategy_name-based runs)
+            try:
+                from ube.papertrading.state import get_or_create_run_id
+
+                # if state was created via strategy_name, ensure the mapping exists
+                # we don't have strategy_name here, but run_id is the strategy_name in new API
+                get_or_create_run_id(db_path, run_id, state.instrument_id)
+            except Exception:
+                pass
+            state.save(db_path, run_id=run_id)
+            # also persist trades/equity for the trade_table view
+            try:
+                from ube.core.ledger import trades as _trades
+                from ube.papertrading.state import save_trades, save_equity
+                import pandas as pd
+
+                # trades
+                # we need instrument for trades()
+                from ube.core.instrument import Instrument as _Instr
+
+                instr = config.base.instrument
+                if isinstance(instr, _Instr):
+                    tlist = list(_trades(state.ledger, {instr.symbol: instr}))
+                    save_trades(db_path, run_id, tlist)
+                    # equity - build from ledger + current state (simple)
+                    # For now, save a single equity point per step (the current equity)
+                    # Full equity curve will be built incrementally
+                    # Use the same logic as main.py: cash + unrealized
+                    from ube.core.ledger import EventType as _ET
+
+                    total_cash = 0.0
+                    has_cash = False
+                    for e in state.ledger.events:
+                        if e.event_type == _ET.CASH_MOVEMENT and e.amount is not None:
+                            has_cash = True
+                            total_cash += float(e.amount)
+                        elif e.event_type in (_ET.COMMISSION, _ET.FUNDING_PAYMENT) and e.amount is not None:
+                            has_cash = True
+                            total_cash -= float(e.amount)
+                    bal = total_cash if has_cash else 0.0
+                    if state.open_position and state.last_price is not None:
+                        mult = float(instr.contract_multiplier or 1.0)
+                        bal += (float(state.last_price) - float(state.open_position.entry_price)) * float(state.open_position.quantity) * float(state.open_position.side) * mult
+                    # append one equity point
+                    eq_df = pd.DataFrame([{"timestamp": int(ts[-1]), "equity": float(bal), "returns": 0.0}])
+                    save_equity(db_path, run_id, eq_df)
+            except Exception:
+                pass
+        except Exception:
+            pass
     return state, new_events
+
+
+def run(
+    strategy_name: str,
+    data: MarketData,
+    signals: Signals,
+    config: PaperConfig,
+    *,
+    db_path: str | None = None,
+    run_id: str | None = None,
+) -> tuple[PaperState, list[LedgerEvent]]:
+    """One-call scheduled-run entry point (strategy_name → run_id → step → auto-save).
+
+    This is the `strategy_name`-keyed API the scheduled paper-trading scripts
+    actually need: it owns `load-or-init` + `step` + durable `trades`/`equity`
+    persistence internally, so every `step` call is atomic and survives a
+    process exit (memory discarded each run). The caller no longer needs to
+    manually `try: load() except: init()` and `save()`.
+
+    Args:
+        strategy_name: Human-readable strategy name (e.g. ``"BITCOIN_m5"``).
+            Used as the stable key in the ``strategies`` table and as the
+            ``run_id`` for ``paper_state`` (one row per strategy).
+        data: New bars (single instrument), aligned with ``signals``.
+        signals: 4-column signals for the same bar grid.
+        config: Canonical ``PaperConfig`` (already built externally from
+            ``config.yaml`` — never a raw dict).
+        db_path: Explicit sqlite path. When ``None``, uses
+            ``config.state_path``.
+        run_id: Optional explicit run_id override (defaults to
+            ``strategy_name``).
+
+    Returns:
+        ``(state, new_events)`` — same as ``step`` but with auto-persistence
+        already done.
+    """
+    # canonical config is required (never a raw yaml dict)
+    if not isinstance(config, PaperConfig):
+        raise ConfigError("ube.paper.run expects a canonical PaperConfig (build it externally from config.yaml)")
+
+    # db_path is required (like backtest) — either explicit or via config.state_path
+    effective_db = db_path if db_path is not None else getattr(config, "state_path", None)
+    if not effective_db:
+        raise ConfigError("db_path is required for scheduled paper trading (set config.state_path or pass db_path)")
+
+    effective_run_id = (run_id or strategy_name).strip() if isinstance(strategy_name, str) and strategy_name.strip() else (run_id or "default")
+    if not effective_run_id:
+        raise ConfigError("strategy_name / run_id must be a non-empty string")
+
+    # ensure strategy registry entry exists and get the stable run_id
+    try:
+        from ube.papertrading.state import get_or_create_run_id
+
+        # instrument_id may not be known until after load/init, so use config's instrument for the first creation
+        instr_id = config.base.instrument.symbol if isinstance(config.base.instrument, Instrument) else str(config.base.instrument)
+        effective_run_id = get_or_create_run_id(str(effective_db), str(effective_run_id), str(instr_id))
+    except Exception:
+        # if registry fails, fall back to the raw run_id — step will still work
+        pass
+
+    # load-or-init (the try-load-fallback every caller was hand-rolling)
+    try:
+        from ube.papertrading.state import PaperState as _PS
+
+        state = _PS.load(str(effective_db), run_id=str(effective_run_id))
+        # ensure the loaded state knows its persistence location for auto-save
+        state.db_path = str(effective_db)
+        state.run_id = str(effective_run_id)
+    except Exception as exc:
+        # distinguish "no row for run_id" (fresh strategy) from corrupt DB
+        msg = str(exc)
+        if "no paper state for run_id" in msg or "does not exist" in msg:
+            state = init(config, run_id=str(effective_run_id), db_path=str(effective_db))
+        else:
+            raise
+
+    # delegate to step (which now auto-saves and persists trades/equity)
+    return step(data, signals, state, config)
 
 
 def run_auto(

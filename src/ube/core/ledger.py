@@ -1356,7 +1356,7 @@ def _closed_row(
         if trade.entry_notional
         else 0.0,
         "realized_pnl": net_pnl_base,
-        "realized_pnl_pct": net_pnl_base / entry_equity if entry_equity else 0.0,
+        "realized_pnl_pct": (net_pnl_base / entry_equity * 100.0) if entry_equity else 0.0,
         "cum_return_pct": exit_equity / start - 1.0 if start else 0.0,
         "balance": exit_equity,
         "entry_fee_pct": trade.entry_fee / trade.entry_notional
