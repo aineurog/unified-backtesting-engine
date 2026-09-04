@@ -737,9 +737,9 @@ def test_trade_table_closed_row():
     assert row["status"] == "closed"
     assert row["quantity"] == pytest.approx(10.0)
     assert row["entry_notional"] == pytest.approx(1000.0)
-    assert row["trade_return_pct"] == pytest.approx(95.0 / 1000.0)
+    assert row["trade_return_pct"] == pytest.approx(9.5)
     assert row["realized_pnl"] == pytest.approx(95.0)
-    assert row["cum_return_pct"] == pytest.approx(1095.0 / 1000.0 - 1.0)
+    assert row["cum_return_pct"] == pytest.approx(9.5)
     assert row["balance"] == pytest.approx(1095.0)
     assert row["reason"] == "take_profit"
 
@@ -767,7 +767,7 @@ def test_trade_table_open_row():
     assert row["exit_price"] == pytest.approx(110.0)  # marked to last close
     assert row["duration"] is pd.NaT
     assert row["reason"] is None
-    assert row["trade_return_pct"] == pytest.approx(0.10)  # (110-100)/100
+    assert row["trade_return_pct"] == pytest.approx(10.0)  # (110-100)/100 * 100
     assert row["realized_pnl"] == pytest.approx(0.0)
     assert row["balance"] == pytest.approx(1100.0)
 

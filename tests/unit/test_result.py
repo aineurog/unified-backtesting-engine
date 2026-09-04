@@ -188,7 +188,7 @@ def test_equity_curve_is_derived_and_correct():
 
 def test_trade_table_columns_match_spec():
     # §4.6: the trades table is the spec'd 19-column per-trade view, joined with the
-    # equity curve; the `_pct` columns are fractions (0.05 = 5%), not percentages.
+    # equity curve; the `_pct` columns are percentages (5.0 = 5%).
     ledger, market_data, instruments, config = _single_instrument()
     result = BacktestResult.from_ledger(
         ledger, config, market_data=market_data, instruments=instruments
@@ -223,13 +223,13 @@ def test_trade_table_columns_match_spec():
     assert row["exit_price"] == 110.0
     assert row["entry_notional"] == pytest.approx(1000.0)
     # entry equity at t0 = cash 1000 + mark 10*100 = 2000.
-    assert row["position_size_pct"] == pytest.approx(1000.0 / 2000.0)
-    # trade return = net_pnl / entry_notional = 100 / 1000 = 0.1 (fraction).
-    assert row["trade_return_pct"] == pytest.approx(0.1)
+    assert row["position_size_pct"] == pytest.approx(50.0)
+    # trade return = net_pnl / entry_notional = 100 / 1000 = 10%.
+    assert row["trade_return_pct"] == pytest.approx(10.0)
     assert row["realized_pnl"] == pytest.approx(100.0)
-    assert row["realized_pnl_pct"] == pytest.approx(100.0 / 2000.0)
-    # cum return = balance / initial_capital - 1 = 1000/2000 - 1 (fraction).
-    assert row["cum_return_pct"] == pytest.approx(-0.5)
+    assert row["realized_pnl_pct"] == pytest.approx(5.0)
+    # cum return = (balance / initial_capital - 1) * 100.
+    assert row["cum_return_pct"] == pytest.approx(-50.0)
     assert row["balance"] == pytest.approx(1000.0)
     assert row["entry_fee_pct"] == 0.0
     assert row["exit_fee_pct"] == 0.0

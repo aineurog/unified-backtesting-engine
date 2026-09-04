@@ -322,13 +322,13 @@ def step(
             state.save(db_path, run_id=run_id)
             # also persist trades/equity for the trade_table view
             try:
-                from ube.core.ledger import trades as _trades
-                from ube.papertrading.state import save_trades, save_equity
                 import pandas as pd
 
                 # trades
                 # we need instrument for trades()
                 from ube.core.instrument import Instrument as _Instr
+                from ube.core.ledger import trades as _trades
+                from ube.papertrading.state import save_equity, save_trades
 
                 instr = config.base.instrument
                 if isinstance(instr, _Instr):
@@ -346,15 +346,26 @@ def step(
                         if e.event_type == _ET.CASH_MOVEMENT and e.amount is not None:
                             has_cash = True
                             total_cash += float(e.amount)
-                        elif e.event_type in (_ET.COMMISSION, _ET.FUNDING_PAYMENT) and e.amount is not None:
+                        elif (
+                            e.event_type in (_ET.COMMISSION, _ET.FUNDING_PAYMENT)
+                            and e.amount is not None
+                        ):
                             has_cash = True
                             total_cash -= float(e.amount)
                     bal = total_cash if has_cash else 0.0
                     if state.open_position and state.last_price is not None:
                         mult = float(instr.contract_multiplier or 1.0)
-                        bal += (float(state.last_price) - float(state.open_position.entry_price)) * float(state.open_position.quantity) * float(state.open_position.side) * mult
+                        pos = state.open_position
+                        bal += (
+                            (float(state.last_price) - float(pos.entry_price))
+                            * float(pos.quantity)
+                            * float(pos.side)
+                            * mult
+                        )
                     # append one equity point
-                    eq_df = pd.DataFrame([{"timestamp": int(ts[-1]), "equity": float(bal), "returns": 0.0}])
+                    eq_df = pd.DataFrame(
+                        [{"timestamp": int(ts[-1]), "equity": float(bal), "returns": 0.0}]
+                    )
                     save_equity(db_path, run_id, eq_df)
             except Exception:
                 pass
@@ -399,14 +410,21 @@ def run(
     """
     # canonical config is required (never a raw yaml dict)
     if not isinstance(config, PaperConfig):
-        raise ConfigError("ube.paper.run expects a canonical PaperConfig (build it externally from config.yaml)")
+        raise ConfigError(
+            "ube.paper.run expects a canonical PaperConfig (build it externally from config.yaml)"
+        )
 
-    # db_path is required (like backtest) — either explicit or via config.state_path
     effective_db = db_path if db_path is not None else getattr(config, "state_path", None)
     if not effective_db:
-        raise ConfigError("db_path is required for scheduled paper trading (set config.state_path or pass db_path)")
+        raise ConfigError(
+            "db_path is required for scheduled paper trading "
+            "(set config.state_path or pass db_path)"
+        )
 
-    effective_run_id = (run_id or strategy_name).strip() if isinstance(strategy_name, str) and strategy_name.strip() else (run_id or "default")
+    is_str_name = isinstance(strategy_name, str) and strategy_name.strip()
+    effective_run_id = (
+        (run_id or strategy_name).strip() if is_str_name else (run_id or "default")
+    )
     if not effective_run_id:
         raise ConfigError("strategy_name / run_id must be a non-empty string")
 
@@ -414,9 +432,13 @@ def run(
     try:
         from ube.papertrading.state import get_or_create_run_id
 
-        # instrument_id may not be known until after load/init, so use config's instrument for the first creation
-        instr_id = config.base.instrument.symbol if isinstance(config.base.instrument, Instrument) else str(config.base.instrument)
-        effective_run_id = get_or_create_run_id(str(effective_db), str(effective_run_id), str(instr_id))
+        # instrument_id may not be known until after load/init, so use config's instrument
+        # for the first creation
+        instr = config.base.instrument
+        instr_id = instr.symbol if isinstance(instr, Instrument) else str(instr)
+        effective_run_id = get_or_create_run_id(
+            str(effective_db), str(effective_run_id), str(instr_id)
+        )
     except Exception:
         # if registry fails, fall back to the raw run_id — step will still work
         pass

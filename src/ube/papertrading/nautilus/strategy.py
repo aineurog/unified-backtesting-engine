@@ -94,6 +94,9 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._hist_ts = 0
         self._sim_side = config.open_position.side if config.open_position else 0
         self._sim_qty = float(config.open_position.quantity) if config.open_position else 0.0
+        # Qty of the most recent ``_submit_open`` order — used as a fallback for close
+        # qty when ``_sim_qty`` is stale (fill lag on async reversals, §9.6).
+        self._pending_open_qty: float = self._sim_qty
         self._last_close: float | None = None
         self._entry_order_ids: set[Any] = set()
         self._close_order_ids: set[Any] = set()
@@ -523,7 +526,13 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self._current_balance += _close_credit
 
         if close_first:
-            self._submit_close(self._last_close)
+            if self._sim_qty > 0:
+                self._submit_close(self._last_close)
+            elif self._sim_side != 0 and self._pending_open_qty > 0:
+                # Fill lag: the prior open fill hasn't arrived yet, so _sim_qty is
+                # stale.  Emit a synthetic close synchronously so the ledger's cash
+                # trail is complete before the new position opens.
+                self._emit_synthetic_close(self._last_close)
             self._sim_side = 0
             self._sim_qty = 0.0
             self._entry_bar = None
@@ -660,6 +669,85 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             )
         )
 
+    # -- synthetic close for fill-lag reversals ----------------------------- #
+
+    def _emit_synthetic_close(self, price: float | None) -> None:
+        """Emit a synthetic close when the prior fill hasn't landed yet.
+
+        On a same-bar reverse the sandbox delivers the open fill *after* the next
+        bar's ``on_bar``, so ``_sim_qty`` is stale (0).  The ``_pending_open_qty``
+        holds the qty the most recent ``_submit_open`` requested, which is the
+        correct close quantity.  This method emits the full set of close events
+        (``CASH_MOVEMENT`` + ``FILL`` + ``COMMISSION`` + ``POSITION_CHANGE``)
+        synchronously so the ledger's cash trail is complete before the new
+        position opens (§4.6).
+        """
+        if (
+            self._instrument is None
+            or price is None
+            or price <= 0
+            or self._pending_open_qty <= 0
+        ):
+            return
+
+        close_side = -self._sim_side  # sell to close long, buy to close short
+        qty = self._pending_open_qty
+        notional = qty * price * self._multiplier
+        hist = self._hist_ts
+
+        # Cash leg: sell credits, buy debits — same formula as on_order_filled.
+        self._events.append(
+            cash_movement_event(
+                self._iid,
+                amount=-close_side * notional,
+                currency=self._quote,
+                ts_override=hist,
+            )
+        )
+        # Synthetic FILL event.
+        self._events.append(
+            LedgerEvent(
+                EventType.FILL,
+                hist,
+                self._iid,
+                side=close_side,
+                quantity=qty,
+                price=price,
+                notional=notional,
+                order_id="",
+                exit_reason="signal",
+            )
+        )
+        # Commission.
+        comm = float(
+            fill_cost(self.config.cost_model, notional=notional)
+        ) if self.config.cost_model else 0.0
+        self._current_balance += -close_side * notional
+        if comm > 0.0:
+            self._events.append(
+                LedgerEvent(
+                    EventType.COMMISSION,
+                    hist,
+                    self._iid,
+                    amount=comm,
+                    currency=self._quote,
+                )
+            )
+            self._current_balance -= comm
+        # Position change: flat after close.
+        self._events.append(
+            LedgerEvent(
+                EventType.POSITION_CHANGE,
+                hist,
+                self._iid,
+                side=0,
+                position_after=0.0,
+            )
+        )
+        # Record close entry for trade ledger compatibility.
+        self._entry_price = None
+        self._entry_bar = None
+
     # -- order submission -------------------------------------------------- #
     def _lot_step(self) -> float:
         instr = self._instrument
@@ -713,6 +801,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         )
         # Predictive: the position will be ``desired`` as soon as this order fills.
         self._sim_side = desired
+        self._pending_open_qty = float(qty.as_double())
         self._entry_order_ids.add(order.client_order_id)
         self._events.append(
             LedgerEvent(

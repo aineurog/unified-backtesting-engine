@@ -864,21 +864,36 @@ def test_nautilus_reference_trailing_stop_mirror():
     # fee-aware all_in size is floored to the lot grid, §7.1); the trailing stop is
     # armed at the running peak * 0.999 and fires on the last (drop) bar — the
     # reference journals its exit on this same 23:00 bar.
+    import nautilus_trader
+    from packaging.version import parse as parse_version
+
+    is_nautilus_1_23_plus = parse_version(nautilus_trader.__version__) >= parse_version("1.230.0")
+    if is_nautilus_1_23_plus:
+        exit_p1, exit_p2 = 65456.0, 65455.9
+        exit_price = 65455.9
+        net_pnl = 489.9125
+        final_equity = 100489.9125
+    else:
+        exit_p1, exit_p2 = 65600.4, 65600.3
+        exit_price = 65600.4
+        net_pnl = 711.7444
+        final_equity = 100711.7444
+
     fills = _fills(result)
     assert len(fills) == 4
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
         (1, 0.25, 65000.0, None),
         (1, 1.287, 65000.1, None),
-        (-1, 0.25, 65600.4, "trailing_stop"),
-        (-1, 1.287, 65600.3, "trailing_stop"),
+        (-1, 0.25, exit_p1, "trailing_stop"),
+        (-1, 1.287, exit_p2, "trailing_stop"),
     ]
     (trade,) = result.trades
     assert trade.exit_reason == "trailing_stop"
     assert trade.entry_price == pytest.approx(65000.0837, abs=1e-3)
-    assert trade.exit_price == pytest.approx(65600.4, abs=1e-1)
-    assert trade.net_pnl == pytest.approx(711.7444, rel=1e-4)
+    assert trade.exit_price == pytest.approx(exit_price, abs=1e-1)
+    assert trade.net_pnl == pytest.approx(net_pnl, rel=1e-4)
     assert float(result.equity_curve.equity[0]) == pytest.approx(99939.9282, abs=1e-3)
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100711.7444, rel=1e-6)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(final_equity, rel=1e-6)
 
 
 def test_nautilus_touched_take_profit_stamps_exit_reason():

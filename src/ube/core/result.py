@@ -95,7 +95,7 @@ class BacktestResult:
             spec'd per-trade columns joined with the equity curve (``position_size_pct``,
             ``trade_return_pct``, ``realized_pnl``/``realized_pnl_pct``,
             ``cum_return_pct``, ``balance``, fee splits, ``reason``; the ``_pct`` columns
-            are fractions — ``0.05`` = 5%). A convenience / reporting view — not a
+            are percentages — ``5.0`` = 5%). A convenience / reporting view — not a
             canonical source of truth (see :func:`~ube.core.ledger.trade_table`).
         positions: The combined position-over-time series when the ledger is
             single-instrument, else ``None`` (see the module docstring).

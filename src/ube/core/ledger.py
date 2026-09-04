@@ -1351,18 +1351,18 @@ def _closed_row(
         "status": "closed",
         "quantity": trade.quantity,
         "entry_notional": trade.entry_notional,
-        "position_size_pct": entry_notional_base / entry_equity if entry_equity else 0.0,
-        "trade_return_pct": trade.net_pnl / trade.entry_notional
+        "position_size_pct": (entry_notional_base / entry_equity * 100.0) if entry_equity else 0.0,
+        "trade_return_pct": (trade.net_pnl / trade.entry_notional * 100.0)
         if trade.entry_notional
         else 0.0,
         "realized_pnl": net_pnl_base,
         "realized_pnl_pct": (net_pnl_base / entry_equity * 100.0) if entry_equity else 0.0,
-        "cum_return_pct": exit_equity / start - 1.0 if start else 0.0,
+        "cum_return_pct": (exit_equity / start - 1.0) * 100.0 if start else 0.0,
         "balance": exit_equity,
-        "entry_fee_pct": trade.entry_fee / trade.entry_notional
+        "entry_fee_pct": (trade.entry_fee / trade.entry_notional * 100.0)
         if trade.entry_notional
         else 0.0,
-        "exit_fee_pct": trade.exit_fee / trade.exit_notional
+        "exit_fee_pct": (trade.exit_fee / trade.exit_notional * 100.0)
         if trade.exit_notional
         else 0.0,
         "reason": trade.exit_reason,
@@ -1414,17 +1414,17 @@ def _open_row(
         "status": "open",
         "quantity": remaining_units,
         "entry_notional": remaining_notional,
-        "position_size_pct": remaining_notional * entry_fx / entry_equity
+        "position_size_pct": (remaining_notional * entry_fx / entry_equity * 100.0)
         if entry_equity
         else 0.0,
-        "trade_return_pct": unrealized / remaining_notional
+        "trade_return_pct": (unrealized / remaining_notional * 100.0)
         if remaining_notional
         else 0.0,
         "realized_pnl": 0.0,
         "realized_pnl_pct": 0.0,
-        "cum_return_pct": last_equity / start - 1.0 if start else 0.0,
+        "cum_return_pct": (last_equity / start - 1.0) * 100.0 if start else 0.0,
         "balance": last_equity,
-        "entry_fee_pct": mt.commission / remaining_notional
+        "entry_fee_pct": (mt.commission / remaining_notional * 100.0)
         if remaining_notional
         else 0.0,
         "exit_fee_pct": 0.0,
@@ -1453,7 +1453,7 @@ def trade_table(
     carries the trade-level columns (entry/exit datetime+price, duration, side, status,
     quantity, notional, fee split, reason) plus account-level columns derived from the
     combined equity curve (``position_size_pct``, ``realized_pnl_pct``,
-    ``cum_return_pct``, ``balance``). The ``_pct`` columns are fractions (``0.05`` = 5%).
+    ``cum_return_pct``, ``balance``). The ``_pct`` columns are percentages (``5.0`` = 5%).
 
     Per-trade monetary values are in the instrument's settlement currency; account-level
     values are in ``base_currency`` (converted via ``fx_rates``). ``initial_capital``

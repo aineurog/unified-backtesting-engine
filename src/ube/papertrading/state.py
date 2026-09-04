@@ -186,9 +186,11 @@ def get_or_create_run_id(
             return str(row[0])
         # create new
         run_id = strategy_name
+        now_ts = int(pd.Timestamp.now(tz="UTC").value // 1_000_000_000)
         conn.execute(
-            "INSERT OR REPLACE INTO strategies (strategy_name, run_id, instrument_id, created_at) VALUES (?, ?, ?, ?)",
-            (strategy_name, run_id, instrument_id, int(pd.Timestamp.now(tz="UTC").value // 1_000_000_000)),
+            "INSERT OR REPLACE INTO strategies "
+            "(strategy_name, run_id, instrument_id, created_at) VALUES (?, ?, ?, ?)",
+            (strategy_name, run_id, instrument_id, now_ts),
         )
         return run_id
     finally:
@@ -208,7 +210,11 @@ def save_trades(
         for t in trades_list:
             # t is ube.core.ledger.Trade
             conn.execute(
-                "INSERT OR REPLACE INTO trades (run_id, instrument_id, entry_timestamp, exit_timestamp, entry_price, exit_price, side, quantity, status, entry_notional, exit_notional, gross_pnl, commission, funding, net_pnl, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO trades ("
+                "run_id, instrument_id, entry_timestamp, exit_timestamp, entry_price, "
+                "exit_price, side, quantity, status, entry_notional, exit_notional, "
+                "gross_pnl, commission, funding, net_pnl, exit_reason"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     t.instrument_id,
@@ -250,7 +256,8 @@ def save_equity(
             except Exception:
                 ts = int(raw_ts)  # already int
             conn.execute(
-                "INSERT OR REPLACE INTO equity (run_id, timestamp, equity, returns) VALUES (?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO equity (run_id, timestamp, equity, returns) "
+                "VALUES (?, ?, ?, ?)",
                 (run_id, int(ts), float(r["equity"]), float(r["returns"])),
             )
     finally:
@@ -579,7 +586,6 @@ class PaperState:
     def trade_table(self, db_path: str) -> Any:
         """Return the persisted trade table for this state's run_id (if any)."""
         # deferred import to avoid circular
-        from ube.core.ledger import Trade
 
         # run_id is not stored on the instance; caller must supply db_path + run_id via load
         raise NotImplementedError("Use load_trades(db_path, run_id) instead")
@@ -593,7 +599,10 @@ def load_trades(db_path: str, run_id: str = "default") -> Any:
     try:
         _ensure_all_tables(conn)
         cur = conn.execute(
-            "SELECT instrument_id, entry_timestamp, exit_timestamp, entry_price, exit_price, side, quantity, status, entry_notional, exit_notional, gross_pnl, commission, funding, net_pnl, exit_reason FROM trades WHERE run_id = ? ORDER BY entry_timestamp",
+            "SELECT instrument_id, entry_timestamp, exit_timestamp, entry_price, exit_price, "
+            "side, quantity, status, entry_notional, exit_notional, gross_pnl, commission, "
+            "funding, net_pnl, exit_reason FROM trades WHERE run_id = ? "
+            "ORDER BY entry_timestamp",
             (run_id,),
         )
         rows = cur.fetchall()
