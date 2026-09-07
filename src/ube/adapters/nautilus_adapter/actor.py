@@ -229,6 +229,9 @@ class UbeActor(Strategy):  # type: ignore[misc]
         self._instrument = self.cache.instrument(self.instrument_id)
         if self._instrument is None:
             raise EngineError(f"instrument {self.instrument_id} is not registered")
+        from ube.adapters.nautilus_adapter.overrides import apply_synthetic_rates
+
+        apply_synthetic_rates(self.cache)
         self.subscribe_bars(self.config.bar_type)
 
     def on_bar(self, bar: Bar) -> None:

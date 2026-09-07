@@ -29,6 +29,27 @@ def _config(asset_class: str = "crypto_perp", **kw) -> PaperConfig:
     return PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0, **kw)
 
 
+def slice_md(md: MarketData, sl: slice) -> MarketData:
+    """Any prefix/subsequence of a validated MarketData is valid, so any slice is too."""
+    sliced = MarketData.__new__(MarketData)  # type: ignore[call-arg]
+    object.__setattr__(sliced, "open", md.open[sl])
+    object.__setattr__(sliced, "high", md.high[sl])
+    object.__setattr__(sliced, "low", md.low[sl])
+    object.__setattr__(sliced, "close", md.close[sl])
+    object.__setattr__(sliced, "volume", md.volume[sl])
+    object.__setattr__(sliced, "index", md.index[sl])
+    return sliced
+
+
+def slice_signals(sig: Signals, sl: slice) -> Signals:
+    return Signals(
+        long_entry=sig.long_entry[sl].copy(),
+        long_exit=sig.long_exit[sl].copy(),
+        short_entry=sig.short_entry[sl].copy(),
+        short_exit=sig.short_exit[sl].copy(),
+    )
+
+
 def test_crypto_perp_entry_then_exit() -> None:
     data = synthetic_bars(PRESETS["crypto_perp"], n_bars=10, seed=1)
     # long entry for 5 bars, then a long-exit signal (one closed long trade). The exit is
@@ -127,26 +148,6 @@ def test_crypto_perp_resume() -> None:
     signals_full = from_target(np.array([1, 1, 1, 1, 1, 1, 0, 0, 0, 0]))
     cfg = _config()
     state = init(cfg)
-
-    def slice_md(md: MarketData, sl: slice) -> MarketData:
-        # Bypass re-validation (same trick as MarketData.head) — any prefix
-        # of a validated MarketData is valid, so any slice is valid too.
-        sliced = MarketData.__new__(MarketData)  # type: ignore[call-arg]
-        object.__setattr__(sliced, "open", md.open[sl])
-        object.__setattr__(sliced, "high", md.high[sl])
-        object.__setattr__(sliced, "low", md.low[sl])
-        object.__setattr__(sliced, "close", md.close[sl])
-        object.__setattr__(sliced, "volume", md.volume[sl])
-        object.__setattr__(sliced, "index", md.index[sl])
-        return sliced
-
-    def slice_signals(sig: Signals, sl: slice) -> Signals:
-        return Signals(
-            long_entry=sig.long_entry[sl].copy(),
-            long_exit=sig.long_exit[sl].copy(),
-            short_entry=sig.short_entry[sl].copy(),
-            short_exit=sig.short_exit[sl].copy(),
-        )
 
     # --- first slice: enter long and hold ---------------------------------
     data_1 = slice_md(data, slice(0, 6))
@@ -250,3 +251,157 @@ def test_crypto_spot_short_signal_exits_existing_long() -> None:
     assert len(closed) == 1
     assert closed[0].side == 1
     assert closed[0].exit_reason == "signal"
+
+
+def _last_saved_equity(db_path: str, run_id: str) -> float:
+    from ube.papertrading.state import load_equity
+
+    df = load_equity(db_path, run_id)
+    assert not df.empty, "auto-save should have persisted equity rows"
+    return float(df["equity"].iloc[-1])
+
+
+def test_auto_save_equity_open_long_stays_near_balance(tmp_path) -> None:
+    """Regression: equity with an open long must stay near starting balance.
+
+    Cash already carries the full -notional entry leg; the mark must be the position's
+    full value (qty*side*last*mult), not PnL-from-entry (zero at entry). The old formula
+    collapsed equity by a full notional on open longs (paper trade_ledger.csv showed
+    ~-89k balances on a 10k account).
+    """
+    data = synthetic_bars(PRESETS["crypto_perp"], n_bars=6, seed=11)
+    signals = from_target(np.array([1, 1, 1, 1, 1, 1]))
+    cfg = _config()
+    db_path = str(tmp_path / "paper_state.db")
+    state = init(cfg, run_id="long_reg", db_path=db_path)
+    step(data, signals, state, cfg)
+
+    assert state.open_position is not None
+    eq = _last_saved_equity(db_path, "long_reg")
+    assert 9_000.0 < eq < 11_000.0, f"long-open equity {eq:.2f} collapsed by notional"
+
+
+def test_auto_save_equity_open_short_stays_near_balance(tmp_path) -> None:
+    """Regression: equity with an open short must stay near starting balance.
+
+    Shorts credit full notional into cash, so the mark must be negative (position value)
+    or equity balloons by a full notional (paper trade_ledger.csv showed ~+108k).
+    """
+    data = synthetic_bars(PRESETS["crypto_perp"], n_bars=6, seed=12)
+    signals = from_target(np.array([-1, -1, -1, -1, -1, -1]))
+    cfg = _config()
+    db_path = str(tmp_path / "paper_state.db")
+    state = init(cfg, run_id="short_reg", db_path=db_path)
+    step(data, signals, state, cfg)
+
+    assert state.open_position is not None
+    eq = _last_saved_equity(db_path, "short_reg")
+    assert 9_000.0 < eq < 11_000.0, f"short-open equity {eq:.2f} inflated by notional"
+
+
+def test_account_currency_follows_instrument_currency() -> None:
+    """Regression: sandbox account base must equal the instrument's currency.
+
+    Live paper-trading logged ``insufficient data for USD/USDT`` on every fill:
+    a futures-style instrument (XAUUSD/commodities, currency USD, no
+    ``settlement_currency`` attr) got a USDT-denominated sandbox account via a
+    ``getattr(..., "settlement_currency", "USDT")`` fallback, while fill
+    commissions book in the instrument currency (USD). The sandbox has no FX
+    feed, so any mismatch is fatal — the base must be derived from the built
+    nautilus instrument (no API calls, no synthetic quotes needed).
+    """
+    from ube.adapters.nautilus_adapter.instrument_map import build_instrument
+    from ube.core.instrument import Instrument
+    from ube.papertrading.nautilus.backend import _instrument_currency
+
+    usd_instrument = Instrument(
+        "XAUUSD", "commodities", tick_size=0.01, contract_multiplier=1.0,
+        settlement_currency="USD",
+    )
+    assert _instrument_currency(build_instrument(usd_instrument, overrides={}).instrument) == "USD"
+
+    usdt_instrument = Instrument(
+        "BITCOIN", "crypto_perp", tick_size=0.01, contract_multiplier=1.0,
+        settlement_currency="USDT",
+    )
+    built = build_instrument(usdt_instrument, overrides={}).instrument
+    assert _instrument_currency(built) == "USDT"
+
+
+def test_backtest_usd_settlement_with_synthetic_usdt_rate() -> None:
+    """Regression: USD-settled instrument + USDT base works without declared rates.
+
+    The adapter automatically seeds a 1:1 USD/USDT FXSeries so that
+    ``trade_table``/``_fx_rate_at`` never raises ``FXRateUnavailableError`` for
+    the common XAUUSD-style case (USD-settled, USDT account).  Explicit
+    ``synthetic_rates`` declarations still take precedence and also succeed.
+    """
+    import ube
+
+    preset = PRESETS["commodities"]  # GC, USD-settled
+    data = synthetic_bars(preset, n_bars=10, seed=1)
+    signals = from_target(np.array([1, 1, 1, 1, 1, 0, 0, 0, 0, 0]))
+
+    def _cfg(**kw):
+        return BacktestConfig(
+            instrument=preset.instrument,
+            signal=SignalConfig(on_opposite_signal="reverse"),
+            base_currency="USDT",
+            **kw,
+        )
+
+    # Auto-seed path: adapter injects 1:1 USD/USDT — no engine_overrides needed.
+    result_auto = ube.run(data, signals, _cfg())
+    assert len(result_auto.trades) == 1
+
+    # Explicit override path still works and also returns one trade.
+    result_explicit = ube.run(
+        data, signals, _cfg(engine_overrides={"synthetic_rates": {"USDUSDT": 1.0}})
+    )
+    assert len(result_explicit.trades) == 1
+
+
+
+def _leveraged_cfg() -> PaperConfig:
+    from ube.core.config import RiskConfig
+    from ube.core.risk.sizing import SizeModel
+
+    instr = PRESETS["crypto_perp"].instrument
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        risk=RiskConfig(sizing=SizeModel(kind="fixed_fraction", value=0.10, leverage=100.0)),
+    )
+    return PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
+
+
+def test_resume_reverse_from_open_short_does_not_double_count_notional() -> None:
+    """Regression: same-bar reverse of a *resumed* open short must not crash.
+
+    Live paper-trading died with ``ConfigError: capital must be non-negative`` on a
+    short->long reversal. Resume seeded ``_current_balance`` as equity (cash + the
+    negative short mark ~= 9.9k); the reversal's optimistic close-credit then re-booked
+    the ~100k closing notional on top of it, collapsing the balance to ~-90k and making
+    100x sizing capital deeply negative. The strategy's balance is a cash book, so a
+    resumed run must seed pure cash (short open cash ~= 110k); at the sizing point the
+    position is already closed, so cash == equity there and sizing is correct.
+    """
+    data = synthetic_bars(PRESETS["crypto_perp"], n_bars=9, seed=9)
+    signals = from_target(np.array([-1, -1, -1, -1, -1, -1, 1, 1, 1]))
+    cfg = _leveraged_cfg()
+    state = init(cfg)
+
+    # slice 1: open a leveraged short (~10x balance notional), hold it open
+    step(slice_md(data, slice(0, 6)), slice_signals(signals, slice(0, 6)), state, cfg)
+    assert state.open_position is not None
+    assert state.open_position.side == -1
+
+    # slice 2: same-bar reverse short -> long (resume seeding path is exercised
+    # because each step() rebuilds the strategy from state/open_position + ledger cash)
+    _, ev2 = step(slice_md(data, slice(6, 9)), slice_signals(signals, slice(6, 9)), state, cfg)
+
+    assert state.open_position is not None
+    assert state.open_position.side == 1
+    fills2 = [e for e in ev2 if e.event_type == EventType.FILL]
+    assert len(fills2) == 2, "close-then-open fills expected on the reversal"
+    assert fills2[0].exit_reason == "signal" and fills2[1].exit_reason is None

@@ -441,6 +441,26 @@ def test_build_instrument_rejects_unsupported_asset_class():
         instrument_mod.ASSET_CLASSES = original
 
 
+def test_validate_overrides_accepts_synthetic_rates():
+    from ube.adapters.nautilus_adapter.overrides import validate_overrides
+
+    overrides = {"synthetic_rates": {"USD/USDT": 1.0, "USDT/USD": 1.0}}
+    res = validate_overrides(overrides)
+    assert res["synthetic_rates"] == {"USD/USDT": 1.0, "USDT/USD": 1.0}
+
+
+def test_apply_synthetic_rates_sets_mark_xrate_on_cache():
+    from nautilus_trader.cache.cache import Cache
+    from nautilus_trader.model.currencies import USD, USDT
+
+    from ube.adapters.nautilus_adapter.overrides import apply_synthetic_rates
+
+    cache = Cache()
+    apply_synthetic_rates(cache, {"synthetic_rates": {"USD/USDT": 1.0}})
+    assert cache.get_mark_xrate(USD, USDT) == 1.0
+    assert cache.get_mark_xrate(USDT, USD) == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Step 4: Data + signal bridge (MarketData/Signals -> Nautilus bars + lookup).
 # ---------------------------------------------------------------------------

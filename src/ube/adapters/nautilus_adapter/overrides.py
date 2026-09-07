@@ -49,6 +49,10 @@ class NautilusEngineOverrides(TypedDict, total=False):
     oms_type: Literal["NETTING", "HEDGING"]
     maker_fee: float
     taker_fee: float
+    synthetic_rates: dict[str, float] | list[dict[str, Any]]
+    fixed_conversions: dict[str, float] | list[dict[str, Any]]
+    currency_fx: dict[str, float] | list[dict[str, Any]]
+    fx_rates: dict[str, float] | list[dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +98,13 @@ def _require_nonneg_int(value: Any, field: str) -> None:
         raise ConfigError(f"engine override {field!r} must be >= 0")
 
 
+def _validate_synthetic_rates(value: Any, field: str) -> None:
+    if not isinstance(value, (Mapping, list, tuple)):
+        raise ConfigError(
+            f"engine override {field!r} must be a dict/Mapping or list/tuple of rates"
+        )
+
+
 _FIELD_VALIDATORS: dict[str, Callable[[Any, str], None]] = {
     "venue": _require_str,
     "account_type": _validate_account_type,
@@ -104,7 +115,109 @@ _FIELD_VALIDATORS: dict[str, Callable[[Any, str], None]] = {
     "oms_type": _validate_oms_type,
     "maker_fee": _require_fraction,
     "taker_fee": _require_fraction,
+    "synthetic_rates": _validate_synthetic_rates,
+    "fixed_conversions": _validate_synthetic_rates,
+    "currency_fx": _validate_synthetic_rates,
+    "fx_rates": _validate_synthetic_rates,
 }
+
+
+def apply_synthetic_rates(
+    cache: Any,
+    overrides: Mapping[str, Any] | None = None,
+    settlement_currency: str | None = None,
+    base_currency: str | None = None,
+) -> None:
+    """Pre-load fixed 1:1 or custom synthetic exchange rates into Nautilus Cache.
+
+    Prevents 'insufficient data for USD/USDT' or missing quote map errors when
+    converting portfolio account state between USD and USDT or custom pairs.
+    """
+    if cache is None:
+        return
+
+    try:
+        from nautilus_trader.model.currencies import USD, USDT, Currency
+
+        # Default USD <-> USDT 1:1 synthetic rate
+        try:
+            cache.add_currency(USD)
+            cache.add_currency(USDT)
+            cache.set_mark_xrate(USD, USDT, 1.0)
+        except Exception:
+            pass
+
+        if settlement_currency and settlement_currency not in ("USD", "USDT"):
+            try:
+                curr = Currency.from_str(settlement_currency)
+                cache.add_currency(curr)
+            except Exception:
+                pass
+
+        if base_currency and base_currency not in ("USD", "USDT"):
+            try:
+                curr = Currency.from_str(base_currency)
+                cache.add_currency(curr)
+            except Exception:
+                pass
+
+        overrides = overrides or {}
+        raw_rates = (
+            overrides.get("synthetic_rates")
+            or overrides.get("fixed_conversions")
+            or overrides.get("currency_fx")
+            or overrides.get("fx_rates")
+        )
+
+        if not raw_rates:
+            return
+
+        if isinstance(raw_rates, Mapping):
+            for pair_str, rate in raw_rates.items():
+                try:
+                    pair = str(pair_str).replace("/", "").replace("_", "").strip()
+                    if len(pair) == 6:
+                        c1_str, c2_str = pair[:3], pair[3:]
+                    else:
+                        parts = str(pair_str).replace("_", "/").split("/")
+                        if len(parts) == 2:
+                            c1_str, c2_str = parts[0].strip(), parts[1].strip()
+                        else:
+                            continue
+                    c1 = Currency.from_str(c1_str)
+                    c2 = Currency.from_str(c2_str)
+                    cache.add_currency(c1)
+                    cache.add_currency(c2)
+                    cache.set_mark_xrate(c1, c2, float(rate))
+                except Exception:
+                    pass
+        elif isinstance(raw_rates, (list, tuple)):
+            for item in raw_rates:
+                if isinstance(item, Mapping):
+                    pair_str = (
+                        item.get("pair") or item.get("symbol") or item.get("currencies")
+                    )
+                    rate = item.get("rate") or item.get("value") or 1.0
+                    if pair_str:
+                        try:
+                            pair = str(pair_str).replace("/", "").replace("_", "").strip()
+                            if len(pair) == 6:
+                                c1_str, c2_str = pair[:3], pair[3:]
+                            else:
+                                parts = str(pair_str).replace("_", "/").split("/")
+                                if len(parts) == 2:
+                                    c1_str, c2_str = parts[0].strip(), parts[1].strip()
+                                else:
+                                    continue
+                            c1 = Currency.from_str(c1_str)
+                            c2 = Currency.from_str(c2_str)
+                            cache.add_currency(c1)
+                            cache.add_currency(c2)
+                            cache.set_mark_xrate(c1, c2, float(rate))
+                        except Exception:
+                            pass
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

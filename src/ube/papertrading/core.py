@@ -356,10 +356,16 @@ def step(
                     if state.open_position and state.last_price is not None:
                         mult = float(instr.contract_multiplier or 1.0)
                         pos = state.open_position
+                        # Mark the open position at its full market value
+                        # (qty*side*last*mult), matching equity_curve(): cash already
+                        # booked the full ±notional fill legs (short opens credit,
+                        # long opens debit), so the mark must offset them. Using
+                        # PnL-from-entry here inflates/deflates equity by one notional
+                        # per side (negative on open longs, +notional on open shorts).
                         bal += (
-                            (float(state.last_price) - float(pos.entry_price))
-                            * float(pos.quantity)
+                            float(pos.quantity)
                             * float(pos.side)
+                            * float(state.last_price)
                             * mult
                         )
                     # append one equity point

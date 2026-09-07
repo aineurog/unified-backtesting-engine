@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -35,6 +35,28 @@ if TYPE_CHECKING:
     from ube.core.signals import Signals
     from ube.papertrading.config import PaperConfig
     from ube.papertrading.state import PaperState
+
+
+def _instrument_currency(instrument: Any) -> str:
+    """Account/quote currency for the sandbox, taken from the nautilus instrument.
+
+    The sandbox has no quote feed for conversion pairs, so the account MUST be
+    denominated in the instrument's own currency: every fill's commission and
+    PnL is booked in that currency (``MakerTakerFeeModel`` uses
+    ``quote_currency``), and the account manager converts to base on each fill.
+    Any mismatch raises ``insufficient data for USD/USDT`` on every fill
+    (``Quote maps must not be empty``). Perp/spot/forex pairs expose
+    ``quote_currency``; futures/equity only expose ``currency`` (no
+    ``settlement_currency`` attr — a ``getattr(..., "settlement_currency",
+    "USDT")`` fallback silently built a USDT account against a USD instrument).
+    With base == activity currency, ``get_xrate`` short-circuits to 1.0
+    (``from == to``) and no FX lookup — synthetic or otherwise — is ever needed.
+    """
+    for attr in ("quote_currency", "currency", "settlement_currency"):
+        cur = getattr(instrument, attr, None)
+        if cur is not None:
+            return str(cur)
+    return "USDT"
 
 
 class NautilusPaperEngine(PaperEngine):
@@ -167,18 +189,19 @@ class NautilusPaperEngine(PaperEngine):
                         total_cash -= float(e.amount)
                 if has_cash:
                     balance = total_cash
-            # Issue B: mark the open position to market so a resumed run sizes against equity
-            # (cash + unrealized PnL), not deflated/inflated cash-only capital. This keeps a
-            # split run sizing identically to an uninterrupted run over the same bars. The
-            # equity = cash flows + unrealized PnL of the open position at ``state.last_price``.
-            if state.open_position is not None and state.last_price is not None:
-                unrealized = (
-                    (float(state.last_price) - float(state.open_position.entry_price))
-                    * float(state.open_position.quantity)
-                    * float(state.open_position.side)
-                    * multiplier
-                )
-                balance += unrealized
+            # Resume sizing always seeds the strategy with the *pure cash book* —
+            # never cash + open-position mark. ``_current_balance`` is cash-only:
+            # each fill books a ±notional cash leg (§4.6), and a same-bar reversal
+            # zeroes _sim_side/_sim_qty and applies the optimistic close-credit
+            # *before* sizing, so at the exact ``_size_qty`` point cash ≈ post-close
+            # equity. Marking the open position here double-counts the notional one
+            # bar later: a short open credits ~+notional to cash, the resume re-adds
+            # the negative mark on top, and the reversal's close-credit then books the
+            # closing notional a second time — equity collapses ~-90k on a 10k account
+            # ("capital must be non-negative" crash in live paper-trading, 07:55 bar).
+            # An uninterrupted run has _current_balance = 10k + short credit (never a
+            # mark), so cash-only seeding is exactly what keeps split-run sizing
+            # identical to a single run over the same bars (Issue B).
 
             # Leverage: mirror backtest's sizing * margin logic — sizing leverage
             # dominates, override is fallback, cash accounts force 1.0 (§3.2).
@@ -200,7 +223,11 @@ class NautilusPaperEngine(PaperEngine):
             borrow_rate = float(getattr(cost_model, "borrow", 0.0) or 0.0) if cost_model else 0.0
             funding_interval_hours = resolve_funding_interval_hours(canonical)
             interval_ns = int(funding_interval_hours * 3600 * 1_000_000_000)
-            quote = str(getattr(instrument, "settlement_currency", "USDT"))
+            # Account currency == instrument currency (see _instrument_currency):
+            # the sandbox has no FX feed, so any mismatch (e.g. a USDT account
+            # against a USD-quoted instrument) fails every fill's account-state
+            # update with "insufficient data for USD/USDT".
+            quote = _instrument_currency(instrument)
 
             # Reset per-run singletons — TradingNode closes its loop on dispose
             # and UbeDataClient.DONE is a class-level Event that remains set

@@ -90,7 +90,7 @@ from ube.core.errors import (
     InvalidSignalError,
 )
 from ube.core.instrument import resolve_funding_interval_hours
-from ube.core.ledger import EventLedger, EventType, LedgerEvent, funding_payments
+from ube.core.ledger import EventLedger, EventType, FXSeries, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
 from ube.core.signals import Signals, validate_long_only
 
@@ -108,6 +108,105 @@ _KIND_RANK: dict[EventType, int] = {
     EventType.POSITION_CHANGE: 3,
     EventType.FUNDING_PAYMENT: 4,
 }
+
+
+def _synthetic_fx_rates(
+    overrides: Mapping[str, Any], index: np.ndarray
+) -> dict[str, FXSeries]:
+    """Build explicit FX curves from the ``synthetic_rates`` family of engine
+    overrides (declared by the caller, no API calls).
+
+    Accepted shapes mirror the nautilus-cache synthetic rates: a ``{pair: rate}``
+    mapping (``"USDUSDT"``, ``"USD/USDT"`` or ``"USD_USDT"``) or a list of
+    ``{"pair": ..., "rate": ...}`` mappings, read from the first declared of
+    ``synthetic_rates`` / ``fixed_conversions`` / ``currency_fx`` / ``fx_rates``.
+    Each 6-letter pair also registers its inverse at ``1/rate`` unless the
+    inverse is explicitly declared. Malformed entries raise ``ConfigError`` —
+    rates are never guessed (§4.7). Returns ``{}`` when nothing is declared, in
+    which case downstream ``trade_table`` / ``equity_curve`` lookups behave
+    exactly as before (missing pairs still raise ``FXRateUnavailableError``).
+    """
+    raw = (
+        overrides.get("synthetic_rates")
+        or overrides.get("fixed_conversions")
+        or overrides.get("currency_fx")
+        or overrides.get("fx_rates")
+    )
+    if raw is None:
+        return {}
+    if isinstance(raw, Mapping):
+        items = list(raw.items())
+    elif isinstance(raw, (list, tuple)):
+        items = []
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                raise ConfigError(
+                    "engine override synthetic rates list entries must be "
+                    f"mappings, got {type(entry).__name__}"
+                )
+            pair = entry.get("pair") or entry.get("symbol")
+            rate = entry.get("rate", entry.get("value"))
+            items.append((pair, rate))
+    else:
+        raise ConfigError(
+            "engine override synthetic rates must be a {pair: rate} mapping or a "
+            f"list of {{pair, rate}} mappings, got {type(raw).__name__}"
+        )
+    pairs: dict[str, float] = {}
+
+    def _split(pair_str: Any) -> tuple[str, str]:
+        # "USD/USDT", "USD_USDT", "USD-USDT" -> ("USD", "USDT"). Bare
+        # concatenation needs length knowledge because USDT has 4 letters
+        # ("USDUSDT" is 7 chars, not 6).
+        text = str(pair_str or "").strip().upper()
+        parts = [p for p in re.split(r"[\s/_\-:]+", text) if p]
+        if len(parts) == 2:
+            c1, c2 = parts
+        elif len(parts) == 1 and text.isalpha():
+            if len(text) == 6:
+                c1, c2 = text[:3], text[3:]
+            elif len(text) == 7 and text.startswith("USDT"):
+                c1, c2 = text[:4], text[4:]
+            elif len(text) == 7 and text.endswith("USDT"):
+                c1, c2 = text[:-4], text[-4:]
+            else:
+                raise ConfigError(
+                    f"engine override synthetic rate pair {pair_str!r} must be "
+                    "two currency codes (e.g. 'USDUSDT' or 'USD/USDT')"
+                )
+        else:
+            raise ConfigError(
+                f"engine override synthetic rate pair {pair_str!r} must be "
+                "two currency codes (e.g. 'USDUSDT' or 'USD/USDT')"
+            )
+        if not (c1.isalpha() and c2.isalpha() and 3 <= len(c1) <= 4 and 3 <= len(c2) <= 4):
+            raise ConfigError(
+                f"engine override synthetic rate pair {pair_str!r} must be "
+                "two 3-4 letter currency codes"
+            )
+        return c1, c2
+
+    quoted: dict[str, tuple[str, str, float]] = {}
+    for pair_str, rate in items:
+        _bad_rate = (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not np.isfinite(rate)
+            or rate <= 0
+        )
+        if _bad_rate:
+            raise ConfigError(
+                f"engine override synthetic rate for {pair_str!r} must be a "
+                f"positive finite number, got {rate!r}"
+            )
+        c1, c2 = _split(pair_str)
+        quoted[c1 + c2] = (c1, c2, float(rate))
+    for key, (_c1, _c2, _r) in list(quoted.items()):
+        pairs[key] = _r
+        if _c2 + _c1 not in quoted:
+            pairs[_c2 + _c1] = 1.0 / _r
+    grid = np.asarray(index, dtype=np.int64)
+    return {key: FXSeries(index=grid, rate=np.full(len(grid), r)) for key, r in pairs.items()}
 
 
 class NautilusAdapter(EngineAdapter):
@@ -265,6 +364,17 @@ class NautilusAdapter(EngineAdapter):
                 [Money(Decimal(str(starting_balance)), currency)],
                 base_currency=currency,
             )
+            from ube.adapters.nautilus_adapter.overrides import apply_synthetic_rates
+
+            kernel = getattr(engine, "kernel", None)
+            cache = getattr(kernel, "cache", None)
+            if cache is not None:
+                apply_synthetic_rates(
+                    cache,
+                    overrides,
+                    settlement,
+                    config.base_currency,
+                )
             engine.add_instrument(build.instrument)
             engine.add_data(bars)
             engine.add_strategy(actor)
@@ -295,11 +405,35 @@ class NautilusAdapter(EngineAdapter):
         finally:
             engine.dispose()
 
+        # Declared synthetic rates (if any) become the explicit FXSeries that
+        # from_ledger/trade_table/equity_curve consume — the nautilus-cache
+        # mark rates registered above do NOT feed those lookups. Absent a
+        # declaration the dict is empty and missing pairs raise as before (§4.7).
+        _grid = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
+        fx_rates = _synthetic_fx_rates(overrides, _grid)
+        # Auto-seed a 1:1 USD/USDT rate when the instrument settles in USD
+        # but the account base currency is USDT (or vice-versa).  USDT is a
+        # USD-pegged stablecoin; assuming parity avoids FXRateUnavailableError
+        # without any live API call.  Only injected when the pair is absent from
+        # the already-declared overrides — explicit rates always win.
+        _sc = str(getattr(config.instrument, "settlement_currency", "") or "")
+        _bc = str(getattr(config, "base_currency", "") or "")
+        if _sc and _bc and _sc != _bc and {_sc.upper(), _bc.upper()} == {"USD", "USDT"}:
+            _fwd = (_sc + _bc).upper()
+            _inv = (_bc + _sc).upper()
+            if _fwd not in fx_rates:
+                _ones = np.ones(len(_grid))
+                fx_rates = dict(fx_rates)  # make mutable copy if needed
+                fx_rates[_fwd] = FXSeries(index=_grid, rate=_ones)
+            if _inv not in fx_rates:
+                fx_rates = dict(fx_rates)
+                fx_rates[_inv] = FXSeries(index=_grid, rate=np.ones(len(_grid)))
         return BacktestResult.from_ledger(
             ledger,
             config,
             market_data={instrument_id: data},
             instruments={instrument_id: config.instrument},
+            fx_rates=fx_rates,
         )
 
     # ------------------------------------------------------------------

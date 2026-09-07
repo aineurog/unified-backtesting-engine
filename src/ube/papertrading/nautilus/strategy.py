@@ -146,6 +146,10 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         )
         self._atr_window: list[list[float]] = []
         self._atr_period = self._max_atr_period()
+        # Engine overrides for on_start (e.g. synthetic_rates consumed by
+        # apply_synthetic_rates). Read from config when present; default {} so
+        # startup never crashes when no overrides are threaded through.
+        self._overrides: dict[str, Any] = dict(getattr(config, "overrides", None) or {})
 
     def _max_atr_period(self) -> int:
         """Largest ``period`` among configured ATR-style exits; 0 if none."""
@@ -198,11 +202,9 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self.stop()
             return
         self._quote = str(getattr(self._instrument, "settlement_currency", "USDT"))
-        # Issue C: seeding is now lazy in ``on_bar`` (needs the first real bar's
-        # live/hist timestamps and the bar period to assign proper preceding
-        # timestamps — issue 1). The synthetic bars are used *only* for exit-level
-        # computation (via ``_build_market_data``); they are never published to the
-        # sandbox, so they cannot generate spurious orders.
+        from ube.adapters.nautilus_adapter.overrides import apply_synthetic_rates
+
+        apply_synthetic_rates(self.cache, self._overrides, self._quote)
         if self._bar_type is not None:
             self.subscribe_bars(self._bar_type)
         get_ready_event().set()
@@ -769,8 +771,14 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         instr = self._instrument
         if instr is None or self.config.sizing is None or price is None or price <= 0:
             return instr.make_qty(0.0) if instr is not None else None
-        # Mirror backtest's account.balance_total() * leverage — paper uses
-        # live cash balance (updated on each fill) scaled by leverage.
+        # Mirror backtest's account.balance_total() * leverage. ``_current_balance``
+        # tracks the *cash book* only — each fill books a ±notional cash leg (§4.6).
+        # Sizing from cash equals sizing from equity because ``_submit_open`` only
+        # runs from flat: a reversal zeroes _sim_side/_sim_qty and applies the
+        # optimistic close-credit first, so at this exact point cash ≈ post-close
+        # equity. Seeding the open-position mark into the balance (or adding it here)
+        # would double-count the notional on a resumed same-bar reversal (~-90k on a
+        # 10k account, "capital must be non-negative" live crash).
         capital = self._current_balance * self._leverage
         raw = size_position(
             self.config.sizing,
