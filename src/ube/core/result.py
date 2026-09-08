@@ -173,12 +173,21 @@ class BacktestResult:
         base_currency = _resolve_base_currency(config, instruments)
 
         trades_view = trades(ledger, instruments=instruments)
+        # position_size display 0-100: divide by leverage (value*leverage*100 -> value*100), sizing unchanged
+        _lev = 1.0
+        try:
+            _lev = float(getattr(getattr(config, "risk", None), "sizing", None).leverage)  # type: ignore
+        except Exception:
+            _lev = 1.0
+        if not _lev:
+            _lev = 1.0
         trade_table_view = trade_table(
             ledger,
             market_data,
             instruments,
             base_currency=base_currency,
             fx_rates=fx_rates,
+            leverage=_lev,
         )
         pc_ids = {e.instrument_id for e in ledger if e.event_type is EventType.POSITION_CHANGE}
         positions_view = positions(ledger) if len(pc_ids) <= 1 else None

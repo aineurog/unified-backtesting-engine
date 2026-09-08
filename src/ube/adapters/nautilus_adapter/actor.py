@@ -573,10 +573,12 @@ class UbeActor(Strategy):  # type: ignore[misc]
         # no reserved fees to protect — fee-less runs keep the legacy conversion.
         step = float(self._instrument.size_increment)
         fee_rate = _entry_fee_rate(self._cost_model)
-        fee_aware = self._sizing.kind in ("all_in", "equal_weight") and fee_rate > 0.0
+        # Always floor to lot step — matches paper trader (strategy.py:789) and
+        # prevents up-rounding 22.745→23 for XAUUSD fixed_fraction. Fee-aware
+        # guard is a subset; all sizers must respect lot grid.
         tradable = (
             float(floor_to_step(raw, step))
-            if fee_aware and math.isfinite(step) and step > 0.0
+            if math.isfinite(step) and step > 0.0
             else raw
         )
         try:

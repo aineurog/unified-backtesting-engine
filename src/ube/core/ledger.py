@@ -1330,6 +1330,7 @@ def _closed_row(
     base_currency: str,
     fx_rates: Mapping[str, FXSeries],
     start: float,
+    leverage: float = 1.0,
 ) -> dict[str, object]:
     sc = settlement_of(trade.instrument_id)
     entry_equity = equity_at(trade.entry_timestamp)
@@ -1351,7 +1352,7 @@ def _closed_row(
         "status": "closed",
         "quantity": trade.quantity,
         "entry_notional": trade.entry_notional,
-        "position_size_pct": (entry_notional_base / entry_equity * 100.0) if entry_equity else 0.0,
+        "position_size_pct": (entry_notional_base / (entry_equity * leverage) * 100.0) if entry_equity and leverage else 0.0,
         "trade_return_pct": (trade.net_pnl / trade.entry_notional * 100.0)
         if trade.entry_notional
         else 0.0,
@@ -1378,6 +1379,7 @@ def _open_row(
     base_currency: str,
     fx_rates: Mapping[str, FXSeries],
     start: float,
+    leverage: float = 1.0,
 ) -> dict[str, object]:
     iid = mt.instrument_id
     md = market_data.get(iid)
@@ -1414,8 +1416,8 @@ def _open_row(
         "status": "open",
         "quantity": remaining_units,
         "entry_notional": remaining_notional,
-        "position_size_pct": (remaining_notional * entry_fx / entry_equity * 100.0)
-        if entry_equity
+        "position_size_pct": (remaining_notional * entry_fx / (entry_equity * leverage) * 100.0)
+        if entry_equity and leverage
         else 0.0,
         "trade_return_pct": (unrealized / remaining_notional * 100.0)
         if remaining_notional
@@ -1440,6 +1442,7 @@ def trade_table(
     base_currency: str,
     fx_rates: Mapping[str, FXSeries] | None = None,
     initial_capital: float | None = None,
+    leverage: float = 1.0,
 ) -> pd.DataFrame:
     """One row per trade (closed *and* open), joined with the equity curve (§4.6).
 
@@ -1491,7 +1494,7 @@ def trade_table(
     rows: list[dict[str, object]] = []
     for trade in closed:
         rows.append(
-            _closed_row(trade, equity_at, settlement_of, base_currency, fx, start)
+            _closed_row(trade, equity_at, settlement_of, base_currency, fx, start, leverage)
         )
     for mt in open_accumulators.values():
         if abs(mt.entry_units - mt.exit_units) <= _EPS:
@@ -1506,6 +1509,7 @@ def trade_table(
                 base_currency,
                 fx,
                 start,
+                leverage,
             )
         )
 
