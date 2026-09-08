@@ -104,14 +104,12 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._quote = "USDT"
         self._leverage = float(getattr(config, "leverage", 1.0) or 1.0)
         self._multiplier = float(getattr(config, "multiplier", 1.0) or 1.0)
+        self._overrides: dict[str, Any] = dict(getattr(config, "overrides", None) or {})
         self._exits: tuple[Exit, ...] = tuple(getattr(config, "exits", ()))
         self._funding_rate = float(getattr(config, "funding_rate", 0.0) or 0.0)
         self._borrow_rate = float(getattr(config, "borrow_rate", 0.0) or 0.0)
         self._funding_interval_ns = int(getattr(config, "funding_interval_ns", 0) or 0)
-        # Live cash balance for fee-aware sizing — mirrors backtest's
-        # account.balance_total() * leverage (starts at balance, then
-        # updated on each fill's cash leg + commission).
-        self._current_balance = float(config.balance)
+        self._pending_credit: float = 0.0
         # Bar history for exit level computation (vectorized, §8). Stored as
         # raw Bar objects to rebuild MarketData for exit_triggered.
         self._bars: list[Bar] = []
@@ -132,13 +130,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._bar_period_ns: int = int(getattr(config, "bar_period_ns", 0) or 0)
         # Exit seed (issue C): on resume, the persistence layer writes the minimal exit
         # statistics (running extreme price + ATR warmup window) so trailing / ATR exits are
-        # not degenerate on the first bars after a restart. Tracks:
-        #   _extreme_price — the running peak (long) / trough (short) since entry.
-        #   _atr_window    — a bounded rolling [high, low, close] window for ATR warmup.
-        # The bars for these are built lazily on the first real bar (needs instrument
-        # precision + the first bar's live/hist timestamps to assign proper preceding
-        # timestamps — issue 1). The current values are exposed via :meth:`exit_seed` for
-        # the backend to persist.
+        # not degenerate on the first bars after a restart.
         self._seed: ExitSeed | None = config.exit_seed
         self._seeded: bool = False
         self._extreme_price: float | None = (
@@ -146,10 +138,17 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         )
         self._atr_window: list[list[float]] = []
         self._atr_period = self._max_atr_period()
-        # Engine overrides for on_start (e.g. synthetic_rates consumed by
-        # apply_synthetic_rates). Read from config when present; default {} so
-        # startup never crashes when no overrides are threaded through.
-        self._overrides: dict[str, Any] = dict(getattr(config, "overrides", None) or {})
+
+    @property
+    def _current_balance(self) -> float:
+        """Derived cash balance: starting balance + all cash movements."""
+        balance = float(self.config.balance)
+        for e in self._events:
+            if e.event_type == EventType.CASH_MOVEMENT and e.amount is not None:
+                balance += float(e.amount)
+            elif e.event_type in (EventType.COMMISSION, EventType.FUNDING_PAYMENT) and e.amount is not None:
+                balance -= float(e.amount)
+        return balance + self._pending_credit
 
     def _max_atr_period(self) -> int:
         """Largest ``period`` among configured ATR-style exits; 0 if none."""
@@ -469,9 +468,8 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                         currency=self._quote,
                     )
                 )
-                # Update live balance for next sizing. A negative amount is funding the trader
-                # *received* — credit it back to the balance; a positive amount is paid — deduct it.
-                self._current_balance -= amount
+                # Balance is derived from self._events; the FUNDING_PAYMENT entry above
+                # already discounts the paid amount (or credits received funding).
                 self._last_funding_ns = self._hist_ts
 
         if not (le or lx or se or sx):
@@ -512,20 +510,16 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # fill). This is what prevents ``decide_action`` from double-submitting on the
         # next bar. The fill handler only uses the order-id sets to tag open vs close
         # fills (and to set ``_sim_qty`` to the *actual* filled quantity).
-        # Optimistic close-credit for same-bar reverse sizing: the sandbox fills
-        # the close asynchronously, so ``_current_balance`` doesn't yet reflect the
-        # close proceeds when ``_submit_open`` calls ``_size_qty``.  Credit the
-        # expected net proceeds (notional − commission) before sizing, then restore
-        # after — the fill handlers will do the real accounting when they fire.
+
+        # Optimistic close-credit for same-bar reverse sizing.
         _close_credit = 0.0
         if close_first and self._sim_qty > 0:
             _close_notional = self._sim_qty * (self._last_close or 0.0) * self._multiplier
             _close_comm = float(
                 fill_cost(self.config.cost_model, notional=_close_notional)
             ) if self.config.cost_model else 0.0
-            # side-aware: long close (sell) credits +notional, short close (buy) debits -notional
             _close_credit = float(self._sim_side) * _close_notional - _close_comm
-            self._current_balance += _close_credit
+            self._pending_credit = _close_credit
 
         if close_first:
             if self._sim_qty > 0:
@@ -547,9 +541,9 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             # Funding: reset last funding timestamp on new entry.
             self._last_funding_ns = self._hist_ts
 
-        # Restore optimistic credit — fill handlers manage the real balance.
-        if _close_credit != 0.0:
-            self._current_balance -= _close_credit
+        # Clear optimistic credit after sizing decision
+        if self._pending_credit != 0.0:
+            self._pending_credit = 0.0
 
     # -- fills ------------------------------------------------------------- #
     def on_order_filled(self, event: Any) -> None:
@@ -601,6 +595,10 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 self._atr_window = []
         elif is_close:
             exit_reason = close_reason or "signal"
+            # Clear pending credit if this close fill matches the pending credit
+            if self._pending_credit != 0.0:
+                self._pending_credit = 0.0
+            
             # For a reverse, the opening order is already in flight; let its fill set the
             # new side/qty, and only flatten here when the close is a true exit.
             if not self._entry_order_ids:
@@ -657,10 +655,9 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             currency=self._quote,
         )
         # Update live balance for next sizing (mirrors account.balance_total).
-        self._current_balance += -side * notional
+        # (Balance now derived dynamically from self._events)
         if comm is not None:
             self._events.append(comm)
-            self._current_balance -= float(comm.amount)  # type: ignore[arg-type]
         self._events.append(
             position_change_event(
                 event,
@@ -724,7 +721,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         comm = float(
             fill_cost(self.config.cost_model, notional=notional)
         ) if self.config.cost_model else 0.0
-        self._current_balance += -close_side * notional
+        # Cash/commission are derived from the CASH_MOVEMENT/COMMISSION events above.
         if comm > 0.0:
             self._events.append(
                 LedgerEvent(
@@ -735,7 +732,6 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                     currency=self._quote,
                 )
             )
-            self._current_balance -= comm
         # Position change: flat after close.
         self._events.append(
             LedgerEvent(

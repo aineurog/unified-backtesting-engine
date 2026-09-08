@@ -189,19 +189,6 @@ class NautilusPaperEngine(PaperEngine):
                         total_cash -= float(e.amount)
                 if has_cash:
                     balance = total_cash
-            # Resume sizing always seeds the strategy with the *pure cash book* —
-            # never cash + open-position mark. ``_current_balance`` is cash-only:
-            # each fill books a ±notional cash leg (§4.6), and a same-bar reversal
-            # zeroes _sim_side/_sim_qty and applies the optimistic close-credit
-            # *before* sizing, so at the exact ``_size_qty`` point cash ≈ post-close
-            # equity. Marking the open position here double-counts the notional one
-            # bar later: a short open credits ~+notional to cash, the resume re-adds
-            # the negative mark on top, and the reversal's close-credit then books the
-            # closing notional a second time — equity collapses ~-90k on a 10k account
-            # ("capital must be non-negative" crash in live paper-trading, 07:55 bar).
-            # An uninterrupted run has _current_balance = 10k + short credit (never a
-            # mark), so cash-only seeding is exactly what keeps split-run sizing
-            # identical to a single run over the same bars (Issue B).
 
             # Leverage: mirror backtest's sizing * margin logic — sizing leverage
             # dominates, override is fallback, cash accounts force 1.0 (§3.2).
