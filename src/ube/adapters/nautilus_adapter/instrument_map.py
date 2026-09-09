@@ -124,10 +124,16 @@ def _base_quote(canonical: Instrument) -> tuple[str, str]:
     symbol = canonical.symbol
     if "-" in symbol:
         base, quote = symbol.split("-", 1)
-        return base, quote
+        # Only treat the dash-suffix as the quote currency when it is an alphabetic
+        # ISO-ish code (``BTC-USDT``). MT5 appends GMT-offset/exchange suffixes
+        # (``AAPL.NAS-24``); those are part of the symbol, not the quote currency —
+        # treating them as a currency silently creates a synthetic quote that cannot
+        # convert to the account's USD base (fill/capital failures).
+        if quote and quote.isalpha() and len(quote) in (3, 4):
+            return base, quote
     quote = canonical.settlement_currency or "USD"
     if canonical.asset_class == "forex" and symbol.endswith(quote) and len(symbol) > len(quote):
-        return symbol[: -len(quote)], quote
+        return symbol[:-len(quote)], quote
     return quote, quote
 
 
