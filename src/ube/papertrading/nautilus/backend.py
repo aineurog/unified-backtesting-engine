@@ -154,7 +154,8 @@ class NautilusPaperEngine(PaperEngine):
             except Exception:
                 _slev = 1.0
             _olev = float(overrides.get("leverage", 0.0))
-            est_lev = (1.0 if no_short else max(_slev, _olev, 1.0))
+            _acct_est = str(overrides.get("account_type", "margin")).lower()
+            est_lev = (1.0 if _acct_est == "cash" else max(_slev, _olev, 1.0))
             est_balance = float(config.starting_balance or overrides.get("starting_balance", 100_000.0))
             max_notional = est_balance * est_lev * max(sizing_val, 1.0)
             min_close = float(np.min(data.close)) if n > 0 else 1.0
@@ -225,14 +226,21 @@ class NautilusPaperEngine(PaperEngine):
                     balance = total_cash
 
             # Leverage: mirror backtest's sizing * margin logic — sizing leverage
-            # dominates, override is fallback, cash accounts force 1.0 (§3.2).
+            # dominates, override is fallback, CASH accounts force 1.0 (§3.2).
+            # ``no_short`` (long-only crypto_spot/stocks) no longer forces 1x: the
+            # backtest adapter levers long-only instruments too (actor_leverage =
+            # sizing_leverage unless account_type == 'cash'), so paper must match it
+            # (e.g. crypto_spot 10% x 100x = 10x balance exposure — trade_ledger vs
+            # ledger.csv parity). Long-only stays enforced via allow_short (decide_action);
+            # leverage and direction are orthogonal.
             sizing_lev = 1.0
             try:
                 sizing_lev = float(getattr(config.base.risk.sizing, "leverage", 1.0))
             except Exception:
                 sizing_lev = 1.0
             override_lev = float(overrides.get("leverage", 0.0))
-            if no_short:
+            _acct = str(overrides.get("account_type", "margin")).lower()
+            if _acct == "cash":
                 leverage = 1.0
             else:
                 lev = max(sizing_lev, override_lev)
