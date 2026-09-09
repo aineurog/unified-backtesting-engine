@@ -644,13 +644,16 @@ def _fill_timestamp_ns(row: Any) -> int:
 
 
 #: A ``Money`` string (``"1000.20 USD"``) — amount plus an optional currency code.
-_MONEY_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*([A-Za-z]{3,})?\s*$")
+#: The suffix may be a 3-letter ISO code or a numeric Nautilus ``Currency.code``
+#: (e.g. ``24`` == USDT); numeric codes are normalised to the settlement currency.
+_MONEY_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*([A-Za-z]{3,}|\d{1,3})?\s*$")
 
 
 def _parse_money(text: str, default_currency: str = "USD") -> tuple[float, str]:
     """Parse a Nautilus ``Money`` string (``"1000.20 USD"``) into ``(amount, currency)``.
 
-    The currency suffix is optional; a missing or empty suffix falls back to
+    The currency suffix is optional; a missing suffix or a numeric Nautilus currency
+    code (``"0.37987200 24"`` — ``24`` is USDT's internal code) falls back to
     ``default_currency`` (the account settlement currency). Parsing is tolerant of
     surrounding whitespace and raises rather than guessing when the layout is
     unrecognised (fail-fast, §15).
@@ -661,7 +664,10 @@ def _parse_money(text: str, default_currency: str = "USD") -> tuple[float, str]:
     match = _MONEY_RE.match(s)
     if match is None:
         raise EngineError(f"cannot parse commission as Money: {text!r}")
-    return float(match.group(1)), match.group(2) or default_currency
+    currency = match.group(2) or default_currency
+    if currency.isdigit():
+        currency = default_currency
+    return float(match.group(1)), currency
 
 
 def _step_timestamps(
