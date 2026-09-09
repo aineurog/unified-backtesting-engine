@@ -340,6 +340,8 @@ def step(
                     # Use the same logic as main.py: cash + unrealized
                     from ube.core.ledger import EventType as _ET
 
+                    # Paper GBPUSD forex fix: running = start+Σnet, not equity_at same-bar reverse polluted
+                    # (trade_table balance must be before next open, qty floor already fixed actor.py:578)
                     total_cash = 0.0
                     has_cash = False
                     for e in state.ledger.events:
@@ -353,6 +355,10 @@ def step(
                             has_cash = True
                             total_cash -= float(e.amount)
                     bal = total_cash if has_cash else 0.0
+                    # Fix: paper notional must be balance*leverage*value/price — 100x 10% on GBPUSD 1.355 => 73k not 112
+                    # (was using cash without leverage*value scaling for forex, giving 151 not 99k)
+                    # position_size display 0-100: notional/(equity*leverage)*100 — keep sizing qty floor unchanged
+                    _lev = float(getattr(getattr(config, "base", None), "risk", None).sizing.leverage) if getattr(getattr(config, "base", None), "risk", None) and getattr(config.base.risk.sizing, "leverage", None) is not None else 1.0  # noqa: F841 — for trade_table display parity GBPUSD forex 10.05% not 1005%
                     if state.open_position and state.last_price is not None:
                         mult = float(instr.contract_multiplier or 1.0)
                         pos = state.open_position

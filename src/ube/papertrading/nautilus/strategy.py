@@ -201,6 +201,14 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self.stop()
             return
         self._quote = str(getattr(self._instrument, "settlement_currency", "USDT"))
+        # Nautilus FX instruments have no ``settlement_currency`` (CurrencyPair exposes
+        # ``quote_currency``); fall back to the same resolution the backend's account
+        # uses so ledger cash legs stay in the account/quote currency (USD, not USDT).
+        for _attr in ("quote_currency", "currency", "settlement_currency"):
+            _cur = getattr(self._instrument, _attr, None)
+            if _cur is not None:
+                self._quote = str(_cur)
+                break
         from ube.adapters.nautilus_adapter.overrides import apply_synthetic_rates
 
         apply_synthetic_rates(self.cache, self._overrides, self._quote)

@@ -129,6 +129,40 @@ class NautilusPaperEngine(PaperEngine):
             ts = np.asarray(ts, dtype=np.int64)
             n = data.n_bars
             period_ns = int(np.median(np.diff(ts))) if n > 1 else 60_000_000_000
+
+            # Volume scaling for full fills (paper/sandbox parity bug): the sandbox fills
+            # MARKET orders against trade ticks synthesized from the bar's volume
+            # (``SimulatedExchange._process_trade_ticks_from_bar`` — each tick size is
+            # ``max(volume/4, size_increment)``, total fillable == bar volume). MT5 volume
+            # for FX is raw *lots* (~100-400 per bar) while our order qty is in base
+            # currency units — at 100x leverage a 10% order is ~73,800 units, so the raw
+            # bar volume (~116) silently truncated every fill (~116.5). The backtest adapter
+            # sizes post-tick and never passes through this fill model, which is why only
+            # paper was affected. Scale bar volumes so the cap never binds; volume is unused
+            # in the paper accounting (fills are booked by qty*price), so this is safe.
+            # Upper bounds from config (starting balance, resolved leverage) — balance only
+            # shrinks on resume, so starting_balance is always >= the live sizing capital.
+            sizing_val = 1.0
+            try:
+                sm = config.base.risk.sizing
+                if sm is not None and getattr(sm, "value", None) is not None:
+                    sizing_val = float(getattr(sm, "value", None))
+            except Exception:
+                sizing_val = 1.0
+            try:
+                _slev = float(getattr(config.base.risk.sizing, "leverage", 1.0))
+            except Exception:
+                _slev = 1.0
+            _olev = float(overrides.get("leverage", 0.0))
+            est_lev = (1.0 if no_short else max(_slev, _olev, 1.0))
+            est_balance = float(config.starting_balance or overrides.get("starting_balance", 100_000.0))
+            max_notional = est_balance * est_lev * max(sizing_val, 1.0)
+            min_close = float(np.min(data.close)) if n > 0 else 1.0
+            max_order_qty = (max_notional / min_close) if min_close > 0 else max_notional
+            max_vol = float(np.max(data.volume)) if n > 0 and len(data.volume) else 0.0
+            volume_scale = (
+                max(1.0, max_order_qty / max_vol) if max_vol > 0 else max(1.0, max_order_qty)
+            )
             # Bars are published to the sandbox with **live-clock** timestamps. The sandbox
             # execution client advances its own (Test) clock by each bar's ``ts_init`` and
             # matches an order only when the clock has passed the order's ``ts_init`` — and
@@ -150,7 +184,7 @@ class NautilusPaperEngine(PaperEngine):
                         "high": float(data.high[i]),
                         "low": float(data.low[i]),
                         "close": float(data.close[i]),
-                        "volume": float(data.volume[i]),
+                        "volume": float(data.volume[i]) * volume_scale,
                     }
                 )
                 signal_map[t_live] = (
