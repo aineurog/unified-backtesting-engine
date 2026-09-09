@@ -143,7 +143,11 @@ def _precision(canonical: Instrument, overrides: Mapping[str, Any]) -> tuple[int
     Nautilus requires ``price_precision == price_increment.precision``, so when the
     ``price_precision`` override differs from the tick-derived default the increment
     string is re-formatted to that precision (e.g. tick ``0.25`` with precision 3 ->
-    ``"0.250"``).
+    ``"0.250"``). An explicit ``price_increment`` override wins over the tick-based
+    value (used when data resolution is raised above the config tick, e.g. BTC prices
+    with 2 dp on a 0.1 config tick — the venue must step its synthesized tick prices
+    at the data's granularity, otherwise small-priced fills come out offset by a full
+    coarse tick).
     """
     tick = canonical.tick_size
     if tick is not None:
@@ -152,7 +156,9 @@ def _precision(canonical: Instrument, overrides: Mapping[str, Any]) -> tuple[int
         tick = float(_DEFAULT_TICK_SIZE[canonical.asset_class])
         default_precision = _DEFAULT_PRICE_PRECISION[canonical.asset_class]
     precision = int(overrides.get("price_precision", default_precision))
-    increment = f"{tick:.{precision}f}"
+    increment = overrides.get("price_increment")
+    if increment is None:
+        increment = f"{tick:.{precision}f}"
     return precision, increment
 
 

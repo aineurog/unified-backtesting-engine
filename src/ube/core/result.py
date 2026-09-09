@@ -173,14 +173,26 @@ class BacktestResult:
         base_currency = _resolve_base_currency(config, instruments)
 
         trades_view = trades(ledger, instruments=instruments)
-        # position_size display 0-100: divide by leverage (value*leverage*100 -> value*100), sizing unchanged
-        _lev = 1.0
+        # position_size display: show the configured allocation fraction directly
+        # (fixed_fraction value*100 -> e.g. 0.10 -> 10), sizing unchanged; other kinds
+        # fall back to the derived notional/(equity*leverage)*100.
+        _sizing = None
         try:
-            _lev = float(getattr(getattr(config, "risk", None), "sizing", None).leverage)  # type: ignore
+            _sizing = getattr(getattr(config, "risk", None), "sizing", None)  # type: ignore
         except Exception:
-            _lev = 1.0
-        if not _lev:
-            _lev = 1.0
+            _sizing = None
+        _lev = 1.0
+        _psz: float | None = None
+        if _sizing is not None:
+            try:
+                _lev = float(getattr(_sizing, "leverage", 1.0) or 1.0) or 1.0
+            except Exception:
+                _lev = 1.0
+            if (
+                getattr(_sizing, "kind", None) == "fixed_fraction"
+                and getattr(_sizing, "value", None) is not None
+            ):
+                _psz = float(_sizing.value)
         trade_table_view = trade_table(
             ledger,
             market_data,
@@ -188,6 +200,7 @@ class BacktestResult:
             base_currency=base_currency,
             fx_rates=fx_rates,
             leverage=_lev,
+            position_size=_psz,
         )
         pc_ids = {e.instrument_id for e in ledger if e.event_type is EventType.POSITION_CHANGE}
         positions_view = positions(ledger) if len(pc_ids) <= 1 else None

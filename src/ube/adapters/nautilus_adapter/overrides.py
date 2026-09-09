@@ -46,6 +46,7 @@ class NautilusEngineOverrides(TypedDict, total=False):
     starting_balance: float
     price_precision: int
     size_precision: int
+    price_increment: str
     oms_type: Literal["NETTING", "HEDGING"]
     maker_fee: float
     taker_fee: float
@@ -112,6 +113,7 @@ _FIELD_VALIDATORS: dict[str, Callable[[Any, str], None]] = {
     "starting_balance": _require_positive_number,
     "price_precision": _require_nonneg_int,
     "size_precision": _require_nonneg_int,
+    "price_increment": _require_str,
     "oms_type": _validate_oms_type,
     "maker_fee": _require_fraction,
     "taker_fee": _require_fraction,

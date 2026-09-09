@@ -59,6 +59,7 @@ Nautilus's bar-adaptive fill model legitimately differs from the core simulation
 from __future__ import annotations
 
 import re
+from itertools import chain
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any, cast
@@ -82,7 +83,7 @@ from ube.adapters.nautilus_adapter.overrides import (
 )
 from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel, resolve_cost_model
-from ube.core.data import MarketData
+from ube.core.data import MarketData, max_price_decimals
 from ube.core.errors import (
     ConfigError,
     DataShapeError,
@@ -305,6 +306,19 @@ class NautilusAdapter(EngineAdapter):
             fee_overrides["leverage"] = margin_leverage
 
         build = build_instrument(config.instrument, fee_overrides)
+        # Resolution-aware price precision: nautilus requires bar OHLC precision to equal
+        # the instrument's, so keep that precision, but never let a coarse config tick
+        # (e.g. 0.1) round away digits the data actually carries (BTC 2 dp, 0.00329 5 dp).
+        instrument_pp = int(build.instrument.price_precision)
+        data_pp = max_price_decimals(
+            chain(data.open, data.high, data.low, data.close),
+            base=instrument_pp,
+        )
+        if data_pp > instrument_pp:
+            fee_overrides = dict(fee_overrides)
+            fee_overrides["price_precision"] = data_pp
+            fee_overrides["price_increment"] = f"{10**-data_pp:.{data_pp}f}"
+            build = build_instrument(config.instrument, fee_overrides)
         # The ledger tags every event with the canonical symbol (§4.6), not the
         # venue-qualified Nautilus ``InstrumentId`` (``build.instrument_id`` is still
         # used below for the actor, which needs the venue to place native orders).

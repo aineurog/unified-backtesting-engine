@@ -772,6 +772,47 @@ def test_trade_table_open_row():
     assert row["balance"] == pytest.approx(1100.0)
 
 
+def test_trade_table_position_size_override_shown_directly():
+    # position_size is the configured allocation fraction (fixed_fraction value):
+    # closed and open rows both display it directly (0.10 -> 10.0), independent of
+    # the derived notional/(equity*leverage) ratio.
+    t0 = pd.Timestamp("2024-01-01T10:00", tz="UTC")
+    t1 = pd.Timestamp("2024-01-01T11:00", tz="UTC")
+    market_data = {"A": _time_bars([t0, t1], [100.0, 110.0])}
+    instruments = {"A": Instrument("A", asset_class="stocks", settlement_currency="USD")}
+    ledger = EventLedger(
+        [
+            _cash(t0, 1000.0),
+            _fill(t0, "A", 1, 10.0, 100.0),
+            _cash(t0, -1000.0),
+            _commission(t0, "A", 5.0),
+            _position(t0, "A", 10.0),
+            LedgerEvent(EventType.FILL, _ns(t1), "A", side=-1, quantity=10.0,
+                        price=110.0, exit_reason="take_profit"),
+            _cash(t1, 1100.0),
+            _position(t1, "A", 0.0),
+        ]
+    )
+    df = trade_table(ledger, market_data, instruments, base_currency="USD",
+                     initial_capital=1000.0, leverage=100.0, position_size=0.10)
+    assert len(df) == 1
+    assert df.iloc[0]["position_size_pct"] == pytest.approx(10.0)
+
+    open_ledger = EventLedger(
+        [
+            _cash(t0, 1000.0),
+            _fill(t0, "A", 1, 10.0, 100.0),
+            _cash(t0, -1000.0),
+            _position(t0, "A", 10.0),
+        ]
+    )
+    df_open = trade_table(open_ledger, market_data, instruments, base_currency="USD",
+                          initial_capital=1000.0, leverage=100.0, position_size=0.10)
+    assert len(df_open) == 1
+    assert df_open.iloc[0]["status"] == "open"
+    assert df_open.iloc[0]["position_size_pct"] == pytest.approx(10.0)
+
+
 # ---------------------------------------------------------------------------
 # EquityCurve.returns / .resample — the data surface the external metrics layer
 # consumes (§10).

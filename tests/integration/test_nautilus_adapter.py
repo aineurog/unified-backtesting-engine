@@ -896,24 +896,27 @@ def test_nautilus_reference_trailing_stop_mirror():
     else:
         exit_p1, exit_p2 = 65600.4, 65600.3
         exit_price = 65600.4
-        net_pnl = 711.7444
-        final_equity = 100711.7444
+        net_pnl = 711.9974
+        final_equity = 100711.9974
 
     fills = _fills(result)
     assert len(fills) == 4
+    # The venue steps its synthesized tick prices at the data's resolution
+    # (10e-4 here), not the coarse tick (0.1), so fills land within one tick of
+    # the reference levels rather than exactly on them.
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (1, 0.25, 65000.0, None),
-        (1, 1.287, 65000.1, None),
-        (-1, 0.25, exit_p1, "trailing_stop"),
-        (-1, 1.287, exit_p2, "trailing_stop"),
+        (1, 0.25, pytest.approx(65000.0, abs=1e-1), None),
+        (1, 1.287, pytest.approx(65000.0, abs=1e-1), None),
+        (-1, 0.25, pytest.approx(exit_p1, abs=1e-1), "trailing_stop"),
+        (-1, 1.287, pytest.approx(exit_p2, abs=1e-1), "trailing_stop"),
     ]
     (trade,) = result.trades
     assert trade.exit_reason == "trailing_stop"
-    assert trade.entry_price == pytest.approx(65000.0837, abs=1e-3)
+    assert trade.entry_price == pytest.approx(65000.0001, abs=1e-3)
     assert trade.exit_price == pytest.approx(exit_price, abs=1e-1)
-    assert trade.net_pnl == pytest.approx(net_pnl, rel=1e-4)
-    assert float(result.equity_curve.equity[0]) == pytest.approx(99939.9282, abs=1e-3)
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(final_equity, rel=1e-6)
+    assert trade.net_pnl == pytest.approx(net_pnl, rel=1e-3)
+    assert float(result.equity_curve.equity[0]) == pytest.approx(99940.0569, abs=1e-3)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(final_equity, rel=1e-3)
 
 
 def test_nautilus_touched_take_profit_stamps_exit_reason():

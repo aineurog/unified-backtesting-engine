@@ -21,7 +21,8 @@ correctness (adjustments, bad ticks) is the user's responsibility and is not val
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import math
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
 from typing import cast
@@ -37,6 +38,7 @@ __all__ = [
     "VOLUME_COLUMN",
     "OHLCV_COLUMNS",
     "derive_bar_period_ns",
+    "max_price_decimals",
 ]
 
 OHLC_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close")
@@ -423,3 +425,42 @@ def derive_bar_period_ns(market_data: MarketData | pd.DatetimeIndex) -> int:
         )
     deltas = np.diff(index.as_unit("ns").asi8)  # type: ignore[attr-defined]
     return int(np.median(deltas[deltas > 0]))
+
+
+def max_price_decimals(values: Iterable[Any], base: int = 0) -> int:
+    """Max decimal places needed to preserve the full precision of ``values``.
+
+    Prices taken straight from market data carry their true precision as the decimal
+    count of their shortest round-tripping float form (e.g. ``78973.62``, or ``0.00329``
+    for a low-priced instrument). Nautilus bars/fills truncate to the instrument's
+    ``price_precision``, so a coarse tick (e.g. 0.1) silently rounds ledger prices;
+    this returns the max decimal count across ``values`` so bar builders can keep
+    every digit the data actually has. Never below ``base`` (the instrument/engine
+    precision). Binary tick-rounding noise (``1.0837000000000001``) counts as the
+    shortest form that reproduces the value (4 dp), never the noise's decimal tail.
+
+    Args:
+        values: Candidate prices (floats, numpy scalars, ``None``/``NaN`` are skipped).
+        base: Minimum precision to guarantee (typically the instrument precision).
+
+    Returns:
+        The price precision (decimal places) to use when building ``Price`` objects.
+    """
+    precision = int(base)
+    for raw in values:
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        # Find the fewest decimals that reproduce the value (resilient to float noise
+        # from tick rounding — e.g. 1.0837000000000001 needs 4 dp, not 16).
+        for p in range(0, 10):
+            if math.isclose(value, float(f"{value:.{p}f}"), rel_tol=1e-9):
+                if p > precision:
+                    precision = p
+                break
+    return precision

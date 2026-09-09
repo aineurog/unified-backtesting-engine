@@ -186,6 +186,28 @@ def test_equity_curve_is_derived_and_correct():
     )
 
 
+def test_trade_table_position_size_display_uses_config_fraction():
+    # §4.6 display: with fixed_fraction sizing the ledger shows the configured
+    # allocation fraction directly (0.10 -> 10), not the leverage-multiplied notional
+    # ratio (which would read 1000 for 10% at 100x). Sizing/leverage still apply to
+    # the fills; only the display column changes.
+    from ube.core.risk import RiskConfig, SizeModel
+
+    ledger, market_data, instruments, config = _single_instrument()
+    config = BacktestConfig(
+        instrument=instruments["A"],
+        base_currency="USD",
+        risk=RiskConfig(
+            sizing=SizeModel(kind="fixed_fraction", value=0.10, leverage=100.0)
+        ),
+    )
+    result = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments
+    )
+    (row,) = result.trade_table.to_dict("records")
+    assert row["position_size_pct"] == pytest.approx(10.0)
+
+
 def test_trade_table_columns_match_spec():
     # §4.6: the trades table is the spec'd 19-column per-trade view, joined with the
     # equity curve; the `_pct` columns are percentages (5.0 = 5%).
