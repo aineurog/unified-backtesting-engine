@@ -59,9 +59,9 @@ Nautilus's bar-adaptive fill model legitimately differs from the core simulation
 from __future__ import annotations
 
 import re
-from itertools import chain
 from collections.abc import Mapping
 from decimal import Decimal
+from itertools import chain
 from typing import Any, cast
 
 import numpy as np
@@ -82,7 +82,7 @@ from ube.adapters.nautilus_adapter.overrides import (
     validate_overrides,
 )
 from ube.core.config import BacktestConfig
-from ube.core.cost import CostModel, resolve_cost_model
+from ube.core.cost import CostModel, fill_cost, resolve_cost_model
 from ube.core.data import MarketData, max_price_decimals
 from ube.core.errors import (
     ConfigError,
@@ -562,20 +562,23 @@ class NautilusAdapter(EngineAdapter):
                 ),
                 ts,
             )
-            commission = str(row["commission"])
-            if commission:
-                amount, currency = _parse_money(commission, settlement)
-                if amount != 0.0:
-                    _add(
-                        LedgerEvent(
-                            EventType.COMMISSION,
-                            ts,
-                            instrument_id,
-                            amount=amount,
-                            currency=currency,
-                        ),
+            # Commission at full precision via the core cost model (single source of
+            # truth, same as the paper bridge's fill_cost). Reading nautilus's fill
+            # report instead would hand the ledger a cents-rounded money amount (e.g.
+            # 0.76 vs 0.76021958), quietly shrinking every reported fee_pct by up to
+            # a cent's fraction and desyncing backtest vs paper fee columns.
+            amount = float(fill_cost(cost_model, notional=notional))
+            if amount != 0.0:
+                _add(
+                    LedgerEvent(
+                        EventType.COMMISSION,
                         ts,
-                    )
+                        instrument_id,
+                        amount=amount,
+                        currency=settlement,
+                    ),
+                    ts,
+                )
             net += side * quantity
             _add(
                 LedgerEvent(
@@ -657,31 +660,7 @@ def _fill_timestamp_ns(row: Any) -> int:
     return int(value) if value is not None else int(ts)
 
 
-#: A ``Money`` string (``"1000.20 USD"``) — amount plus an optional currency code.
-#: The suffix may be a 3-letter ISO code or a numeric Nautilus ``Currency.code``
-#: (e.g. ``24`` == USDT); numeric codes are normalised to the settlement currency.
-_MONEY_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*([A-Za-z]{3,}|\d{1,3})?\s*$")
 
-
-def _parse_money(text: str, default_currency: str = "USD") -> tuple[float, str]:
-    """Parse a Nautilus ``Money`` string (``"1000.20 USD"``) into ``(amount, currency)``.
-
-    The currency suffix is optional; a missing suffix or a numeric Nautilus currency
-    code (``"0.37987200 24"`` — ``24`` is USDT's internal code) falls back to
-    ``default_currency`` (the account settlement currency). Parsing is tolerant of
-    surrounding whitespace and raises rather than guessing when the layout is
-    unrecognised (fail-fast, §15).
-    """
-    s = str(text).strip()
-    if not s:
-        return 0.0, default_currency
-    match = _MONEY_RE.match(s)
-    if match is None:
-        raise EngineError(f"cannot parse commission as Money: {text!r}")
-    currency = match.group(2) or default_currency
-    if currency.isdigit():
-        currency = default_currency
-    return float(match.group(1)), currency
 
 
 def _step_timestamps(

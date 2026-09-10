@@ -653,20 +653,21 @@ def test_nautilus_full_loop_futures_signal_roundtrip():
     fills = _fills(result)
     assert len(fills) == 2
     # Entry fills at the signal bar's close; the signal exit at the next close.
+    # Quantity floors to the lot grid: 100000 / 5002.5 = 19.99 -> 19 contracts (§7.1).
     assert [(e.side, e.quantity, e.price, e.exit_reason) for e in fills] == [
-        (1, 20.0, 5002.5, None),
-        (-1, 20.0, 4989.5, "signal"),
+        (1, 19.0, 5002.5, None),
+        (-1, 19.0, 4989.5, "signal"),
     ]
-    assert sum(e.quantity for e in fills[:-1]) == 20.0  # no scale-out partials
+    assert sum(e.quantity for e in fills[:-1]) == 19.0  # no scale-out partials
     (trade,) = result.trades
-    assert trade.quantity == 20.0
+    assert trade.quantity == 19.0
     assert trade.entry_price == 5002.5
     assert trade.exit_price == 4989.5
     assert trade.exit_reason == "signal"
-    assert trade.net_pnl == -13000.0  # 20 * multiplier 50 * (4989.5 - 5002.5)
+    assert trade.net_pnl == -12350.0  # 19 * multiplier 50 * (4989.5 - 5002.5)
     # Self-financing equity (zero-cost model): last == starting + realized.
     assert float(result.equity_curve.equity[0]) == 100000.0
-    assert float(result.equity_curve.equity[-1]) == 87000.0
+    assert float(result.equity_curve.equity[-1]) == 87650.0
     assert not _ledger_events(result, EventType.COMMISSION)
     assert not _ledger_events(result, EventType.FUNDING_PAYMENT)
 
@@ -1479,7 +1480,8 @@ def test_nautilus_emits_order_submitted_events():
 
     submitted = _ledger_events(result, EventType.ORDER_SUBMITTED)
     # One entry order (long) + one signal-exit order (short); no risk exits in this run.
-    assert [(e.side, e.quantity) for e in submitted] == [(1, 20.0), (-1, 20.0)]
+    # Quantity floors to the lot grid: 100000 / 5002.5 = 19.99 -> 19 contracts (§7.1).
+    assert [(e.side, e.quantity) for e in submitted] == [(1, 19.0), (-1, 19.0)]
     assert all(e.order_id for e in submitted)
     # Submissions land on the two acting bars, in order.
     assert submitted[0].timestamp < submitted[1].timestamp
