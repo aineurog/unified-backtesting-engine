@@ -24,6 +24,7 @@ def fill_event(
     exit_reason: str | None,
     ts_override: int | None = None,
     multiplier: float = 1.0,
+    price_override: float | None = None,
 ) -> LedgerEvent:
     """A single ube ``FILL`` ledger event from a nautilus ``OrderFilled``.
 
@@ -32,10 +33,12 @@ def fill_event(
     ledger must stay on the test-clock timeline for §9.4 comparability.
     ``multiplier`` is the contract multiplier (e.g. 50 for ES futures) — notional is
     ``qty * price * multiplier`` like the backtest (§4.6).
+    ``price_override`` lets a paper exit book its fill at the exit's own level price
+    (optimistic level fill, §9.4) instead of the sandbox's bar-close ``last_px``.
     """
     t = int(ts_override) if ts_override is not None else int(fill.ts_init)
     qty = float(fill.last_qty.as_double())
-    price = float(fill.last_px.as_double())
+    price = float(price_override) if price_override is not None else float(fill.last_px.as_double())
     notional = qty * price * multiplier
     side = 1 if fill.is_buy else -1
     return LedgerEvent(
@@ -78,16 +81,19 @@ def commission_event(
     ts_override: int | None = None,
     multiplier: float = 1.0,
     currency: str = "USD",
+    price_override: float | None = None,
 ) -> LedgerEvent | None:
     """A ube ``COMMISSION`` ledger event computed via ``core.cost.fill_cost``.
 
     ``multiplier`` and ``currency`` mirror the backtest — notional includes the
     contract multiplier and commission is booked in the instrument's settlement
     currency, not hardcoded USD.
+    ``price_override`` mirrors :func:`fill_event` so commission matches the
+    (optimistic) level fill price, §9.4.
     """
     t = int(ts_override) if ts_override is not None else int(fill.ts_init)
     qty = float(fill.last_qty.as_double())
-    price = float(fill.last_px.as_double())
+    price = float(price_override) if price_override is not None else float(fill.last_px.as_double())
     notional = qty * price * multiplier
     commission = float(fill_cost(cost_model, notional=notional))
     if commission <= 0.0:

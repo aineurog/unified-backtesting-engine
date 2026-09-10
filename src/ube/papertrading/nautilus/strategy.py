@@ -6,8 +6,11 @@ plain MARKET orders driven by the *same* ``decide_action`` logic the recording b
 ``core.risk.sizing.size_position`` + ``floor_to_step``; fills are bridged to ube
 ``LedgerEvent``s (the ``EventLedger`` is the single source of truth, §4.6).
 
-TP/SL bracket exits and funding arrive in later tasks (T4/T5); the slice exits on the
-signal (``exit_reason="signal"``).
+Risk exits (TP/SL/ATR/trailing/chandelier/time) fire from the same
+``core.risk.exits`` pure functions as the backtest (§4.7 §9.4): "touched" exits fill
+at the exit's own level price (optimistic, zero slippage), "close"-triggered and
+time exits fill at the bar close; the slice otherwise exits on the signal
+(``exit_reason="signal"``).
 """
 
 from __future__ import annotations
@@ -30,7 +33,9 @@ from ube.core.risk.exits import (
     ATRStop,
     ChandelierExit,
     Exit,
+    TimeExit,
     TrailingStop,
+    exit_level,
     exit_triggered,
     scale_out_fraction,
 )
@@ -320,8 +325,13 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # only need OHLC arrays, so we store a minimal stub.
         return md
 
-    def _check_risk_exits(self) -> tuple[str, float] | None:
-        """Check RiskConfig.exit in order, return (exit_reason, fraction) if triggered."""
+    def _check_risk_exits(self) -> tuple[str, float, float | None] | None:
+        """Check RiskConfig.exit in order; return (exit_reason, fraction, level) if triggered.
+
+        ``level`` is the exit's own price level at the current bar for ``trigger="touched"``
+        exits — paper fills at the level (optimistic, §9.4) — and ``None`` for
+        ``trigger="close"`` exits and :class:`TimeExit`, which fill at the bar close.
+        """
         if (
             not self._exits
             or self._sim_side == 0
@@ -377,7 +387,25 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                     "TimeExit": "time_exit",
                     "ChandelierExit": "chandelier_exit",
                 }.get(name, name.lower())
-                return reason, scale_out_fraction(cfg)
+                # §9.4 alignment: only "touched" exits carry a fill level. TimeExit has no
+                # level at all, and "close"-triggered exits are evaluated against the close
+                # — both fill at the bar close, so they report ``level=None``.
+                level: float | None = None
+                if not isinstance(cfg, TimeExit) and getattr(cfg, "trigger", None) == "touched":
+                    try:
+                        level = float(
+                            exit_level(
+                                cfg,
+                                market_data=md,
+                                side=self._sim_side,
+                                entry_price=self._entry_price,
+                                entry_bar=self._entry_bar,
+                                atr_series=atr_series,
+                            )[cur_bar]
+                        )
+                    except Exception:
+                        level = None
+                return reason, scale_out_fraction(cfg), level
         return None
 
     def on_bar(self, bar: Bar) -> None:
@@ -419,15 +447,20 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # — Risk exits (T4) — checked before signals, stop precedence.
         risk_exit = self._check_risk_exits()
         if risk_exit is not None and self._sim_side != 0:
-            reason, fraction = risk_exit
+            reason, fraction, exit_level_price = risk_exit
             t = self._hist_ts
             self._events.append(
                 LedgerEvent(EventType.SIGNAL_EVALUATED, t, self._iid, action=f"exit_{reason}")
             )
             # Scale-out: fraction of remaining position (1.0 = full close).
             qty_to_close = self._sim_qty * fraction
+            # §9.4 parity: a "touched" exit fills at its own level price (optimistic — exactly
+            # at the level, zero slippage beyond it); "close"-triggered and time exits keep the
+            # bar close. The level price is stashed per-order and read on fill in
+            # ``on_order_filled`` (the sandbox would otherwise price the MARKET order at bar close).
+            close_price = exit_level_price if exit_level_price is not None else self._last_close
             # For partial closes, keep remaining position; for full, flatten.
-            self._submit_close(self._last_close, fraction=fraction, exit_reason=reason)
+            self._submit_close(close_price, fraction=fraction, exit_reason=reason)
             if fraction >= 1.0 - 1e-12:
                 self._sim_side = 0
                 self._sim_qty = 0.0
@@ -564,6 +597,12 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         close_reason: str | None = None
         if hasattr(self, "_close_reasons"):
             close_reason = self._close_reasons.pop(coid, None)
+        # §9.4: the exit level price stashed at submit (touched exits). When present it
+        # overrides the sandbox's bar-close ``last_px`` so the ledger books the optimistic
+        # level fill; ``None`` (signal/close-trigger/time exits) keeps the sandbox price.
+        fill_price: float | None = None
+        if hasattr(self, "_close_prices"):
+            fill_price = self._close_prices.pop(coid, None)
 
         if is_open:
             exit_reason: str | None = None
@@ -632,7 +671,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             hist = int(reg[4])
         side = 1 if event.is_buy else -1
         qty = float(event.last_qty.as_double())
-        price = float(event.last_px.as_double())
+        price = float(fill_price) if fill_price is not None else float(event.last_px.as_double())
         notional = qty * price * self._multiplier
         # Cash leg of the fill (§4.6): a buy pays the notional out of the account, a sell
         # pays it back in. Together with the starting-balance cash_movement and the
@@ -652,6 +691,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 exit_reason=exit_reason,
                 ts_override=hist,
                 multiplier=self._multiplier,
+                price_override=price,
             )
         )
         comm = commission_event(
@@ -661,6 +701,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             ts_override=hist,
             multiplier=self._multiplier,
             currency=self._quote,
+            price_override=price,
         )
         # Update live balance for next sizing (mirrors account.balance_total).
         # (Balance now derived dynamically from self._events)
@@ -851,6 +892,13 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             if not hasattr(self, "_close_reasons"):
                 self._close_reasons: dict[Any, str] = {}
             self._close_reasons[order.client_order_id] = exit_reason
+        # §9.4: a non-None price is the exit's own level (touched exits). Stash it so the
+        # fill books at the level — the sandbox would otherwise price this MARKET close at
+        # the bar close. ``None`` (= bar close) keeps ``on_order_filled`` a no-op.
+        if price is not None:
+            if not hasattr(self, "_close_prices"):
+                self._close_prices: dict[Any, float] = {}
+            self._close_prices[order.client_order_id] = float(price)
         self._close_order_ids.add(order.client_order_id)
         self._events.append(
             LedgerEvent(

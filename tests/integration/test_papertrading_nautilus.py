@@ -11,9 +11,10 @@ import pytest
 
 nautilus = pytest.importorskip("nautilus_trader")
 
-from ube.core.config import BacktestConfig, SignalConfig  # noqa: E402
+from ube.core.config import BacktestConfig, RiskConfig, SignalConfig  # noqa: E402
 from ube.core.data import MarketData  # noqa: E402
 from ube.core.ledger import EventType, trades  # noqa: E402
+from ube.core.risk.exits import StopLoss, TakeProfit  # noqa: E402
 from ube.core.signals import Signals, from_target  # noqa: E402
 from ube.papertrading import init, step  # noqa: E402
 from ube.papertrading.config import PaperConfig  # noqa: E402
@@ -373,6 +374,132 @@ def _leveraged_cfg() -> PaperConfig:
         risk=RiskConfig(sizing=SizeModel(kind="fixed_fraction", value=0.10, leverage=100.0)),
     )
     return PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
+
+
+def _exit_cfg(exit_cfg, asset_class: str = "crypto_perp") -> PaperConfig:
+    """A paper config carrying a ``RiskConfig.exit`` (single-exit cases for §9.4)."""
+    instr = PRESETS[asset_class].instrument
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        risk=RiskConfig(exit=(exit_cfg,)),
+    )
+    return PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
+
+
+def test_crypto_perp_touched_take_profit_fills_at_level() -> None:
+    """§9.4 — a touched TP exit fills at its own level price, not the bar close.
+
+    Entry at 100 (bar 0 close), TP 5% → level 105.0. Bar 2 prints a high of 106
+    (touches the level) but closes at 100.5 — a backtest would fill the bracket at
+    the 105.0 level, and the paper engine must book the same 105.0, not 100.5.
+    Bar 1 is a quiet hold so the entry fill (one-bar sandbox fill lag) has landed
+    before the touch.
+    """
+    md = MarketData.from_records(
+        [
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T00:00:00Z"},
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0,
+             "timestamp": "2024-01-01T01:00:00Z"},
+            {"open": 100.5, "high": 106.0, "low": 100.0, "close": 100.5, "volume": 1000.0,
+             "timestamp": "2024-01-01T02:00:00Z"},
+            {"open": 100.5, "high": 101.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T03:00:00Z"},
+            {"open": 100.0, "high": 100.0, "low": 99.0, "close": 99.5, "volume": 1000.0,
+             "timestamp": "2024-01-01T04:00:00Z"},
+        ]
+    )
+    signals = from_target(np.array([1, 1, 0, 0, 0]))
+    cfg = _exit_cfg(TakeProfit(percent=0.05))
+    state = init(cfg)
+
+    _, events = step(md, signals, state, cfg)
+
+    instr = cfg.base.instrument
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "take_profit"
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert len(fills) == 2
+    assert fills[1].exit_reason == "take_profit"
+    # level fill, not the bar-1 close (100.5)
+    assert abs(fills[1].price - 105.0) < 1e-6
+    assert abs(closed[0].exit_price - 105.0) < 1e-6
+
+
+def test_crypto_perp_touched_stop_loss_fills_at_level() -> None:
+    """§9.4 — a touched SL exit fills at the stop level: intra-bar wick through.
+
+    Entry at 100, SL 2% → level 98.0. Bar 2 dips to 97 (through the stop) and
+    closes back at 99 — the touched stop must book exactly 98.0, not the close.
+    Bar 1 is a quiet hold so the entry fill (one-bar sandbox fill lag) has landed.
+    """
+    md = MarketData.from_records(
+        [
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T00:00:00Z"},
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0,
+             "timestamp": "2024-01-01T01:00:00Z"},
+            {"open": 100.5, "high": 100.5, "low": 97.0, "close": 99.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T02:00:00Z"},
+            {"open": 99.0, "high": 99.5, "low": 98.0, "close": 98.5, "volume": 1000.0,
+             "timestamp": "2024-01-01T03:00:00Z"},
+            {"open": 98.5, "high": 99.0, "low": 97.5, "close": 98.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T04:00:00Z"},
+        ]
+    )
+    signals = from_target(np.array([1, 1, 0, 0, 0]))
+    cfg = _exit_cfg(StopLoss(percent=0.02))
+    state = init(cfg)
+
+    _, events = step(md, signals, state, cfg)
+
+    instr = cfg.base.instrument
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "stop_loss"
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert len(fills) == 2
+    assert abs(fills[1].price - 98.0) < 1e-6
+    assert abs(closed[0].exit_price - 98.0) < 1e-6
+
+
+def test_crypto_perp_close_trigger_exit_fills_at_bar_close() -> None:
+    """§9.4 — a ``trigger="close"`` SL still fills at the bar close, never the level.
+
+    Bar 1 wicks to 97 (below the 98 stop) but closes at 100.5 → not triggered by the
+    close rule. Bar 2 closes at 97.5 → triggered; with no level the MARKET order fills
+    at the closing price 97.5, matching the backtest's close-based exit.
+    """
+    md = MarketData.from_records(
+        [
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T00:00:00Z"},
+            {"open": 100.0, "high": 101.0, "low": 97.0, "close": 100.5, "volume": 1000.0,
+             "timestamp": "2024-01-01T01:00:00Z"},
+            {"open": 100.5, "high": 101.0, "low": 96.5, "close": 97.5, "volume": 1000.0,
+             "timestamp": "2024-01-01T02:00:00Z"},
+            {"open": 97.5, "high": 98.0, "low": 96.5, "close": 97.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T03:00:00Z"},
+        ]
+    )
+    signals = from_target(np.array([1, 1, 1, 0]))
+    cfg = _exit_cfg(StopLoss(percent=0.02, trigger="close"))
+    state = init(cfg)
+
+    _, events = step(md, signals, state, cfg)
+
+    instr = cfg.base.instrument
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "stop_loss"
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert len(fills) == 2
+    # bar-2 close (97.5), not the 98.0 stop level — and never the bar-1 close
+    assert abs(fills[1].price - 97.5) < 1e-6
+    assert abs(closed[0].exit_price - 97.5) < 1e-6
+    assert fills[1].timestamp == int(md.timestamps.as_unit("ns").asi8[2])
 
 
 def test_resume_reverse_from_open_short_does_not_double_count_notional() -> None:
