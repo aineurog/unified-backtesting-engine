@@ -161,8 +161,9 @@ class NautilusPaperEngine(PaperEngine):
             sizing_val = 1.0
             try:
                 sm = config.base.risk.sizing
-                if sm is not None and getattr(sm, "value", None) is not None:
-                    sizing_val = float(getattr(sm, "value", None))
+                sm_val = getattr(sm, "value", None) if sm is not None else None
+                if sm is not None and sm_val is not None:
+                    sizing_val = float(sm_val)
             except Exception:
                 sizing_val = 1.0
             try:
@@ -172,7 +173,9 @@ class NautilusPaperEngine(PaperEngine):
             _olev = float(overrides.get("leverage", 0.0))
             _acct_est = str(overrides.get("account_type", "margin")).lower()
             est_lev = (1.0 if _acct_est == "cash" else max(_slev, _olev, 1.0))
-            est_balance = float(config.starting_balance or overrides.get("starting_balance", 100_000.0))
+            est_balance = float(
+                config.starting_balance or overrides.get("starting_balance", 100_000.0)
+            )
             max_notional = est_balance * est_lev * max(sizing_val, 1.0)
             min_close = float(np.min(data.close)) if n > 0 else 1.0
             max_order_qty = (max_notional / min_close) if min_close > 0 else max_notional

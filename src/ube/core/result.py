@@ -178,7 +178,7 @@ class BacktestResult:
         # fall back to the derived notional/(equity*leverage)*100.
         _sizing = None
         try:
-            _sizing = getattr(getattr(config, "risk", None), "sizing", None)  # type: ignore
+            _sizing = getattr(getattr(config, "risk", None), "sizing", None)
         except Exception:
             _sizing = None
         _lev = 1.0

@@ -340,8 +340,9 @@ def step(
                     # Use the same logic as main.py: cash + unrealized
                     from ube.core.ledger import EventType as _ET
 
-                    # Paper GBPUSD forex fix: running = start+Σnet, not equity_at same-bar reverse polluted
-                    # (trade_table balance must be before next open, qty floor already fixed actor.py:578)
+                    # Paper GBPUSD forex fix: running = start+Σnet, not equity_at
+                    # same-bar reverse polluted; balance must be before next open
+                    # (qty floor already fixed actor.py:578)
                     total_cash = 0.0
                     has_cash = False
                     for e in state.ledger.events:
@@ -355,10 +356,20 @@ def step(
                             has_cash = True
                             total_cash -= float(e.amount)
                     bal = total_cash if has_cash else 0.0
-                    # Fix: paper notional must be balance*leverage*value/price — 100x 10% on GBPUSD 1.355 => 73k not 112
+                    # Fix: paper notional must be balance*leverage*value/price —
+                    # 100x 10% on GBPUSD 1.355 => 73k not 112
                     # (was using cash without leverage*value scaling for forex, giving 151 not 99k)
-                    # position_size display 0-100: notional/(equity*leverage)*100 — keep sizing qty floor unchanged
-                    _lev = float(getattr(getattr(config, "base", None), "risk", None).sizing.leverage) if getattr(getattr(config, "base", None), "risk", None) and getattr(config.base.risk.sizing, "leverage", None) is not None else 1.0  # noqa: F841 — for trade_table display parity GBPUSD forex 10.05% not 1005%
+                    # position_size display 0-100: notional/(equity*leverage)*100 —
+                    # keep sizing qty floor unchanged
+                    _cfg_risk = getattr(getattr(config, "base", None), "risk", None)
+                    _cfg_sizing = (
+                        getattr(_cfg_risk, "sizing", None) if _cfg_risk is not None else None
+                    )
+                    _lev = (  # noqa: F841 — for trade_table display parity GBPUSD forex 10.05% not 1005%
+                        float(_cfg_sizing.leverage)
+                        if _cfg_sizing is not None and _cfg_sizing.leverage is not None
+                        else 1.0
+                    )
                     if state.open_position and state.last_price is not None:
                         mult = float(instr.contract_multiplier or 1.0)
                         pos = state.open_position
@@ -602,7 +613,7 @@ class RecordingBackend(PaperEngine):
         signals: Signals,
         config: PaperConfig,
     ) -> list[LedgerEvent]:
-        from ube.core.cost import fill_cost, resolve_cost_model
+        from ube.core.cost import fill_cost, resolve_cost_model, slipped_price
 
         instrument = config.base.instrument
         asset_class = instrument.asset_class if isinstance(instrument, Instrument) else ""
@@ -655,16 +666,19 @@ class RecordingBackend(PaperEngine):
 
             # Emit the close (if any) then the open, as separate fills.
             if close_first and sim_qty > 0:
-                notional = sim_qty * price
+                close_side = -sim_side
+                # §8 price-level slippage by the closing fill's direction.
+                close_price = float(slipped_price(price, close_side, cost_model.slippage))
+                notional = sim_qty * close_price
                 commission = float(fill_cost(cost_model, notional=notional))
                 events.append(
                     LedgerEvent(
                         EventType.FILL,
                         t,
                         iid,
-                        side=-sim_side,
+                        side=close_side,
                         quantity=sim_qty,
-                        price=price,
+                        price=close_price,
                         notional=notional,
                         exit_reason="signal",
                     )
@@ -684,7 +698,9 @@ class RecordingBackend(PaperEngine):
                 side = 1 if desired == 1 else -1
                 # Use an all-in-ish size: 1.0 unit for the fake (deterministic).
                 qty = 1.0
-                notional = qty * price
+                # §8 price-level slippage by the opening fill's direction.
+                open_price = float(slipped_price(price, side, cost_model.slippage))
+                notional = qty * open_price
                 commission = float(fill_cost(cost_model, notional=notional))
                 order_id = f"{action}-{t}"
                 events.append(
@@ -709,7 +725,7 @@ class RecordingBackend(PaperEngine):
                         iid,
                         side=side,
                         quantity=qty,
-                        price=price,
+                        price=open_price,
                         notional=notional,
                         order_id=order_id,
                     )

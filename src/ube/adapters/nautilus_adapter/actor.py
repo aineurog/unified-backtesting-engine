@@ -81,7 +81,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders.base import Order
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
-from ube.core.cost import CostModel
+from ube.core.cost import CostModel, slipped_price
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, EngineError
 from ube.core.instrument import allows_short
@@ -504,7 +504,12 @@ class UbeActor(Strategy):  # type: ignore[misc]
             self.signal_evaluated[idx] = action
 
     def _open(self, side: int, bar: Bar, idx: int) -> None:
-        price = float(bar.close)
+        model = self._cost_model
+        slip = model.slippage if model is not None else 0.0
+        # Sizing and stop/target anchoring use the *slipped* entry reference price —
+        # the fill the venue actually books (§8). The fold applies the same adjustment
+        # to the fill report's last_px, so the resulting fill price equals ``price``.
+        price = float(slipped_price(float(bar.close), side, slip))
         qty = self._entry_quantity(price, idx)
         if qty is None:
             self.log.error(

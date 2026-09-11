@@ -139,7 +139,11 @@ def apply_synthetic_rates(
         return
 
     try:
-        from nautilus_trader.model.currencies import USD, USDT, Currency
+        from nautilus_trader.model.currencies import (  # type: ignore[attr-defined]
+            USD,
+            USDT,
+            Currency,
+        )
 
         # Default USD <-> USDT 1:1 synthetic rate
         try:

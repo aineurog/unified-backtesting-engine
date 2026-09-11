@@ -25,7 +25,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd

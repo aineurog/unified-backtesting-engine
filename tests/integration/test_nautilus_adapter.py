@@ -713,14 +713,16 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
 
     fills = _fills(result)
     assert len(fills) == 2
-    assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (1, 1.65, 60535.9, None),
-        (-1, 1.65, 60693.9, "signal"),
+    # §8: slippage is price-level — the long entry buys at bar close * (1 + slip),
+    # the signal-exit sells at bar close * (1 - slip).
+    assert [(e.side, round(e.quantity, 3), round(e.price, 6), e.exit_reason) for e in fills] == [
+        (1, 1.65, 60548.00718, None),
+        (-1, 1.65, 60681.76122, "signal"),
     ]
     commissions = _ledger_events(result, EventType.COMMISSION)
     fundings = _ledger_events(result, EventType.FUNDING_PAYMENT)
     assert len(commissions) == 2
-    assert all(e.amount > 0.0 for e in commissions)  # commission + slippage, per fill
+    assert all(e.amount > 0.0 for e in commissions)  # commission, per fill
     assert len(fundings) == 3  # three held bars between the entry and exit bars
     assert all(e.amount > 0.0 for e in fundings)
     (trade,) = result.trades
@@ -728,7 +730,7 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
     # all_in now reserves the entry fee in the sized quantity (§7.1), so the entry fills
     # slightly fewer units and the net PnL/equity reflect the correctly-reserved fee.
     assert trade.net_pnl == pytest.approx(90.5904, rel=1e-4)  # gross less fees + funding
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.6453, rel=1e-6)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.5904, rel=1e-6)
 
 
 def test_nautilus_full_loop_crypto_perp_short_pays_loss():
@@ -750,18 +752,20 @@ def test_nautilus_full_loop_crypto_perp_short_pays_loss():
     )
 
     fills = _fills(result)
-    assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (-1, 1.65, 60535.9, None),
-        (1, 1.65, 60693.9, "signal"),
+    # §8: slippage is price-level — the short entry sells at bar close * (1 - slip),
+    # the buy-to-cover exit books at bar close * (1 + slip).
+    assert [(e.side, round(e.quantity, 3), round(e.price, 6), e.exit_reason) for e in fills] == [
+        (-1, 1.651, 60523.79282, None),
+        (1, 1.651, 60706.03878, "signal"),
     ]
     (trade,) = result.trades
     assert trade.side == -1
     # all_in now reserves the entry fee in the sized quantity (§7.1), so the entry fills
     # slightly fewer units and the net PnL/equity reflect the correctly-reserved fee.
-    assert trade.net_pnl == pytest.approx(-430.8096, rel=1e-4)
+    assert trade.net_pnl == pytest.approx(-431.0707, rel=1e-4)
     assert len(_ledger_events(result, EventType.COMMISSION)) == 2
     assert len(_ledger_events(result, EventType.FUNDING_PAYMENT)) == 3
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(99569.1904, rel=1e-6)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(99568.9293, rel=1e-6)
 
 
 def test_nautilus_cash_account_short_rejection_raises_engine_error():

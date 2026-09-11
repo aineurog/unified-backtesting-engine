@@ -172,13 +172,16 @@ def _divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
 
 
 def _entry_fee_rate(cost_model: CostModel | None) -> float:
-    """Entry-fill fee rate (commission + slippage) as a fraction of notional.
+    """Entry-fill commission rate as a fraction of notional.
 
     Reuses :func:`ube.core.cost.fill_cost` so the fee math has a single source of truth
     (§4.5) — this is not a second, independent implementation of the same calculation.
-    ``None`` means zero-cost (the §7.1 default), preserving fee-less behavior for callers
-    that don't pass a cost model. Entry fee only: the exit fill is paid out of proceeds,
-    not out of the upfront capital being sized here.
+    Slippage is *not* reserved here: it is a price-level adjustment (see
+    :func:`ube.core.cost.slipped_price`) applied to the fill price itself, so the
+    entry notional the sizer prices already includes it. ``None`` means zero-cost (the
+    §7.1 default), preserving fee-less behavior for callers that don't pass a cost
+    model. Entry fee only: the exit fill is paid out of proceeds, not out of the
+    upfront capital being sized here.
     """
     if cost_model is None:
         return 0.0
@@ -256,7 +259,8 @@ def all_in_size(
     """Fee-aware all-in sizer: 100% of capital, reserving the entry fee (§7.1).
 
     ``units = capital / (price * (1 + entry_fee_rate))``, where the entry-fee rate is the
-    commission + slippage fraction reused from :func:`ube.core.cost.fill_cost`. Reserving
+    commission fraction from :func:`ube.core.cost.fill_cost` (slippage is already
+    reflected in ``price`` via :func:`ube.core.cost.slipped_price`). Reserving
     the fee up front means the order no longer pushes the account negative when the venue
     charges commission on top of the notional (the previously-silent empty-result bug).
     """

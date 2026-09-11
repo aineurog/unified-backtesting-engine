@@ -12,11 +12,17 @@ Translation summary (requirements §4.6):
   (native orders); the core trigger rule computes the levels, Nautilus performs the
   fill simulation (§8).
 * **Fees** — the core :class:`~ube.core.cost.CostModel` drives everything. Its
-  ``commission + slippage`` is folded into both the instrument's ``maker_fee`` and
+  ``commission`` is folded into both the instrument's ``maker_fee`` and
   ``taker_fee`` at construction (an explicit ``maker_fee`` / ``taker_fee`` engine
   override wins over the cost model). Nautilus then charges the fee per fill, and the
   fold books each fill's ``commission`` into the ledger as a ``commission`` event —
   the canonical trade/equity math applies it identically to the core cost functions.
+* **Slippage** — the ``slippage`` rate is an adverse *price-level* adjustment
+  (:func:`~ube.core.cost.slipped_price`), applied uniformly to every fill price in the
+  fold: a BUY books at ``price * (1 + slippage)``, a SELL at ``price * (1 - slippage)``,
+  whether the fill is an entry, a normal risk-exit, or an intra-bar stop/gap fill.
+  The actor sizes entries and anchors stop/target levels against the slipped entry
+  price, so the reported fill prices are the slipped ones (§8).
 * **Carry** — ``funding`` / ``borrow`` rates have no native Nautilus equivalent, so
   the adapter derives ``funding_payment`` events directly from the core
   :func:`~ube.core.ledger.funding_payments` generator, aligned per bar (§24).
@@ -49,7 +55,7 @@ Nautilus's bar-adaptive fill model legitimately differs from the core simulation
   *first*; no ``BacktestVenueConfig`` flag flips this (probe-verified on 1.221.0).
   §8 prescribes stop-first; the actor honours §8 precedence for close-time exits and
   documents this as a residual divergence for the parity report.
-* Fees: ``commission + slippage`` is folded into the instrument's ``maker_fee`` /
+* Fees: ``commission`` is folded into the instrument's ``maker_fee`` /
   ``taker_fee``, so Nautilus charges per fill; ``funding`` / ``borrow`` have no native
   equivalent and are re-derived from the core ``CostModel`` by
   :func:`~ube.core.ledger.funding_payments`. Rounding can differ from a purely
@@ -82,7 +88,7 @@ from ube.adapters.nautilus_adapter.overrides import (
     validate_overrides,
 )
 from ube.core.config import BacktestConfig
-from ube.core.cost import CostModel, fill_cost, resolve_cost_model
+from ube.core.cost import CostModel, fill_cost, resolve_cost_model, slipped_price
 from ube.core.data import MarketData, max_price_decimals
 from ube.core.errors import (
     ConfigError,
@@ -283,10 +289,12 @@ class NautilusAdapter(EngineAdapter):
             else resolve_cost_model(config.instrument)
         )
 
-        # Fold commission + slippage into the instrument fees (§5.3); an explicit
-        # maker_fee/taker_fee override wins over the resolved cost model.
+        # Fold commission only into the instrument fees (§5.3); an explicit
+        # maker_fee/taker_fee override wins over the resolved cost model. Slippage is a
+        # price-level adjustment (:func:`ube.core.cost.slipped_price`), applied to each
+        # fill price in the fold below — never a fee.
         fee_overrides = dict(overrides)
-        rate = cost_model.commission + cost_model.slippage
+        rate = cost_model.commission
         fee_overrides.setdefault("maker_fee", rate)
         fee_overrides.setdefault("taker_fee", rate)
 
@@ -526,13 +534,21 @@ class NautilusAdapter(EngineAdapter):
 
         # Fills -> fill + cash-leg + commission events; position_change reconstructed
         # from the running net position so scale-out partials move the ledger position.
-        fills = engine.trader.generate_fills_report()
+        # Nautilus's fills report is NOT guaranteed chronological (row order follows its
+        # internal index, not ts_event): an intra-bar stop/target fill can be reported
+        # before the entry fill of the same trade. The running-net bookkeeping below
+        # requires chronological order, or signed position_after values land on the wrong
+        # timestamps and corrupt the equity curve's marks (§4.6).
+        fill_rows = _fills_chronological(engine.trader.generate_fills_report())
         net: float = 0.0
-        for client_order_id, row in fills.iterrows():
+        for client_order_id, row in fill_rows:
             ts = _fill_timestamp_ns(row)
             side = 1 if row["order_side"] == "BUY" else -1
             quantity = float(row["last_qty"])
-            price = float(row["last_px"])
+            # Slippage is a price-level adjustment, applied to *every* fill: entries,
+            # signal/close-exit market fills, and intra-bar stop/target/gap fills alike.
+            # A BUY books at price*(1+slip), a SELL at price*(1-slip) (§8).
+            price = float(slipped_price(float(row["last_px"]), side, cost_model.slippage))
             notional = quantity * price * multiplier
             # Cash leg of the fill (§4.6): a buy pays the notional out of the account, a
             # sell pays it back in. Together with the starting-balance cash_movement and
@@ -658,6 +674,22 @@ def _fill_timestamp_ns(row: Any) -> int:
     ts = row["ts_event"]
     value = getattr(ts, "value", None)
     return int(value) if value is not None else int(ts)
+
+
+def _fills_chronological(fills: Any) -> list[tuple[object, Any]]:
+    """Order a fills-report frame's rows by fill timestamp (stable).
+
+    Nautilus's fills-report rows follow its internal index rather than the
+    chronological ``ts_event`` order. The fold accumulates running signed net
+    positions from these rows and emits each ``position_change`` at its fill's
+    timestamp, so a non-chronological report misattributes ``position_after`` to the
+    wrong timestamps — an intra-bar stop fill can precede its own entry fill and
+    leave a phantom opposite-sign position on the equity-curve grid, corrupting the
+    marks (§4.6). A stable sort by ``ts_event`` makes the sequence chronological
+    while preserving the report's relative order for same-timestamp rows (split
+    fills), so the final running net stays identical.
+    """
+    return sorted(fills.iterrows(), key=lambda item: _fill_timestamp_ns(item[1]))
 
 
 

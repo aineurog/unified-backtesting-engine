@@ -26,7 +26,7 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
-from ube.core.cost import fill_cost
+from ube.core.cost import fill_cost, slipped_price
 from ube.core.data import MarketData
 from ube.core.ledger import EventType, LedgerEvent
 from ube.core.risk.exits import (
@@ -151,7 +151,10 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         for e in self._events:
             if e.event_type == EventType.CASH_MOVEMENT and e.amount is not None:
                 balance += float(e.amount)
-            elif e.event_type in (EventType.COMMISSION, EventType.FUNDING_PAYMENT) and e.amount is not None:
+            elif (
+                e.event_type in (EventType.COMMISSION, EventType.FUNDING_PAYMENT)
+                and e.amount is not None
+            ):
                 balance -= float(e.amount)
         return balance + self._pending_credit
 
@@ -555,7 +558,8 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # Optimistic close-credit for same-bar reverse sizing.
         _close_credit = 0.0
         if close_first and self._sim_qty > 0:
-            _close_notional = self._sim_qty * (self._last_close or 0.0) * self._multiplier
+            _close_ref = self._slipped(self._last_close or 0.0, -self._sim_side)
+            _close_notional = self._sim_qty * _close_ref * self._multiplier
             _close_comm = float(
                 fill_cost(self.config.cost_model, notional=_close_notional)
             ) if self.config.cost_model else 0.0
@@ -576,9 +580,11 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self._entry_price = None
         if desired != 0:
             self._submit_open(desired, self._last_close)
-            # Record entry for risk-exit level computation (vectorized, §8).
+            # Record entry for risk-exit level computation (vectorized, §8). Anchored to
+            # the slipped entry price — the fill the venue books — so touched stop/target
+            # levels match the real executed entry.
             self._entry_bar = len(self._bars) - 1
-            self._entry_price = self._last_close
+            self._entry_price = self._slipped(self._last_close, desired)
             # Funding: reset last funding timestamp on new entry.
             self._last_funding_ns = self._hist_ts
 
@@ -608,9 +614,12 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             exit_reason: str | None = None
             self._sim_side = 1 if event.is_buy else -1
             self._sim_qty = float(event.last_qty.as_double())
-            # Record entry for risk-exit level computation.
+            # Record entry for risk-exit level computation. Anchored to the slipped fill
+            # price (mirrors the backtest actor), so touched stop/target levels line up.
             self._entry_bar = len(self._bars) - 1
-            self._entry_price = float(event.last_px.as_double())
+            self._entry_price = self._slipped(
+                float(event.last_px.as_double()), 1 if event.is_buy else -1
+            )
             self._last_funding_ns = self._hist_ts
             # Issue C: a fresh (non-resume) entry starts a new running extreme and ATR window
             # from this bar. The fill arrives asynchronously (one bar after submission), so
@@ -671,7 +680,10 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             hist = int(reg[4])
         side = 1 if event.is_buy else -1
         qty = float(event.last_qty.as_double())
-        price = float(fill_price) if fill_price is not None else float(event.last_px.as_double())
+        # §8: price-level slippage applies to *every* fill — entries, signal closes, and
+        # touched exits (whose level price is slipped just like the backtest's stop fold).
+        base = float(fill_price) if fill_price is not None else float(event.last_px.as_double())
+        price = self._slipped(base, side)
         notional = qty * price * self._multiplier
         # Cash leg of the fill (§4.6): a buy pays the notional out of the account, a sell
         # pays it back in. Together with the starting-balance cash_movement and the
@@ -740,6 +752,8 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
 
         close_side = -self._sim_side  # sell to close long, buy to close short
         qty = self._pending_open_qty
+        # Same §8 price-level slippage as a real fill of ``close_side``.
+        price = self._slipped(price, close_side)
         notional = qty * price * self._multiplier
         hist = self._hist_ts
 
@@ -796,6 +810,19 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._entry_bar = None
 
     # -- order submission -------------------------------------------------- #
+    def _slipped(self, price: float, side: int) -> float:
+        """Adverse price-level slippage for a fill of direction ``side`` (+1 BUY, -1 SELL).
+
+        Mirrors the backtest fold (:func:`ube.core.cost.slipped_price`): a BUY books at
+        ``price * (1 + slippage)``, a SELL at ``price * (1 - slippage)``. Identity when
+        the cost model has no slippage.
+        """
+        model = self.config.cost_model
+        slip = model.slippage if model is not None else 0.0
+        if slip == 0.0:
+            return price
+        return float(slipped_price(price, side, slip))
+
     def _lot_step(self) -> float:
         instr = self._instrument
         if instr is None:
@@ -842,7 +869,9 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         if self._instrument is None or price is None:
             return
         side = OrderSide.BUY if desired == 1 else OrderSide.SELL
-        qty = self._size_qty(price)
+        # Size against the slipped entry reference price (the fill the venue books),
+        # mirroring the backtest actor's ``_open``.
+        qty = self._size_qty(self._slipped(float(price), desired))
         if qty is None or float(qty.as_double()) <= 0.0:
             self.log.warning(f"Skipped open {side}: non-positive quantity")
             return
