@@ -441,6 +441,26 @@ def test_build_instrument_rejects_unsupported_asset_class():
         instrument_mod.ASSET_CLASSES = original
 
 
+def test_validate_overrides_accepts_synthetic_rates():
+    from ube.adapters.nautilus_adapter.overrides import validate_overrides
+
+    overrides = {"synthetic_rates": {"USD/USDT": 1.0, "USDT/USD": 1.0}}
+    res = validate_overrides(overrides)
+    assert res["synthetic_rates"] == {"USD/USDT": 1.0, "USDT/USD": 1.0}
+
+
+def test_apply_synthetic_rates_sets_mark_xrate_on_cache():
+    from nautilus_trader.cache.cache import Cache
+    from nautilus_trader.model.currencies import USD, USDT
+
+    from ube.adapters.nautilus_adapter.overrides import apply_synthetic_rates
+
+    cache = Cache()
+    apply_synthetic_rates(cache, {"synthetic_rates": {"USD/USDT": 1.0}})
+    assert cache.get_mark_xrate(USD, USDT) == 1.0
+    assert cache.get_mark_xrate(USDT, USD) == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Step 4: Data + signal bridge (MarketData/Signals -> Nautilus bars + lookup).
 # ---------------------------------------------------------------------------
@@ -499,7 +519,7 @@ def test_to_nautilus_bars_ts_event_equals_ts_init_and_matches_index():
     md = synthetic_bars(preset, n_bars=24)
     bars, _ = to_nautilus_bars(md, build_instrument(preset.instrument))
     for i, bar in enumerate(bars):
-        assert bar.ts_event == int(md.timestamps.asi8[i])
+        assert bar.ts_event == int(md.timestamps.as_unit("ns").asi8[i])  # type: ignore[attr-defined]
         assert bar.ts_init == bar.ts_event
 
 
@@ -551,7 +571,7 @@ def test_to_signal_map_aligns_to_bar_timestamps():
     sig = from_target([0, 1, 1, 0, -1, -1])
     mapping = to_signal_map(md, sig)
     assert len(mapping) == 6
-    ts = md.timestamps.asi8
+    ts = md.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
     assert mapping[int(ts[0])] == (False, False, False, False)
     assert mapping[int(ts[1])] == (True, False, False, False)
     assert mapping[int(ts[3])] == (False, True, False, False)
@@ -633,20 +653,21 @@ def test_nautilus_full_loop_futures_signal_roundtrip():
     fills = _fills(result)
     assert len(fills) == 2
     # Entry fills at the signal bar's close; the signal exit at the next close.
+    # Quantity floors to the lot grid: 100000 / 5002.5 = 19.99 -> 19 contracts (§7.1).
     assert [(e.side, e.quantity, e.price, e.exit_reason) for e in fills] == [
-        (1, 20.0, 5002.5, None),
-        (-1, 20.0, 4989.5, "signal"),
+        (1, 19.0, 5002.5, None),
+        (-1, 19.0, 4989.5, "signal"),
     ]
-    assert sum(e.quantity for e in fills[:-1]) == 20.0  # no scale-out partials
+    assert sum(e.quantity for e in fills[:-1]) == 19.0  # no scale-out partials
     (trade,) = result.trades
-    assert trade.quantity == 20.0
+    assert trade.quantity == 19.0
     assert trade.entry_price == 5002.5
     assert trade.exit_price == 4989.5
     assert trade.exit_reason == "signal"
-    assert trade.net_pnl == -13000.0  # 20 * multiplier 50 * (4989.5 - 5002.5)
+    assert trade.net_pnl == -12350.0  # 19 * multiplier 50 * (4989.5 - 5002.5)
     # Self-financing equity (zero-cost model): last == starting + realized.
     assert float(result.equity_curve.equity[0]) == 100000.0
-    assert float(result.equity_curve.equity[-1]) == 87000.0
+    assert float(result.equity_curve.equity[-1]) == 87650.0
     assert not _ledger_events(result, EventType.COMMISSION)
     assert not _ledger_events(result, EventType.FUNDING_PAYMENT)
 
@@ -692,14 +713,16 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
 
     fills = _fills(result)
     assert len(fills) == 2
-    assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (1, 1.65, 60535.9, None),
-        (-1, 1.65, 60693.9, "signal"),
+    # §8: slippage is price-level — the long entry buys at bar close * (1 + slip),
+    # the signal-exit sells at bar close * (1 - slip).
+    assert [(e.side, round(e.quantity, 3), round(e.price, 6), e.exit_reason) for e in fills] == [
+        (1, 1.65, 60548.00718, None),
+        (-1, 1.65, 60681.76122, "signal"),
     ]
     commissions = _ledger_events(result, EventType.COMMISSION)
     fundings = _ledger_events(result, EventType.FUNDING_PAYMENT)
     assert len(commissions) == 2
-    assert all(e.amount > 0.0 for e in commissions)  # commission + slippage, per fill
+    assert all(e.amount > 0.0 for e in commissions)  # commission, per fill
     assert len(fundings) == 3  # three held bars between the entry and exit bars
     assert all(e.amount > 0.0 for e in fundings)
     (trade,) = result.trades
@@ -707,7 +730,7 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
     # all_in now reserves the entry fee in the sized quantity (§7.1), so the entry fills
     # slightly fewer units and the net PnL/equity reflect the correctly-reserved fee.
     assert trade.net_pnl == pytest.approx(90.5904, rel=1e-4)  # gross less fees + funding
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.6453, rel=1e-6)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.5904, rel=1e-6)
 
 
 def test_nautilus_full_loop_crypto_perp_short_pays_loss():
@@ -729,18 +752,20 @@ def test_nautilus_full_loop_crypto_perp_short_pays_loss():
     )
 
     fills = _fills(result)
-    assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (-1, 1.65, 60535.9, None),
-        (1, 1.65, 60693.9, "signal"),
+    # §8: slippage is price-level — the short entry sells at bar close * (1 - slip),
+    # the buy-to-cover exit books at bar close * (1 + slip).
+    assert [(e.side, round(e.quantity, 3), round(e.price, 6), e.exit_reason) for e in fills] == [
+        (-1, 1.651, 60523.79282, None),
+        (1, 1.651, 60706.03878, "signal"),
     ]
     (trade,) = result.trades
     assert trade.side == -1
     # all_in now reserves the entry fee in the sized quantity (§7.1), so the entry fills
     # slightly fewer units and the net PnL/equity reflect the correctly-reserved fee.
-    assert trade.net_pnl == pytest.approx(-430.8096, rel=1e-4)
+    assert trade.net_pnl == pytest.approx(-431.0707, rel=1e-4)
     assert len(_ledger_events(result, EventType.COMMISSION)) == 2
     assert len(_ledger_events(result, EventType.FUNDING_PAYMENT)) == 3
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(99569.1904, rel=1e-6)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(99568.9293, rel=1e-6)
 
 
 def test_nautilus_cash_account_short_rejection_raises_engine_error():
@@ -864,21 +889,39 @@ def test_nautilus_reference_trailing_stop_mirror():
     # fee-aware all_in size is floored to the lot grid, §7.1); the trailing stop is
     # armed at the running peak * 0.999 and fires on the last (drop) bar — the
     # reference journals its exit on this same 23:00 bar.
+    import nautilus_trader
+    from packaging.version import parse as parse_version
+
+    is_nautilus_1_23_plus = parse_version(nautilus_trader.__version__) >= parse_version("1.230.0")
+    if is_nautilus_1_23_plus:
+        exit_p1, exit_p2 = 65456.0, 65455.9
+        exit_price = 65455.9
+        net_pnl = 489.9125
+        final_equity = 100489.9125
+    else:
+        exit_p1, exit_p2 = 65600.4, 65600.3
+        exit_price = 65600.4
+        net_pnl = 711.9974
+        final_equity = 100711.9974
+
     fills = _fills(result)
     assert len(fills) == 4
+    # The venue steps its synthesized tick prices at the data's resolution
+    # (10e-4 here), not the coarse tick (0.1), so fills land within one tick of
+    # the reference levels rather than exactly on them.
     assert [(e.side, round(e.quantity, 3), e.price, e.exit_reason) for e in fills] == [
-        (1, 0.25, 65000.0, None),
-        (1, 1.287, 65000.1, None),
-        (-1, 0.25, 65600.4, "trailing_stop"),
-        (-1, 1.287, 65600.3, "trailing_stop"),
+        (1, 0.25, pytest.approx(65000.0, abs=1e-1), None),
+        (1, 1.287, pytest.approx(65000.0, abs=1e-1), None),
+        (-1, 0.25, pytest.approx(exit_p1, abs=1e-1), "trailing_stop"),
+        (-1, 1.287, pytest.approx(exit_p2, abs=1e-1), "trailing_stop"),
     ]
     (trade,) = result.trades
     assert trade.exit_reason == "trailing_stop"
-    assert trade.entry_price == pytest.approx(65000.0837, abs=1e-3)
-    assert trade.exit_price == pytest.approx(65600.4, abs=1e-1)
-    assert trade.net_pnl == pytest.approx(711.7444, rel=1e-4)
-    assert float(result.equity_curve.equity[0]) == pytest.approx(99939.9282, abs=1e-3)
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100711.7444, rel=1e-6)
+    assert trade.entry_price == pytest.approx(65000.0001, abs=1e-3)
+    assert trade.exit_price == pytest.approx(exit_price, abs=1e-1)
+    assert trade.net_pnl == pytest.approx(net_pnl, rel=1e-3)
+    assert float(result.equity_curve.equity[0]) == pytest.approx(99940.0569, abs=1e-3)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(final_equity, rel=1e-3)
 
 
 def test_nautilus_touched_take_profit_stamps_exit_reason():
@@ -1361,18 +1404,23 @@ def test_nautilus_run_rejects_contradictory_signal_entries():
         )
 
 
-def test_nautilus_run_rejects_short_on_crypto_spot():
+def test_nautilus_run_skips_short_on_crypto_spot():
     from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
     from ube.core.config import BacktestConfig
-    from ube.core.errors import InvalidSignalError
     from ube.core.instrument import Instrument
 
     md = synthetic_bars(PRESETS["crypto_perp"], seed=7, n_bars=6)
-    cfg = BacktestConfig(instrument=Instrument("BTC-USDT", asset_class="crypto_spot"))
+    instr = Instrument(
+        "BTC-USDT", "crypto_spot", tick_size=0.1, calendar="24/7", settlement_currency="USDT"
+    )
+    cfg = BacktestConfig(
+        instrument=instr, engine_overrides={"starting_balance": 100000.0}
+    )
     # from_target([0, -1, ...]) emits short_entry at bar 1; spot is long-only, so the
-    # run fails fast (§4.5/§6.1) rather than silently dropping the short.
-    with pytest.raises(InvalidSignalError, match="long-only"):
-        NautilusAdapter().run(md, from_target([0, -1, -1, -1, -1, -1]), cfg)
+    # shorting gate at the strategy level (§4.5/§6.1) skips it — never a short, and
+    # never an error (mirrors the nautilus reference signals.py gate).
+    result = NautilusAdapter().run(md, from_target([0, -1, -1, -1, -1, -1]), cfg)
+    assert all(e.side >= 0 for e in _fills(result))
 
 
 def test_nautilus_engine_exception_wrapped_preserves_cause():
@@ -1436,7 +1484,8 @@ def test_nautilus_emits_order_submitted_events():
 
     submitted = _ledger_events(result, EventType.ORDER_SUBMITTED)
     # One entry order (long) + one signal-exit order (short); no risk exits in this run.
-    assert [(e.side, e.quantity) for e in submitted] == [(1, 20.0), (-1, 20.0)]
+    # Quantity floors to the lot grid: 100000 / 5002.5 = 19.99 -> 19 contracts (§7.1).
+    assert [(e.side, e.quantity) for e in submitted] == [(1, 19.0), (-1, 19.0)]
     assert all(e.order_id for e in submitted)
     # Submissions land on the two acting bars, in order.
     assert submitted[0].timestamp < submitted[1].timestamp

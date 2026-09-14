@@ -42,6 +42,12 @@ from ube.run import ensure_builtin_engines_registered, run
 # ``ube.core.signals``; there is no ``ube/signals.py`` shim to import).
 sys.modules["ube.signals"] = signals
 
+# Paper trading (§9): ``ube.paper.init / step / run_auto``. The package only imports
+# ``core`` (never the nautilus backend) so importing ``ube`` never requires nautilus.
+from ube import papertrading as paper  # noqa: E402
+
+sys.modules["ube.paper"] = paper
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -68,6 +74,7 @@ __all__ = [
     "from_callable",
     "from_target",
     "get_engine",
+    "paper",
     "register_engine",
     "registered_engines",
     "resolve_engine_name",

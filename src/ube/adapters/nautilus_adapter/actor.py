@@ -81,7 +81,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders.base import Order
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
-from ube.core.cost import CostModel
+from ube.core.cost import CostModel, slipped_price
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, EngineError
 from ube.core.instrument import allows_short
@@ -229,6 +229,9 @@ class UbeActor(Strategy):  # type: ignore[misc]
         self._instrument = self.cache.instrument(self.instrument_id)
         if self._instrument is None:
             raise EngineError(f"instrument {self.instrument_id} is not registered")
+        from ube.adapters.nautilus_adapter.overrides import apply_synthetic_rates
+
+        apply_synthetic_rates(self.cache)
         self.subscribe_bars(self.config.bar_type)
 
     def on_bar(self, bar: Bar) -> None:
@@ -501,7 +504,12 @@ class UbeActor(Strategy):  # type: ignore[misc]
             self.signal_evaluated[idx] = action
 
     def _open(self, side: int, bar: Bar, idx: int) -> None:
-        price = float(bar.close)
+        model = self._cost_model
+        slip = model.slippage if model is not None else 0.0
+        # Sizing and stop/target anchoring use the *slipped* entry reference price —
+        # the fill the venue actually books (§8). The fold applies the same adjustment
+        # to the fill report's last_px, so the resulting fill price equals ``price``.
+        price = float(slipped_price(float(bar.close), side, slip))
         qty = self._entry_quantity(price, idx)
         if qty is None:
             self.log.error(
@@ -570,10 +578,12 @@ class UbeActor(Strategy):  # type: ignore[misc]
         # no reserved fees to protect — fee-less runs keep the legacy conversion.
         step = float(self._instrument.size_increment)
         fee_rate = _entry_fee_rate(self._cost_model)
-        fee_aware = self._sizing.kind in ("all_in", "equal_weight") and fee_rate > 0.0
+        # Always floor to lot step — matches paper trader (strategy.py:789) and
+        # prevents up-rounding 22.745→23 for XAUUSD fixed_fraction. Fee-aware
+        # guard is a subset; all sizers must respect lot grid.
         tradable = (
             float(floor_to_step(raw, step))
-            if fee_aware and math.isfinite(step) and step > 0.0
+            if math.isfinite(step) and step > 0.0
             else raw
         )
         try:

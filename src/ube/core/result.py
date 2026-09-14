@@ -95,7 +95,7 @@ class BacktestResult:
             spec'd per-trade columns joined with the equity curve (``position_size_pct``,
             ``trade_return_pct``, ``realized_pnl``/``realized_pnl_pct``,
             ``cum_return_pct``, ``balance``, fee splits, ``reason``; the ``_pct`` columns
-            are fractions — ``0.05`` = 5%). A convenience / reporting view — not a
+            are percentages — ``5.0`` = 5%). A convenience / reporting view — not a
             canonical source of truth (see :func:`~ube.core.ledger.trade_table`).
         positions: The combined position-over-time series when the ledger is
             single-instrument, else ``None`` (see the module docstring).
@@ -173,12 +173,34 @@ class BacktestResult:
         base_currency = _resolve_base_currency(config, instruments)
 
         trades_view = trades(ledger, instruments=instruments)
+        # position_size display: show the configured allocation fraction directly
+        # (fixed_fraction value*100 -> e.g. 0.10 -> 10), sizing unchanged; other kinds
+        # fall back to the derived notional/(equity*leverage)*100.
+        _sizing = None
+        try:
+            _sizing = getattr(getattr(config, "risk", None), "sizing", None)
+        except Exception:
+            _sizing = None
+        _lev = 1.0
+        _psz: float | None = None
+        if _sizing is not None:
+            try:
+                _lev = float(getattr(_sizing, "leverage", 1.0) or 1.0) or 1.0
+            except Exception:
+                _lev = 1.0
+            if (
+                getattr(_sizing, "kind", None) == "fixed_fraction"
+                and getattr(_sizing, "value", None) is not None
+            ):
+                _psz = float(_sizing.value)
         trade_table_view = trade_table(
             ledger,
             market_data,
             instruments,
             base_currency=base_currency,
             fx_rates=fx_rates,
+            leverage=_lev,
+            position_size=_psz,
         )
         pc_ids = {e.instrument_id for e in ledger if e.event_type is EventType.POSITION_CHANGE}
         positions_view = positions(ledger) if len(pc_ids) <= 1 else None

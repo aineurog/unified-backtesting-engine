@@ -53,7 +53,12 @@ def test_signals_submodule_is_exposed():
 
 
 def test_paper_is_not_stubbed():
-    # §9 (paper trading) is a separate, larger piece of work and must NOT be stubbed as an
-    # empty namespace. Absence is the correct state until real work backs it (per the punch
-    # list scope).
-    assert not hasattr(ube, "paper")
+    # §9 (paper trading) is implemented under ``ube.paper`` and must NOT be a stub. It must
+    # expose the real engine-agnostic front-end (init/step/run_auto) and a registered
+    # nautilus backend, never an empty namespace.
+    assert hasattr(ube, "paper")
+    for name in ("init", "step", "run_auto"):
+        assert callable(getattr(ube.paper, name))
+    from ube.papertrading.core import get_paper_engine
+
+    assert get_paper_engine("nautilus") is not None

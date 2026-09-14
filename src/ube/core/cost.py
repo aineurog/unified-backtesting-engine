@@ -8,16 +8,20 @@ borrow / hard-to-borrow fees — to "filled in per asset class as adapters are b
 - A frozen :class:`CostModel` carrying the four cost dimensions the spec names
   (commission/fee, slippage, funding/swap, borrow), each a single explicit rate that
   defaults to ``0.0`` so the default is zero-cost (§7.1).
-- Pure, vectorizable cost functions — :func:`fill_cost` for a single fill and
+- Pure, vectorizable cost functions — :func:`fill_cost` for a single fill,
+  :func:`slipped_price` for the price-level slippage adjustment of a fill, and
   :func:`carrying_cost` for the per-bar carrying cost — that the ledger (item 07)
-  calls. They are deterministic functions of notional/side/bar-span with no state.
+  and the engines call. They are deterministic functions of notional/side/bar-span
+  with no state.
 - :func:`resolve_cost_model`, mapping an :class:`~ube.core.instrument.Instrument` to a
   default ``CostModel``: zero-cost everywhere, except ``crypto_perp`` which gets a
   documented "reasonable" funding + fee default (§4.5). Every other asset class
   resolves to zero-cost until §24 lands (see the note in :func:`resolve_cost_model`).
 
-Rates are expressed as fractions of notional: ``commission`` and ``slippage`` are
-charged per fill; ``funding`` and ``borrow`` are charged per funding period — the
+Rates are expressed as fractions: ``commission`` is a fraction of notional charged per
+fill; ``slippage`` is a fraction of the fill price applied as an adverse price-level
+adjustment (a BUY fill rounds the price up, a SELL fill rounds it down — see
+:func:`slipped_price`); ``funding`` and ``borrow`` are charged per funding period — the
 wall-clock cadence declared on the :class:`~ube.core.instrument.Instrument`
 (``funding_interval_hours``, §4.5, §24). ``funding_payments`` accrues them by elapsed
 time, so the per-period number is the *single* meaning of ``funding``/``borrow`` across
@@ -42,6 +46,7 @@ __all__ = [
     "ZERO_COST",
     "resolve_cost_model",
     "fill_cost",
+    "slipped_price",
     "carrying_cost",
 ]
 
@@ -70,14 +75,19 @@ class CostModel:
     Every field defaults to ``0.0``, so a bare ``CostModel()`` is the zero-cost model
     of §7.1. Rates are fractions of notional:
 
-    - ``commission`` / ``slippage`` — charged per fill (see :func:`fill_cost`).
+    - ``commission`` — charged per fill, as a fraction of notional (see
+      :func:`fill_cost`).
+    - ``slippage`` — an adverse price-level adjustment applied to every fill (see
+      :func:`slipped_price`).
     - ``funding`` / ``borrow`` — charged **per funding period** (see ``funding_payments``
       and ``carrying_cost``); ``borrow`` applies to the short side only. The period is the
       instrument's ``funding_interval_hours`` schedule (§4.5, §24).
 
     Attributes:
         commission: Per-fill commission/fee rate, as a fraction of notional.
-        slippage: Per-fill slippage rate, as a fraction of notional.
+        slippage: Per-fill adverse price slippage, as a fraction of the fill price. A
+            BUY fill books at ``price * (1 + slippage)``, a SELL fill at
+            ``price * (1 - slippage)`` (:func:`slipped_price`); ``0.0`` disables it.
         funding: Per-funding-period funding/swap rate (perps, forex), as a fraction of
             notional.
         borrow: Per-funding-period short-side borrow / hard-to-borrow fee rate
@@ -129,14 +139,31 @@ def resolve_cost_model(instrument: Instrument | None = None) -> CostModel:
 
 
 def fill_cost(model: CostModel, *, notional: ArrayLike) -> np.ndarray:
-    """Commission + slippage cost of a fill, as a fraction of the fill notional.
+    """Commission cost of a fill, as a fraction of the fill notional.
 
     ``notional`` is the non-negative gross value of the fill (``price * size``); it may
-    be a scalar or an array. The result is ``(commission + slippage) * notional`` —
-    symmetric in side, so direction is not needed. Pure and vectorized.
+    be a scalar or an array. The result is ``commission * notional`` — symmetric in
+    side, so direction is not needed. Pure and vectorized.
+
+    Slippage is deliberately *not* part of the fee: it is a price-level adjustment
+    applied to the fill price itself (see :func:`slipped_price`), so the fill notional
+    already reflects it and the commission is charged on the slipped price.
     """
     n = np.asarray(notional, dtype=np.float64)
-    return (model.commission + model.slippage) * n
+    return model.commission * n
+
+
+def slipped_price(price: ArrayLike, side: ArrayLike, slippage: float) -> np.ndarray:
+    """Adverse price-level slippage applied to a fill price.
+
+    ``side`` is the fill direction (``+1`` BUY, ``-1`` SELL); ``slippage`` is the
+    :attr:`CostModel.slippage` fraction. The result is ``price * (1 + side * slippage)``
+    — a BUY pays ``slippage`` more, a SELL receives ``slippage`` less. ``slippage == 0``
+    is the identity. Pure and vectorized (price and side may be arrays).
+    """
+    p = np.asarray(price, dtype=np.float64)
+    s = np.asarray(side, dtype=np.float64)
+    return p * (1.0 + s * slippage)
 
 
 def carrying_cost(

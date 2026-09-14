@@ -11,6 +11,7 @@ from ube.core.cost import (
     carrying_cost,
     fill_cost,
     resolve_cost_model,
+    slipped_price,
 )
 from ube.core.errors import ConfigError, InvalidInstrumentError
 from ube.core.instrument import Instrument
@@ -99,13 +100,15 @@ def test_resolve_non_instrument_raises():
 
 
 # ---------------------------------------------------------------------------
-# fill_cost — pure, vectorized function of notional (§7.2).
+# fill_cost — pure, vectorized function of notional (§7.2). Commission only:
+# slippage is a price-level adjustment (see slipped_price), never a fee.
 # ---------------------------------------------------------------------------
 
 
 def test_fill_cost_is_proportional_to_notional():
     model = CostModel(commission=0.001, slippage=0.002)
-    assert fill_cost(model, notional=1000.0) == pytest.approx(0.003 * 1000.0)
+    # Slippage is NOT part of the fee — only the commission rate scales with notional.
+    assert fill_cost(model, notional=1000.0) == pytest.approx(0.001 * 1000.0)
 
 
 def test_fill_cost_is_vectorized():
@@ -120,6 +123,31 @@ def test_fill_cost_does_not_mutate_input():
     original = notional.copy()
     fill_cost(model, notional=notional)
     np.testing.assert_array_equal(notional, original)
+
+
+# ---------------------------------------------------------------------------
+# slipped_price — price-level adverse slippage (§8), pure and vectorized.
+# ---------------------------------------------------------------------------
+
+
+def test_slipped_price_buy_rounds_up_sell_rounds_down():
+    slip = 0.0002
+    assert float(slipped_price(100.0, 1, slip)) == pytest.approx(100.0 * 1.0002)
+    assert float(slipped_price(100.0, -1, slip)) == pytest.approx(100.0 * (1.0 - 0.0002))
+
+
+def test_slipped_price_identity_at_zero_slippage():
+    price = np.array([1.0, 2.0])
+    side = np.array([1.0, -1.0])
+    np.testing.assert_array_equal(slipped_price(price, side, 0.0), price)
+
+
+def test_slipped_price_is_vectorized():
+    prices = np.array([100.0, 200.0])
+    sides = np.array([1.0, -1.0])
+    np.testing.assert_allclose(
+        slipped_price(prices, sides, 0.001), prices * (1.0 + sides * 0.001)
+    )
 
 
 # ---------------------------------------------------------------------------

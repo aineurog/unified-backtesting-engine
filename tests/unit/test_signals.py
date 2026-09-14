@@ -213,28 +213,20 @@ def test_invalid_signal_error_is_a_config_error():
 
 
 # ---------------------------------------------------------------------------
-# Long-only asset classes (§4.5, §6.1) — a short signal on spot is rejected.
+# Long-only asset classes (§4.5, §6.1) — the shorting gate lives at the strategy
+# level (``decide_action``/actor), so ``validate_long_only`` no longer rejects
+# short signals; it passes them through for exit-or-skip handling.
 # ---------------------------------------------------------------------------
 
 
-def test_validate_long_only_rejects_short_entry():
+def test_validate_long_only_does_not_reject_short_entry():
     sig = _signals(short_entry=np.array([False, True, False]))
-    with pytest.raises(InvalidSignalError) as excinfo:
-        validate_long_only(sig, "crypto_spot")
-    message = str(excinfo.value)
-    assert "long-only" in message
-    assert "short_entry" in message
-    assert "bar 1" in message
+    validate_long_only(sig, "crypto_spot")  # no raise — gate is at strategy level
 
 
-def test_validate_long_only_rejects_short_exit():
+def test_validate_long_only_does_not_reject_short_exit():
     sig = _signals(short_exit=np.array([False, False, True]))
-    with pytest.raises(InvalidSignalError) as excinfo:
-        validate_long_only(sig, "crypto_spot")
-    message = str(excinfo.value)
-    assert "long-only" in message
-    assert "short_exit" in message
-    assert "bar 2" in message
+    validate_long_only(sig, "crypto_spot")  # no raise — gate is at strategy level
 
 
 def test_validate_long_only_allows_short_on_margin_classes():

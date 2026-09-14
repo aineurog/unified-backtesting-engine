@@ -1330,6 +1330,8 @@ def _closed_row(
     base_currency: str,
     fx_rates: Mapping[str, FXSeries],
     start: float,
+    leverage: float = 1.0,
+    position_size: float | None = None,
 ) -> dict[str, object]:
     sc = settlement_of(trade.instrument_id)
     entry_equity = equity_at(trade.entry_timestamp)
@@ -1351,18 +1353,24 @@ def _closed_row(
         "status": "closed",
         "quantity": trade.quantity,
         "entry_notional": trade.entry_notional,
-        "position_size_pct": entry_notional_base / entry_equity if entry_equity else 0.0,
-        "trade_return_pct": trade.net_pnl / trade.entry_notional
+        "position_size_pct": (
+            float(position_size) * 100.0
+            if position_size is not None
+            else (entry_notional_base / (entry_equity * leverage) * 100.0)
+            if entry_equity and leverage
+            else 0.0
+        ),
+        "trade_return_pct": (trade.net_pnl / trade.entry_notional * 100.0)
         if trade.entry_notional
         else 0.0,
         "realized_pnl": net_pnl_base,
-        "realized_pnl_pct": net_pnl_base / entry_equity if entry_equity else 0.0,
-        "cum_return_pct": exit_equity / start - 1.0 if start else 0.0,
+        "realized_pnl_pct": (net_pnl_base / entry_equity * 100.0) if entry_equity else 0.0,
+        "cum_return_pct": (exit_equity / start - 1.0) * 100.0 if start else 0.0,
         "balance": exit_equity,
-        "entry_fee_pct": trade.entry_fee / trade.entry_notional
+        "entry_fee_pct": (trade.entry_fee / trade.entry_notional * 100.0)
         if trade.entry_notional
         else 0.0,
-        "exit_fee_pct": trade.exit_fee / trade.exit_notional
+        "exit_fee_pct": (trade.exit_fee / trade.exit_notional * 100.0)
         if trade.exit_notional
         else 0.0,
         "reason": trade.exit_reason,
@@ -1378,6 +1386,8 @@ def _open_row(
     base_currency: str,
     fx_rates: Mapping[str, FXSeries],
     start: float,
+    leverage: float = 1.0,
+    position_size: float | None = None,
 ) -> dict[str, object]:
     iid = mt.instrument_id
     md = market_data.get(iid)
@@ -1414,17 +1424,21 @@ def _open_row(
         "status": "open",
         "quantity": remaining_units,
         "entry_notional": remaining_notional,
-        "position_size_pct": remaining_notional * entry_fx / entry_equity
-        if entry_equity
-        else 0.0,
-        "trade_return_pct": unrealized / remaining_notional
+        "position_size_pct": (
+            float(position_size) * 100.0
+            if position_size is not None
+            else (remaining_notional * entry_fx / (entry_equity * leverage) * 100.0)
+            if entry_equity and leverage
+            else 0.0
+        ),
+        "trade_return_pct": (unrealized / remaining_notional * 100.0)
         if remaining_notional
         else 0.0,
         "realized_pnl": 0.0,
         "realized_pnl_pct": 0.0,
-        "cum_return_pct": last_equity / start - 1.0 if start else 0.0,
+        "cum_return_pct": (last_equity / start - 1.0) * 100.0 if start else 0.0,
         "balance": last_equity,
-        "entry_fee_pct": mt.commission / remaining_notional
+        "entry_fee_pct": (mt.commission / remaining_notional * 100.0)
         if remaining_notional
         else 0.0,
         "exit_fee_pct": 0.0,
@@ -1440,6 +1454,8 @@ def trade_table(
     base_currency: str,
     fx_rates: Mapping[str, FXSeries] | None = None,
     initial_capital: float | None = None,
+    leverage: float = 1.0,
+    position_size: float | None = None,
 ) -> pd.DataFrame:
     """One row per trade (closed *and* open), joined with the equity curve (§4.6).
 
@@ -1453,11 +1469,15 @@ def trade_table(
     carries the trade-level columns (entry/exit datetime+price, duration, side, status,
     quantity, notional, fee split, reason) plus account-level columns derived from the
     combined equity curve (``position_size_pct``, ``realized_pnl_pct``,
-    ``cum_return_pct``, ``balance``). The ``_pct`` columns are fractions (``0.05`` = 5%).
+    ``cum_return_pct``, ``balance``). The ``_pct`` columns are percentages (``5.0`` = 5%).
 
     Per-trade monetary values are in the instrument's settlement currency; account-level
     values are in ``base_currency`` (converted via ``fx_rates``). ``initial_capital``
-    defaults to the first point of the equity curve.
+    defaults to the first point of the equity curve. ``position_size`` is the
+    configured allocation fraction (``SizeModel.value`` for a ``fixed_fraction`` sizing
+    model — e.g. ``0.10`` for a 10% allocation): when supplied, ``position_size_pct``
+    is displayed as that fraction directly (``10.0`` = 10%) regardless of leverage;
+    otherwise it falls back to ``notional / (equity * leverage) * 100``.
 
     Args:
         ledger: The append-only event ledger.
@@ -1466,6 +1486,10 @@ def trade_table(
         base_currency: The portfolio base currency (§4.7).
         fx_rates: Optional historical FX rates keyed by currency pair.
         initial_capital: Optional account baseline for ``cum_return_pct``.
+        leverage: The config leverage (exposure multiplier) used for the derived
+            ``position_size_pct`` fallback when ``position_size`` is not supplied.
+        position_size: The configured allocation fraction (``None`` = derive the
+            display from notional/equity/leverage).
 
     Returns:
         A ``DataFrame`` with one row per trade, columns in :data:`_TRADE_TABLE_COLUMNS`.
@@ -1491,7 +1515,16 @@ def trade_table(
     rows: list[dict[str, object]] = []
     for trade in closed:
         rows.append(
-            _closed_row(trade, equity_at, settlement_of, base_currency, fx, start)
+            _closed_row(
+                trade,
+                equity_at,
+                settlement_of,
+                base_currency,
+                fx,
+                start,
+                leverage,
+                position_size,
+            )
         )
     for mt in open_accumulators.values():
         if abs(mt.entry_units - mt.exit_units) <= _EPS:
@@ -1506,6 +1539,8 @@ def trade_table(
                 base_currency,
                 fx,
                 start,
+                leverage,
+                position_size,
             )
         )
 

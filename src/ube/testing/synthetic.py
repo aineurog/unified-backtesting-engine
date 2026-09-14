@@ -220,11 +220,14 @@ def synthetic_bars(
             candidate.tz_localize("UTC")
             if candidate.tz is None
             else candidate.tz_convert("UTC")
-        )
+        ).as_unit("ns")
         mask = cal.session_mask(candidate)
         index = candidate[mask][:n_bars]
 
-    return MarketData(open=open_, high=high, low=low, close=close, volume=volume, index=index)
+    return MarketData(
+        open=open_, high=high, low=low, close=close, volume=volume,
+        index=index.as_unit("ns"),
+    )
 
 
 def _resolve_preset(asset_class: str | AssetClassPreset) -> AssetClassPreset:
@@ -261,4 +264,5 @@ def _round_to_tick(values: np.ndarray, tick: float, mode: str = "nearest") -> np
 def _utc_index(start: str | pd.Timestamp, n_bars: int, freq: str) -> pd.DatetimeIndex:
     """Build a regular tz-aware UTC ``DatetimeIndex`` for the bars."""
     index = pd.date_range(start=start, periods=n_bars, freq=freq)
-    return index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+    utc = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+    return utc.as_unit("ns")

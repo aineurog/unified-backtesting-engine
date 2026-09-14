@@ -12,11 +12,17 @@ Translation summary (requirements §4.6):
   (native orders); the core trigger rule computes the levels, Nautilus performs the
   fill simulation (§8).
 * **Fees** — the core :class:`~ube.core.cost.CostModel` drives everything. Its
-  ``commission + slippage`` is folded into both the instrument's ``maker_fee`` and
+  ``commission`` is folded into both the instrument's ``maker_fee`` and
   ``taker_fee`` at construction (an explicit ``maker_fee`` / ``taker_fee`` engine
   override wins over the cost model). Nautilus then charges the fee per fill, and the
   fold books each fill's ``commission`` into the ledger as a ``commission`` event —
   the canonical trade/equity math applies it identically to the core cost functions.
+* **Slippage** — the ``slippage`` rate is an adverse *price-level* adjustment
+  (:func:`~ube.core.cost.slipped_price`), applied uniformly to every fill price in the
+  fold: a BUY books at ``price * (1 + slippage)``, a SELL at ``price * (1 - slippage)``,
+  whether the fill is an entry, a normal risk-exit, or an intra-bar stop/gap fill.
+  The actor sizes entries and anchors stop/target levels against the slipped entry
+  price, so the reported fill prices are the slipped ones (§8).
 * **Carry** — ``funding`` / ``borrow`` rates have no native Nautilus equivalent, so
   the adapter derives ``funding_payment`` events directly from the core
   :func:`~ube.core.ledger.funding_payments` generator, aligned per bar (§24).
@@ -49,7 +55,7 @@ Nautilus's bar-adaptive fill model legitimately differs from the core simulation
   *first*; no ``BacktestVenueConfig`` flag flips this (probe-verified on 1.221.0).
   §8 prescribes stop-first; the actor honours §8 precedence for close-time exits and
   documents this as a residual divergence for the parity report.
-* Fees: ``commission + slippage`` is folded into the instrument's ``maker_fee`` /
+* Fees: ``commission`` is folded into the instrument's ``maker_fee`` /
   ``taker_fee``, so Nautilus charges per fill; ``funding`` / ``borrow`` have no native
   equivalent and are re-derived from the core ``CostModel`` by
   :func:`~ube.core.ledger.funding_payments`. Rounding can differ from a purely
@@ -61,6 +67,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from decimal import Decimal
+from itertools import chain
 from typing import Any, cast
 
 import numpy as np
@@ -81,8 +88,8 @@ from ube.adapters.nautilus_adapter.overrides import (
     validate_overrides,
 )
 from ube.core.config import BacktestConfig
-from ube.core.cost import CostModel, resolve_cost_model
-from ube.core.data import MarketData
+from ube.core.cost import CostModel, fill_cost, resolve_cost_model, slipped_price
+from ube.core.data import MarketData, max_price_decimals
 from ube.core.errors import (
     ConfigError,
     DataShapeError,
@@ -90,7 +97,7 @@ from ube.core.errors import (
     InvalidSignalError,
 )
 from ube.core.instrument import resolve_funding_interval_hours
-from ube.core.ledger import EventLedger, EventType, LedgerEvent, funding_payments
+from ube.core.ledger import EventLedger, EventType, FXSeries, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
 from ube.core.signals import Signals, validate_long_only
 
@@ -108,6 +115,105 @@ _KIND_RANK: dict[EventType, int] = {
     EventType.POSITION_CHANGE: 3,
     EventType.FUNDING_PAYMENT: 4,
 }
+
+
+def _synthetic_fx_rates(
+    overrides: Mapping[str, Any], index: np.ndarray
+) -> dict[str, FXSeries]:
+    """Build explicit FX curves from the ``synthetic_rates`` family of engine
+    overrides (declared by the caller, no API calls).
+
+    Accepted shapes mirror the nautilus-cache synthetic rates: a ``{pair: rate}``
+    mapping (``"USDUSDT"``, ``"USD/USDT"`` or ``"USD_USDT"``) or a list of
+    ``{"pair": ..., "rate": ...}`` mappings, read from the first declared of
+    ``synthetic_rates`` / ``fixed_conversions`` / ``currency_fx`` / ``fx_rates``.
+    Each 6-letter pair also registers its inverse at ``1/rate`` unless the
+    inverse is explicitly declared. Malformed entries raise ``ConfigError`` —
+    rates are never guessed (§4.7). Returns ``{}`` when nothing is declared, in
+    which case downstream ``trade_table`` / ``equity_curve`` lookups behave
+    exactly as before (missing pairs still raise ``FXRateUnavailableError``).
+    """
+    raw = (
+        overrides.get("synthetic_rates")
+        or overrides.get("fixed_conversions")
+        or overrides.get("currency_fx")
+        or overrides.get("fx_rates")
+    )
+    if raw is None:
+        return {}
+    if isinstance(raw, Mapping):
+        items = list(raw.items())
+    elif isinstance(raw, (list, tuple)):
+        items = []
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                raise ConfigError(
+                    "engine override synthetic rates list entries must be "
+                    f"mappings, got {type(entry).__name__}"
+                )
+            pair = entry.get("pair") or entry.get("symbol")
+            rate = entry.get("rate", entry.get("value"))
+            items.append((pair, rate))
+    else:
+        raise ConfigError(
+            "engine override synthetic rates must be a {pair: rate} mapping or a "
+            f"list of {{pair, rate}} mappings, got {type(raw).__name__}"
+        )
+    pairs: dict[str, float] = {}
+
+    def _split(pair_str: Any) -> tuple[str, str]:
+        # "USD/USDT", "USD_USDT", "USD-USDT" -> ("USD", "USDT"). Bare
+        # concatenation needs length knowledge because USDT has 4 letters
+        # ("USDUSDT" is 7 chars, not 6).
+        text = str(pair_str or "").strip().upper()
+        parts = [p for p in re.split(r"[\s/_\-:]+", text) if p]
+        if len(parts) == 2:
+            c1, c2 = parts
+        elif len(parts) == 1 and text.isalpha():
+            if len(text) == 6:
+                c1, c2 = text[:3], text[3:]
+            elif len(text) == 7 and text.startswith("USDT"):
+                c1, c2 = text[:4], text[4:]
+            elif len(text) == 7 and text.endswith("USDT"):
+                c1, c2 = text[:-4], text[-4:]
+            else:
+                raise ConfigError(
+                    f"engine override synthetic rate pair {pair_str!r} must be "
+                    "two currency codes (e.g. 'USDUSDT' or 'USD/USDT')"
+                )
+        else:
+            raise ConfigError(
+                f"engine override synthetic rate pair {pair_str!r} must be "
+                "two currency codes (e.g. 'USDUSDT' or 'USD/USDT')"
+            )
+        if not (c1.isalpha() and c2.isalpha() and 3 <= len(c1) <= 4 and 3 <= len(c2) <= 4):
+            raise ConfigError(
+                f"engine override synthetic rate pair {pair_str!r} must be "
+                "two 3-4 letter currency codes"
+            )
+        return c1, c2
+
+    quoted: dict[str, tuple[str, str, float]] = {}
+    for pair_str, rate in items:
+        _bad_rate = (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not np.isfinite(rate)
+            or rate <= 0
+        )
+        if _bad_rate:
+            raise ConfigError(
+                f"engine override synthetic rate for {pair_str!r} must be a "
+                f"positive finite number, got {rate!r}"
+            )
+        c1, c2 = _split(pair_str)
+        quoted[c1 + c2] = (c1, c2, float(rate))
+    for key, (_c1, _c2, _r) in list(quoted.items()):
+        pairs[key] = _r
+        if _c2 + _c1 not in quoted:
+            pairs[_c2 + _c1] = 1.0 / _r
+    grid = np.asarray(index, dtype=np.int64)
+    return {key: FXSeries(index=grid, rate=np.full(len(grid), r)) for key, r in pairs.items()}
 
 
 class NautilusAdapter(EngineAdapter):
@@ -183,10 +289,12 @@ class NautilusAdapter(EngineAdapter):
             else resolve_cost_model(config.instrument)
         )
 
-        # Fold commission + slippage into the instrument fees (§5.3); an explicit
-        # maker_fee/taker_fee override wins over the resolved cost model.
+        # Fold commission only into the instrument fees (§5.3); an explicit
+        # maker_fee/taker_fee override wins over the resolved cost model. Slippage is a
+        # price-level adjustment (:func:`ube.core.cost.slipped_price`), applied to each
+        # fill price in the fold below — never a fee.
         fee_overrides = dict(overrides)
-        rate = cost_model.commission + cost_model.slippage
+        rate = cost_model.commission
         fee_overrides.setdefault("maker_fee", rate)
         fee_overrides.setdefault("taker_fee", rate)
 
@@ -206,6 +314,19 @@ class NautilusAdapter(EngineAdapter):
             fee_overrides["leverage"] = margin_leverage
 
         build = build_instrument(config.instrument, fee_overrides)
+        # Resolution-aware price precision: nautilus requires bar OHLC precision to equal
+        # the instrument's, so keep that precision, but never let a coarse config tick
+        # (e.g. 0.1) round away digits the data actually carries (BTC 2 dp, 0.00329 5 dp).
+        instrument_pp = int(build.instrument.price_precision)
+        data_pp = max_price_decimals(
+            chain(data.open, data.high, data.low, data.close),
+            base=instrument_pp,
+        )
+        if data_pp > instrument_pp:
+            fee_overrides = dict(fee_overrides)
+            fee_overrides["price_precision"] = data_pp
+            fee_overrides["price_increment"] = f"{10**-data_pp:.{data_pp}f}"
+            build = build_instrument(config.instrument, fee_overrides)
         # The ledger tags every event with the canonical symbol (§4.6), not the
         # venue-qualified Nautilus ``InstrumentId`` (``build.instrument_id`` is still
         # used below for the actor, which needs the venue to place native orders).
@@ -265,6 +386,17 @@ class NautilusAdapter(EngineAdapter):
                 [Money(Decimal(str(starting_balance)), currency)],
                 base_currency=currency,
             )
+            from ube.adapters.nautilus_adapter.overrides import apply_synthetic_rates
+
+            kernel = getattr(engine, "kernel", None)
+            cache = getattr(kernel, "cache", None)
+            if cache is not None:
+                apply_synthetic_rates(
+                    cache,
+                    overrides,
+                    settlement,
+                    config.base_currency,
+                )
             engine.add_instrument(build.instrument)
             engine.add_data(bars)
             engine.add_strategy(actor)
@@ -295,11 +427,35 @@ class NautilusAdapter(EngineAdapter):
         finally:
             engine.dispose()
 
+        # Declared synthetic rates (if any) become the explicit FXSeries that
+        # from_ledger/trade_table/equity_curve consume — the nautilus-cache
+        # mark rates registered above do NOT feed those lookups. Absent a
+        # declaration the dict is empty and missing pairs raise as before (§4.7).
+        _grid = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
+        fx_rates = _synthetic_fx_rates(overrides, _grid)
+        # Auto-seed a 1:1 USD/USDT rate when the instrument settles in USD
+        # but the account base currency is USDT (or vice-versa).  USDT is a
+        # USD-pegged stablecoin; assuming parity avoids FXRateUnavailableError
+        # without any live API call.  Only injected when the pair is absent from
+        # the already-declared overrides — explicit rates always win.
+        _sc = str(getattr(config.instrument, "settlement_currency", "") or "")
+        _bc = str(getattr(config, "base_currency", "") or "")
+        if _sc and _bc and _sc != _bc and {_sc.upper(), _bc.upper()} == {"USD", "USDT"}:
+            _fwd = (_sc + _bc).upper()
+            _inv = (_bc + _sc).upper()
+            if _fwd not in fx_rates:
+                _ones = np.ones(len(_grid))
+                fx_rates = dict(fx_rates)  # make mutable copy if needed
+                fx_rates[_fwd] = FXSeries(index=_grid, rate=_ones)
+            if _inv not in fx_rates:
+                fx_rates = dict(fx_rates)
+                fx_rates[_inv] = FXSeries(index=_grid, rate=np.ones(len(_grid)))
         return BacktestResult.from_ledger(
             ledger,
             config,
             market_data={instrument_id: data},
             instruments={instrument_id: config.instrument},
+            fx_rates=fx_rates,
         )
 
     # ------------------------------------------------------------------
@@ -378,13 +534,21 @@ class NautilusAdapter(EngineAdapter):
 
         # Fills -> fill + cash-leg + commission events; position_change reconstructed
         # from the running net position so scale-out partials move the ledger position.
-        fills = engine.trader.generate_fills_report()
+        # Nautilus's fills report is NOT guaranteed chronological (row order follows its
+        # internal index, not ts_event): an intra-bar stop/target fill can be reported
+        # before the entry fill of the same trade. The running-net bookkeeping below
+        # requires chronological order, or signed position_after values land on the wrong
+        # timestamps and corrupt the equity curve's marks (§4.6).
+        fill_rows = _fills_chronological(engine.trader.generate_fills_report())
         net: float = 0.0
-        for client_order_id, row in fills.iterrows():
+        for client_order_id, row in fill_rows:
             ts = _fill_timestamp_ns(row)
             side = 1 if row["order_side"] == "BUY" else -1
             quantity = float(row["last_qty"])
-            price = float(row["last_px"])
+            # Slippage is a price-level adjustment, applied to *every* fill: entries,
+            # signal/close-exit market fills, and intra-bar stop/target/gap fills alike.
+            # A BUY books at price*(1+slip), a SELL at price*(1-slip) (§8).
+            price = float(slipped_price(float(row["last_px"]), side, cost_model.slippage))
             notional = quantity * price * multiplier
             # Cash leg of the fill (§4.6): a buy pays the notional out of the account, a
             # sell pays it back in. Together with the starting-balance cash_movement and
@@ -414,20 +578,23 @@ class NautilusAdapter(EngineAdapter):
                 ),
                 ts,
             )
-            commission = str(row["commission"])
-            if commission:
-                amount, currency = _parse_money(commission, settlement)
-                if amount != 0.0:
-                    _add(
-                        LedgerEvent(
-                            EventType.COMMISSION,
-                            ts,
-                            instrument_id,
-                            amount=amount,
-                            currency=currency,
-                        ),
+            # Commission at full precision via the core cost model (single source of
+            # truth, same as the paper bridge's fill_cost). Reading nautilus's fill
+            # report instead would hand the ledger a cents-rounded money amount (e.g.
+            # 0.76 vs 0.76021958), quietly shrinking every reported fee_pct by up to
+            # a cent's fraction and desyncing backtest vs paper fee columns.
+            amount = float(fill_cost(cost_model, notional=notional))
+            if amount != 0.0:
+                _add(
+                    LedgerEvent(
+                        EventType.COMMISSION,
                         ts,
-                    )
+                        instrument_id,
+                        amount=amount,
+                        currency=settlement,
+                    ),
+                    ts,
+                )
             net += side * quantity
             _add(
                 LedgerEvent(
@@ -509,25 +676,23 @@ def _fill_timestamp_ns(row: Any) -> int:
     return int(value) if value is not None else int(ts)
 
 
-#: A ``Money`` string (``"1000.20 USD"``) — amount plus an optional currency code.
-_MONEY_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*([A-Za-z]{3,})?\s*$")
+def _fills_chronological(fills: Any) -> list[tuple[object, Any]]:
+    """Order a fills-report frame's rows by fill timestamp (stable).
 
-
-def _parse_money(text: str, default_currency: str = "USD") -> tuple[float, str]:
-    """Parse a Nautilus ``Money`` string (``"1000.20 USD"``) into ``(amount, currency)``.
-
-    The currency suffix is optional; a missing or empty suffix falls back to
-    ``default_currency`` (the account settlement currency). Parsing is tolerant of
-    surrounding whitespace and raises rather than guessing when the layout is
-    unrecognised (fail-fast, §15).
+    Nautilus's fills-report rows follow its internal index rather than the
+    chronological ``ts_event`` order. The fold accumulates running signed net
+    positions from these rows and emits each ``position_change`` at its fill's
+    timestamp, so a non-chronological report misattributes ``position_after`` to the
+    wrong timestamps — an intra-bar stop fill can precede its own entry fill and
+    leave a phantom opposite-sign position on the equity-curve grid, corrupting the
+    marks (§4.6). A stable sort by ``ts_event`` makes the sequence chronological
+    while preserving the report's relative order for same-timestamp rows (split
+    fills), so the final running net stays identical.
     """
-    s = str(text).strip()
-    if not s:
-        return 0.0, default_currency
-    match = _MONEY_RE.match(s)
-    if match is None:
-        raise EngineError(f"cannot parse commission as Money: {text!r}")
-    return float(match.group(1)), match.group(2) or default_currency
+    return sorted(fills.iterrows(), key=lambda item: _fill_timestamp_ns(item[1]))
+
+
+
 
 
 def _step_timestamps(

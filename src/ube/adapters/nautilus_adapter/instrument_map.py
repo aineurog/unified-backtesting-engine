@@ -124,10 +124,16 @@ def _base_quote(canonical: Instrument) -> tuple[str, str]:
     symbol = canonical.symbol
     if "-" in symbol:
         base, quote = symbol.split("-", 1)
-        return base, quote
+        # Only treat the dash-suffix as the quote currency when it is an alphabetic
+        # ISO-ish code (``BTC-USDT``). MT5 appends GMT-offset/exchange suffixes
+        # (``AAPL.NAS-24``); those are part of the symbol, not the quote currency —
+        # treating them as a currency silently creates a synthetic quote that cannot
+        # convert to the account's USD base (fill/capital failures).
+        if quote and quote.isalpha() and len(quote) in (3, 4):
+            return base, quote
     quote = canonical.settlement_currency or "USD"
     if canonical.asset_class == "forex" and symbol.endswith(quote) and len(symbol) > len(quote):
-        return symbol[: -len(quote)], quote
+        return symbol[:-len(quote)], quote
     return quote, quote
 
 
@@ -137,7 +143,11 @@ def _precision(canonical: Instrument, overrides: Mapping[str, Any]) -> tuple[int
     Nautilus requires ``price_precision == price_increment.precision``, so when the
     ``price_precision`` override differs from the tick-derived default the increment
     string is re-formatted to that precision (e.g. tick ``0.25`` with precision 3 ->
-    ``"0.250"``).
+    ``"0.250"``). An explicit ``price_increment`` override wins over the tick-based
+    value (used when data resolution is raised above the config tick, e.g. BTC prices
+    with 2 dp on a 0.1 config tick — the venue must step its synthesized tick prices
+    at the data's granularity, otherwise small-priced fills come out offset by a full
+    coarse tick).
     """
     tick = canonical.tick_size
     if tick is not None:
@@ -146,7 +156,9 @@ def _precision(canonical: Instrument, overrides: Mapping[str, Any]) -> tuple[int
         tick = float(_DEFAULT_TICK_SIZE[canonical.asset_class])
         default_precision = _DEFAULT_PRICE_PRECISION[canonical.asset_class]
     precision = int(overrides.get("price_precision", default_precision))
-    increment = f"{tick:.{precision}f}"
+    increment = overrides.get("price_increment")
+    if increment is None:
+        increment = f"{tick:.{precision}f}"
     return precision, increment
 
 
