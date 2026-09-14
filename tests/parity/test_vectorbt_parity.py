@@ -52,17 +52,17 @@ _VBT_LOCKED = {
     "futures": {
         "final_equity": 91725.0,
         "n_trades": 1,
-        "trades_hash": "0aafa08e8f5d63608c746fb3094cba41584185cfec687c08aafbb956e9dc3810",
+        "trades_hash": "fc07e566d09e914ac5ad112b176c2f78b500bf52441862683d542f4d1d67e1df",
     },
     "crypto_perp": {
-        "final_equity": 91264.14779999998,
+        "final_equity": 91259.98991624996,
         "n_trades": 1,
-        "trades_hash": "45caee561c90ed184d93af48471c460c92a9c95f59bd03a41bf5d9949db856dc",
+        "trades_hash": "9764fdc44f5d0b75202df1cac55c942a1b1e404efe66b4eee6748bd1cc1aeed5",
     },
     "commodities": {
         "final_equity": 92040.0,
         "n_trades": 1,
-        "trades_hash": "a721e03098ac1ca54130770da78a6985df21f69d572625b973feb9b7ace0e3e1",
+        "trades_hash": "5f0e33614636ef722879bba478818843351462499eb57cc7a6979d864100df12",
     },
     "forex": {
         "final_equity": 99999.981,
@@ -72,7 +72,7 @@ _VBT_LOCKED = {
     "stocks": {
         "final_equity": 99987.29999999999,
         "n_trades": 1,
-        "trades_hash": "bfe442a97c74c838d6cf4ce45b4bd9018600261e79a9cc2c6229dd5d91f9156c",
+        "trades_hash": "c9fe5bdb52e8da35ce7c9818fb757b3b889aa222e047c4df258111b9e99b284e",
     },
 }
 

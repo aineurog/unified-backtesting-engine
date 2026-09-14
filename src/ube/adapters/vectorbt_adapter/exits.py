@@ -1,10 +1,12 @@
 """Exit translation for the vectorbt engine (§5.2, §4.2).
 
-vectorbt exits on its own stop primitives (``sl_stop`` / ``tp_stop`` / ``sl_trail``), so this
-module translates the canonical exit configs into per-bar stop *fractions* and labels each
-closed trade with the core ``exit_triggered`` semantics so a trade is stamped identically to
-the Nautilus engine (requirements §4.6, §8). The ATR-based exits resolve their named
-``aux_data`` series here, including the no-look-ahead forward-fill described in §5.2.
+vectorbt exits on its own stop primitives (``sl_stop`` / ``tp_stop`` / ``sl_trail``) plus
+the signal exit masks, so this module translates the canonical exit configs into per-bar
+stop *fractions*, folds a holding-period ``TimeExit`` into the vectorbt exit masks (vectorbt
+has no native time exit), and labels each closed trade with the core ``exit_triggered``
+semantics so a trade is stamped identically to the Nautilus engine (requirements §4.6, §8).
+The ATR-based exits resolve their named ``aux_data`` series here, including the
+no-look-ahead forward-fill described in §5.2.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ube.adapters.vectorbt_adapter.adapt_data import VbtSignalInputs
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError
 from ube.core.risk.exits import (
@@ -33,34 +36,89 @@ __all__ = [
     "validate_aux",
     "atr_from_aux",
     "atr_series_for_exit",
+    "resolve_vol_for_sizing",
+    "apply_time_exits",
     "exit_stop_params",
     "classify_exit_reason",
 ]
 
 
-def validate_aux(exits: tuple[Any, ...], aux_data: Mapping[str, Any] | None) -> None:
-    """Fail fast if an ATR-based exit names an ``aux_data`` series that is absent (§5.2)."""
-    required: set[str] = set()
+def validate_aux(
+    exits: tuple[Any, ...],
+    aux_data: Mapping[str, Any] | None,
+    *,
+    sizing: Any | None = None,
+    data: MarketData | None = None,
+) -> None:
+    """Fail fast if an ATR exit or ``volatility_target`` sizing has no usable series (§5.2, §6.3).
+
+    Mirrors the Nautilus actor ``_validate_aux``: an ATR-based exit (``ATRStop`` /
+    ``ChandelierExit``) must name a specific ``aux_data`` series via its ``atr`` key —
+    the library never computes ATR from the signal ``data`` bars — and ``volatility_target``
+    sizing must name one via ``SizeModel.vol``. Enforces that every named series is present.
+    When ``data`` is supplied, a named ``MarketData`` aux series must also span the main
+    period (start at or before it and reach within one aux bar of its end), so leading and
+    trailing main bars always have a value.
+    """
+    named: set[str] = set()
     for e in exits:
         if isinstance(e, (ATRStop, ChandelierExit)):
             atr_name = getattr(e, "atr", None)
-            if atr_name is not None:
-                required.add(str(atr_name))
-    if not required:
+            if atr_name is None:
+                raise ConfigError(
+                    f"{type(e).__name__} requires an 'atr' key referencing an "
+                    "aux_data series (§5.2); ATR is never computed from the signal "
+                    "data bars"
+                )
+            named.add(str(atr_name))
+    if sizing is not None and getattr(sizing, "kind", None) == "volatility_target":
+        vol_name = getattr(sizing, "vol", None)
+        if not vol_name:
+            raise ConfigError(
+                "volatility_target sizing requires a 'vol' key referencing an "
+                "aux_data series (§6.3); volatility is never computed from the "
+                "signal data bars"
+            )
+        named.add(str(vol_name))
+
+    if not named:
         return
     if aux_data is None:
         raise ConfigError(
-            "exits reference ATR series(es) "
-            f"{sorted(required)} but aux_data was not supplied; "
+            "exits/sizing reference aux_data series(es) "
+            f"{sorted(named)} but aux_data was not supplied; "
             "ATR-based stops/chandelier require aux_data"
         )
-    missing = required - set(aux_data)
+    missing = named - set(aux_data)
     if missing:
         raise ConfigError(
-            "exits reference ATR series(es) "
+            "exits/sizing reference aux_data series(es) "
             f"{sorted(missing)} that are absent from aux_data; "
             "ATR-based stops/chandelier require the named aux_data series"
         )
+
+    if data is not None:
+        main_ts = data.timestamps
+        main_start, main_end = main_ts[0], main_ts[-1]
+        main_step = main_ts[1] - main_ts[0] if len(main_ts) > 1 else pd.Timedelta(0)
+        for name in sorted(named):
+            value = aux_data[name]
+            if not isinstance(value, MarketData):
+                continue  # precomputed arrays are length-checked at resolution
+            aux_ts = value.timestamps
+            if aux_ts[0] > main_start + main_step:
+                raise DataShapeError(
+                    f"aux_data[{name!r}] starts at {aux_ts[0]} which is after the data "
+                    f"start {main_start}; the leading main bars would have no value "
+                    "(aux_data must start at or before the signal/price period)"
+                )
+            aux_step = aux_ts[1] - aux_ts[0] if len(aux_ts) > 1 else main_step
+            if aux_ts[-1] < main_end - aux_step:
+                raise DataShapeError(
+                    f"aux_data[{name!r}] ends at {aux_ts[-1]} which is more than one aux "
+                    f"bar before the data end {main_end}; aux_data must span the "
+                    "signal/price period (the trailing value would be stale)"
+                )
 
 
 def atr_from_aux(data: MarketData, aux_md: MarketData, period: int) -> np.ndarray:
@@ -104,6 +162,88 @@ def atr_series_for_exit(
             f"got shape {series.shape}"
         )
     return series
+
+
+def resolve_vol_for_sizing(
+    sizing: Any, aux_data: Mapping[str, Any] | None, data: MarketData
+) -> np.ndarray:
+    """Resolve the ``volatility_target`` per-bar vol estimate from ``aux_data`` (§6.3).
+
+    Mirrors the Nautilus actor ``_vol_from_aux``: a ``MarketData`` value (a raw OHLCV
+    series, typically coarser than the signal bars) is turned into ``ATR/price`` on the aux
+    grid, shifted forward one aux bar so a main bar inside hour ``h`` only ever sees the
+    volatility of the *last completed* aux bar (no look-ahead), then forward-filled onto the
+    main bar grid. A precomputed array is used verbatim. Length and positivity are enforced
+    here (fail fast); the name is validated up front in :func:`validate_aux`.
+    """
+    aux = aux_data if aux_data is not None else {}
+    name = str(getattr(sizing, "vol", None))
+    if name not in aux:
+        raise ConfigError(f"sizing references aux_data[{name!r}] which was not supplied")
+    value = aux[name]
+    if isinstance(value, MarketData):
+        vol_aux = atr(value) / value.close
+        series = pd.Series(vol_aux, index=value.timestamps)
+        series = series.shift(1).fillna(series.iloc[0])
+        aligned = series.reindex(data.timestamps, method="ffill")
+        arr = aligned.to_numpy(dtype=np.float64)
+    else:
+        arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim != 1 or arr.shape[0] != data.n_bars:
+        raise DataShapeError(
+            f"aux_data[{name!r}] has {arr.shape[0]} bars but data has {data.n_bars}"
+        )
+    if not np.isfinite(arr).all() or (arr <= 0).any():
+        raise ConfigError("vol estimate must be finite and positive")
+    return arr
+
+
+def _time_exit_mask(entries: np.ndarray, bars: int) -> np.ndarray:
+    """Holding-period exit mask: fire at the first bar at/after ``entry_bar + bars``.
+
+    Each fresh ``entries`` bar re-arms the countdown; after firing, the mask goes idle
+    until a new entry (a subsequent stale ``True`` is a no-op for vectorbt — first-exit-wins).
+    """
+    n = entries.shape[0]
+    mask = np.zeros(n, dtype=np.bool_)
+    armed = False
+    fire_at: int | None = None
+    for i in range(n):
+        if bool(entries[i]):
+            armed = True
+            fire_at = i + bars
+        if armed and fire_at is not None and i >= fire_at:
+            mask[i] = True
+            armed = False
+            fire_at = None
+    return mask
+
+
+def apply_time_exits(
+    inputs: VbtSignalInputs, exits: tuple[Any, ...], data: MarketData
+) -> VbtSignalInputs:
+    """Fold ``TimeExit`` into the vectorbt exit masks so vectorbt actually exits (§6.4).
+
+    vectorbt has no native holding-period primitive, so a ``TimeExit(bars)`` is translated
+    into an exit-signal mask with the core :func:`time_exit_mask` semantics: a position
+    opened at bar ``e`` exits at the first bar at or after ``e + bars``. The mask is applied
+    to both the long and the short exit columns (a time exit closes whichever side is open);
+    a signal exit or stop that already closed the position makes a later mask bar idle, and
+    a new entry re-arms the countdown. Returns a (possibly mutated) copy of ``inputs``.
+    """
+    time_bars = [e.bars for e in exits if isinstance(e, TimeExit)]
+    if not time_bars:
+        return inputs
+    n = data.n_bars
+    long_mask = np.zeros(n, dtype=np.bool_)
+    short_mask = np.zeros(n, dtype=np.bool_)
+    for bars in time_bars:
+        long_mask |= _time_exit_mask(inputs.entries.to_numpy(dtype=np.bool_), bars)
+        short_mask |= _time_exit_mask(inputs.short_entries.to_numpy(dtype=np.bool_), bars)
+    idx = inputs.close.index
+    inputs.long_exits = inputs.long_exits | pd.Series(long_mask, index=idx, dtype=bool)
+    inputs.short_exits = inputs.short_exits | pd.Series(short_mask, index=idx, dtype=bool)
+    return inputs
 
 
 def exit_stop_params(

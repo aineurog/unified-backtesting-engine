@@ -39,7 +39,8 @@ def build_portfolio(
     Args:
         signals: The translated signal frame from :func:`to_vbt_inputs`.
         init_cash: Starting cash (from the ``starting_balance`` override).
-        fees: Per-trade fee fraction (commission + slippage from the cost model).
+        fees: Per-trade commission fraction (must be commission-only — slippage is applied
+            at the fill price level in the ledger fold, not via this parameter).
         sl_stop: Per-bar stop-loss fraction array/scalar, or ``None``.
         tp_stop: Take-profit fraction, or ``None``.
         sl_trail: Trailing-stop fraction, or ``None``.

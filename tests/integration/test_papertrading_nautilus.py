@@ -348,6 +348,7 @@ def test_backtest_usd_settlement_with_synthetic_usdt_rate() -> None:
             instrument=preset.instrument,
             signal=SignalConfig(on_opposite_signal="reverse"),
             base_currency="USDT",
+            engine="nautilus",  # nautilus auto-seeds the 1:1 USD/USDT FXSeries
             **kw,
         )
 

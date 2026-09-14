@@ -47,6 +47,7 @@ def _config() -> BacktestConfig:
     return BacktestConfig(
         instrument=PRESETS["futures"].instrument,
         risk=RiskConfig(sizing=SizeModel(kind="fixed_units", value=1.0)),
+        engine="nautilus",  # this file exercises through the Nautilus adapter
         engine_overrides={"starting_balance": 100000.0},
     )
 

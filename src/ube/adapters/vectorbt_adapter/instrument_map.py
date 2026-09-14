@@ -22,9 +22,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ube.adapters.vectorbt_adapter.overrides import DEFAULT_FUNDING_INTERVAL_HOURS
 from ube.core.errors import InvalidInstrumentError
-from ube.core.instrument import Instrument
+from ube.core.instrument import Instrument, resolve_funding_interval_hours
 
 __all__ = [
     "VbtInstrument",
@@ -126,9 +125,15 @@ def build_instrument(
         else 1.0
     )
     settlement_currency = canonical.settlement_currency or "USD"
-    funding_interval_hours = float(
-        overrides.get("funding_interval_hours", DEFAULT_FUNDING_INTERVAL_HOURS)
-    )
+    # §4.5/§24: the funding cadence is asset-class metadata that travels with the instrument
+    # (mirroring ``resolve_funding_interval_hours`` in the nautilus adapter), so the schedule
+    # is not silently rewritten by the adapter defaults. An explicit engine override still
+    # wins (it is the caller's loud, per-run choice); otherwise the canonical instrument's
+    # ``funding_interval_hours`` (or the 8h asset-class default) is used.
+    if "funding_interval_hours" in overrides:
+        funding_interval_hours = float(overrides["funding_interval_hours"])
+    else:
+        funding_interval_hours = resolve_funding_interval_hours(canonical)
     return VbtInstrument(
         asset_class=asset_class,
         size_precision=size_precision,

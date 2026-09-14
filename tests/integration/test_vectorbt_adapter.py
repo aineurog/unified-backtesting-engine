@@ -34,6 +34,7 @@ from ube.adapters.vectorbt_adapter.exits import (
 from ube.adapters.vectorbt_adapter.overrides import (
     DEFAULT_FUNDING_INTERVAL_HOURS,
     DEFAULT_STARTING_BALANCE,
+    parse_synthetic_rates,
     validate_overrides,
 )
 from ube.core.config import BacktestConfig
@@ -47,6 +48,7 @@ from ube.core.risk.exits import (
     ATRStop,
     ChandelierExit,
     TakeProfit,
+    TimeExit,
     TrailingStop,
 )
 from ube.core.signals import from_target
@@ -131,6 +133,48 @@ def test_validate_overrides_rejects_non_positive_funding_interval():
 def test_defaults_are_exported():
     assert DEFAULT_STARTING_BALANCE > 0.0
     assert DEFAULT_FUNDING_INTERVAL_HOURS > 0.0
+
+
+def test_validate_overrides_accepts_extended_schema():
+    validated = validate_overrides(
+        {
+            "starting_balance": 50000.0,
+            "funding_interval_hours": 4.0,
+            "size_precision": 2,
+            "size_increment": 0.01,
+            "account_type": "cash",
+        }
+    )
+    assert validated["size_precision"] == 2
+    assert validated["size_increment"] == 0.01
+    assert validated["account_type"] == "cash"
+
+
+def test_validate_overrides_rejects_bad_extended_schema():
+    with pytest.raises(ConfigError, match="size_precision"):
+        validate_overrides({"size_precision": -1})
+    with pytest.raises(ConfigError, match="size_increment"):
+        validate_overrides({"size_increment": 0.0})
+    with pytest.raises(ConfigError, match="account_type"):
+        validate_overrides({"account_type": "hedged"})
+    with pytest.raises(ConfigError, match="fx_rates"):
+        validate_overrides({"fx_rates": {"EURUSD": -1.0}})
+
+
+def test_parse_synthetic_rates_normalizes_and_inverts():
+    # A single quoted pair also yields its implicit inverse; a mapping form is accepted.
+    parsed = parse_synthetic_rates({"EURUSD": 1.2}, "fx_rates")
+    assert parsed["EURUSD"] == pytest.approx(1.2)
+    assert parsed["USDEUR"] == pytest.approx(1 / 1.2)
+    parsed2 = parse_synthetic_rates(
+        [{"pair": "GBPUSD", "rate": 1.3}, {"pair": "USDJPY", "rate": 110.0}], "synthetic_rates"
+    )
+    assert parsed2["GBPUSD"] == pytest.approx(1.3)
+    assert parsed2["USDGBP"] == pytest.approx(1 / 1.3)
+    assert parsed2["USDJPY"] == pytest.approx(110.0)
+    assert parsed2["JPYUSD"] == pytest.approx(1 / 110.0)
+    with pytest.raises(ConfigError):
+        parse_synthetic_rates({"BAD": "x"}, "fx_rates")
 
 
 # ---------------------------------------------------------------------------
@@ -267,14 +311,16 @@ def test_vectorbt_full_loop_futures_signal_roundtrip():
     fills = _fills(result)
     assert len(fills) == 2
     assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "signal")]
-    assert fills[0].quantity == pytest.approx(19.99, abs=0.05)
+    assert fills[0].quantity == pytest.approx(19.0, abs=1e-6)
     assert fills[0].price == pytest.approx(5002.5, abs=1e-6)
     assert fills[1].price == pytest.approx(4989.5, abs=1e-6)
     (trade,) = result.trades
     assert trade.exit_reason == "signal"
-    assert trade.net_pnl == pytest.approx(-12993.5, abs=1.0)
+    assert trade.net_pnl == pytest.approx(-12350.0, abs=1e-6)
     assert float(result.equity_curve.equity[0]) == pytest.approx(100000.0)
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(87006.5, abs=1.0)
+    # Parity with Nautilus: always-floored qty (19.0 contracts) matches the actor's §7.1
+    # floor-to-lot, so both engines book the same final equity.
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(87650.0, abs=1e-6)
     assert not _ledger_events(result, EventType.COMMISSION)
     assert not _ledger_events(result, EventType.FUNDING_PAYMENT)
 
@@ -336,7 +382,10 @@ def test_vectorbt_full_loop_crypto_perp_short_pays_loss():
     fills = _fills(result)
     assert [(e.side, e.exit_reason) for e in fills] == [(-1, None), (1, "signal")]
     assert len(_ledger_events(result, EventType.FUNDING_PAYMENT)) == 3
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(99569.19, abs=1e-2)
+    # Parity with the Nautilus engine (which pins the same value): fees are booked at the
+    # slipped fill notional and funding on the held notional, so the short is less lossy than
+    # the legacy vectorbt fold predicted.
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(99568.9293, abs=1e-2)
 
 
 def test_vectorbt_funding_default_8h_accrues_proportionally_per_open_bar():
@@ -379,23 +428,81 @@ def test_vectorbt_trailing_stop_stamps_exit_reason():
     assert trade.exit_reason == "trailing_stop"
 
 
+def test_vectorbt_time_exit_executes_and_stamps_reason():
+    # TimeExit(bars) must actually fold into the vectorbt exit masks (it has no native
+    # holding-period primitive) and stamp "time_exit" on the fill.
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    result = VectorbtAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 1, 1, 0, 0, 0, 0]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(TimeExit(2),)),
+            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
+        ),
+    )
+    fills = _fills(result)
+    assert len(fills) == 2
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "time_exit")]
+    (trade,) = result.trades
+    assert trade.exit_reason == "time_exit"
+
+
+def test_vectorbt_time_exit_yields_to_earlier_signal_exit():
+    # A signal exit on the same bar closes first (first-exit-wins); the time mask is idle.
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    result = VectorbtAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 1, 0, 0, 0, 0, 0]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(TimeExit(10),)),
+            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
+        ),
+    )
+    (trade,) = result.trades
+    assert trade.exit_reason == "signal"
+
+
 def test_vectorbt_volatility_target_sizing_runs():
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
+    # §6.3: vol comes from aux_data (never the signal bars); the SizeModel must name it via
+    # the `vol` key. A raw MarketData series is turned into ATR/price on the aux grid.
+    aux = {"vol_1h": synthetic_bars(PRESETS["futures"], seed=3, n_bars=12)}
     result = VectorbtAdapter().run(
         md,
         from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
         BacktestConfig(
             instrument=PRESETS["futures"].instrument,
-            risk=RiskConfig(sizing=SizeModel(kind="volatility_target", value=0.02)),
+            risk=RiskConfig(sizing=SizeModel(kind="volatility_target", value=0.02, vol="vol_1h")),
             engine_overrides={"starting_balance": 100000.0},
         ),
+        aux_data=aux,
     )
     assert len(result.trades) == 1
+    # The volatility budget sizes beyond unleveraged equity: units = target*capital/(price*vol)
+    # is not capped at a fixed-fraction of the account.
+    assert result.trades[0].quantity > 0
+
+
+def test_vectorbt_volatility_target_missing_vol_key_raises():
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
+    with pytest.raises(ConfigError, match="volatility_target"):
+        VectorbtAdapter().run(
+            md,
+            from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+            BacktestConfig(
+                instrument=PRESETS["futures"].instrument,
+                risk=RiskConfig(sizing=SizeModel(kind="volatility_target", value=0.02)),
+                engine_overrides={"starting_balance": 100000.0},
+            ),
+        )
 
 
 def test_vectorbt_aux_atr_stop_runs_with_aux_data():
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=20)
-    aux = {"atr_1h": synthetic_bars(PRESETS["crypto_perp"], seed=1, n_bars=6)}
+    # aux must span the signal/price period (range-consistency §5.2), so 20 bars like main.
+    aux = {"atr_1h": synthetic_bars(PRESETS["crypto_perp"], seed=1, n_bars=20)}
     result = VectorbtAdapter().run(
         md,
         from_target([0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
@@ -474,17 +581,21 @@ def test_vectorbt_run_rejects_single_bar_data():
         )
 
 
-def test_vectorbt_run_rejects_short_on_long_only_asset():
-    # crypto_spot is the only long-only asset class; it is not a preset, so build the
-    # instrument with that asset class explicitly (validate_long_only keys off the string).
+def test_vectorbt_short_signal_on_long_only_asset_is_not_signal_gated():
+    # validate_long_only is a documented no-op at the signal level: short gating lives in the
+    # strategy/actor layer, not in the engine. The vectorbt engine executes the short and the
+    # run completes normally (no InvalidSignalError) — signalling responsibility moved.
+    # (crypto_spot is the only long-only asset class; it is not a preset, so build the
+    # instrument with that asset class explicitly.)
     inst = replace(PRESETS["stocks"].instrument, asset_class="crypto_spot")
     md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
-    with pytest.raises(InvalidSignalError, match="long-only"):
-        VectorbtAdapter().run(
-            md,
-            from_target([0, -1, -1, -1, -1, -1]),
-            BacktestConfig(instrument=inst),
-        )
+    result = VectorbtAdapter().run(
+        md,
+        from_target([0, -1, -1, -1, -1, -1]),
+        BacktestConfig(instrument=inst),
+    )
+    fills = _fills(result)
+    assert fills and fills[0].side == -1
 
 
 # ---------------------------------------------------------------------------
