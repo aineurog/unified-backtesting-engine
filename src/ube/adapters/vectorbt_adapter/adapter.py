@@ -349,9 +349,12 @@ class VectorbtAdapter(EngineAdapter):
         inputs = apply_time_exits(inputs, exits, data)
 
         # Two-pass sizing: nominal 1-unit run to learn entry prices, then core-sized run.
+        # §3.2: the portfolio is funded with the *leveraged* capital (``starting_balance *
+        # eff_leverage``) so long entries are not affordability-capped by vectorbt's raw
+        # cash check — the sized quantities already reflect leverage via the size series.
         pf = build_portfolio(
             inputs,
-            init_cash=starting_balance,
+            init_cash=starting_balance * eff_leverage,
             fees=fees,
             sl_stop=sl_stop,
             tp_stop=tp_stop,
@@ -373,7 +376,7 @@ class VectorbtAdapter(EngineAdapter):
             )
             pf = build_portfolio(
                 inputs,
-                init_cash=starting_balance,
+                init_cash=starting_balance * eff_leverage,
                 fees=fees,
                 sl_stop=sl_stop,
                 tp_stop=tp_stop,
@@ -486,6 +489,10 @@ class VectorbtAdapter(EngineAdapter):
             size = abs(float(trade["Size"]))
             direction = str(trade["Direction"])
             side = 1 if direction == "Long" else -1
+            # An open record carries the last bar as its "exit" in vectorbt; the position
+            # is still held at the end of the run and must stay open in the ledger (the
+            # trade_table renders its mark via the open row) — matching the nautilus fold.
+            is_open = str(trade.get("Status", "")).strip().lower() == "open"
             # Slipped fill prices (§8): entry fill at ``price * (1 + side*slip)``, exit
             # fill at ``price * (1 - side*slip)`` — the fill the venue would actually book.
             entry_price = float(slipped_price(raw_entry, side, slip))
@@ -565,72 +572,76 @@ class VectorbtAdapter(EngineAdapter):
                     )
 
             # Exit signal-evaluated row (§4.6): mirrors the nautilus actor where every
-            # exit (signal bar or risk bar) is stamped with a per-bar action.
-            if exit_reason == "signal":
-                exit_action = "long_exit" if side == 1 else "short_exit"
-            else:
-                exit_action = f"exit_{exit_reason}"
-            _add(
-                LedgerEvent(
-                    EventType.SIGNAL_EVALUATED,
+            # exit (signal bar or risk bar) is stamped with a per-bar action. Skip for
+            # open records — the final position stays held to the end of the run.
+            if not is_open:
+                if exit_reason == "signal":
+                    exit_action = "long_exit" if side == 1 else "short_exit"
+                else:
+                    exit_action = f"exit_{exit_reason}"
+                _add(
+                    LedgerEvent(
+                        EventType.SIGNAL_EVALUATED,
+                        int(bar_ts[exit_bar]),
+                        instrument_id,
+                        action=exit_action,
+                    ),
                     int(bar_ts[exit_bar]),
-                    instrument_id,
-                    action=exit_action,
-                ),
-                int(bar_ts[exit_bar]),
-            )
+                )
 
             # Exit ORDER_SUBMITTED (§4.6): mirrors the nautilus actor, which records one
             # per order placed — entry and close/exit alike.
-            _order_submitted(int(bar_ts[exit_bar]), -side, size)
+            if not is_open:
+                _order_submitted(int(bar_ts[exit_bar]), -side, size)
 
-            # Exit fill (with reason) + cash leg + commission + position change.
-            exit_notional = size * exit_price * multiplier
-            _add(
-                LedgerEvent(
-                    EventType.CASH_MOVEMENT,
-                    int(bar_ts[exit_bar]),
-                    instrument_id,
-                    amount=side * exit_notional,
-                    currency=settlement,
-                ),
-                int(bar_ts[exit_bar]),
-            )
-            _add(
-                LedgerEvent(
-                    EventType.FILL,
-                    int(bar_ts[exit_bar]),
-                    instrument_id,
-                    side=-side,
-                    quantity=size,
-                    price=exit_price,
-                    exit_reason=exit_reason,
-                ),
-                int(bar_ts[exit_bar]),
-            )
-            if size > 0.0 and cost_model is not None:
-                exit_fee = float(fill_cost(cost_model, notional=exit_notional))
-                if exit_fee != 0.0:
-                    _add(
-                        LedgerEvent(
-                            EventType.COMMISSION,
-                            int(bar_ts[exit_bar]),
-                            instrument_id,
-                            amount=exit_fee,
-                            currency=settlement,
-                        ),
+            if not is_open:
+                # Exit fill (with reason) + cash leg + commission + position change.
+                exit_notional = size * exit_price * multiplier
+                _add(
+                    LedgerEvent(
+                        EventType.CASH_MOVEMENT,
                         int(bar_ts[exit_bar]),
-                    )
-            net += (-side) * size
-            _add(
-                LedgerEvent(
-                    EventType.POSITION_CHANGE,
+                        instrument_id,
+                        amount=side * exit_notional,
+                        currency=settlement,
+                    ),
                     int(bar_ts[exit_bar]),
-                    instrument_id,
-                    position_after=net,
-                ),
-                int(bar_ts[exit_bar]),
-            )
+                )
+                _add(
+                    LedgerEvent(
+                        EventType.FILL,
+                        int(bar_ts[exit_bar]),
+                        instrument_id,
+                        side=-side,
+                        quantity=size,
+                        price=exit_price,
+                        exit_reason=exit_reason,
+                    ),
+                    int(bar_ts[exit_bar]),
+                )
+                if size > 0.0 and cost_model is not None:
+                    exit_fee = float(fill_cost(cost_model, notional=exit_notional))
+                    if exit_fee != 0.0:
+                        _add(
+                            LedgerEvent(
+                                EventType.COMMISSION,
+                                int(bar_ts[exit_bar]),
+                                instrument_id,
+                                amount=exit_fee,
+                                currency=settlement,
+                            ),
+                            int(bar_ts[exit_bar]),
+                        )
+                net += (-side) * size
+                _add(
+                    LedgerEvent(
+                        EventType.POSITION_CHANGE,
+                        int(bar_ts[exit_bar]),
+                        instrument_id,
+                        position_after=net,
+                    ),
+                    int(bar_ts[exit_bar]),
+                )
 
         # Carry (funding/swap + short borrow) from the core cost model (§24).
         funding_rate = float(cost_model.funding)
