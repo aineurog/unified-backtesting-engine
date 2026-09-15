@@ -312,19 +312,29 @@ def test_build_instrument_futures_maps_to_futures_contract():
     assert build.instrument.underlying == "USD"
 
 
-def test_build_instrument_commodities_maps_to_futures_contract():
+def test_build_instrument_commodities_maps_to_cfd():
     from nautilus_trader.model.enums import AssetClass
-    from nautilus_trader.model.instruments import FuturesContract
+    from nautilus_trader.model.instruments import (
+        Cfd,
+        FuturesContract,
+    )
 
     from ube.adapters.nautilus_adapter.instrument_map import build_instrument
 
     build = build_instrument(PRESETS["commodities"].instrument)
-    assert isinstance(build.instrument, FuturesContract)
+    assert isinstance(build.instrument, Cfd)
+    assert not isinstance(build.instrument, FuturesContract)
     assert str(build.instrument_id) == "GC.SIM"
     assert build.instrument.asset_class == AssetClass.COMMODITY
-    assert build.instrument.multiplier.as_double() == 100.0
+    # Cfd hardcodes multiplier=1 in nautilus (no multiplier parameter); the ledger
+    # fold uses the canonical contract_multiplier (100) for PnL math instead.
+    assert build.instrument.multiplier.as_double() == 1.0
     assert build.instrument.price_increment.as_double() == 0.1
     assert build.instrument.price_precision == 1
+    # commodities trade fractional 0.01 lots (Cfd), not integer futures lots.
+    assert build.instrument.size_precision == 2
+    assert build.instrument.size_increment.as_double() == 0.01
+    assert build.instrument.min_quantity.as_double() == 0.01
 
 
 def test_build_instrument_crypto_perp_maps_to_crypto_perpetual():

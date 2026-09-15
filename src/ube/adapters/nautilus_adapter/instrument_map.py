@@ -8,12 +8,19 @@ Maps the canonical asset-class metadata onto the concrete Nautilus instrument cl
 | ``asset_class``| Nautilus class         | Notes                                       |
 +================+========================+=============================================+
 | ``futures``    | ``FuturesContract``    | multiplier from ``contract_multiplier``     |
-| ``commodities``| ``FuturesContract``    | e.g. gold GC (``multiplier=100``)           |
+| ``commodities``| ``Cfd``                | fractional lots (0.01), e.g. spot gold      |
 | ``crypto_perp``| ``CryptoPerpetual``    | linear (``is_inverse=False``)               |
 | ``stocks``     | ``Equity``             |                                             |
 | ``forex``      | ``CurrencyPair``       |                                             |
 | ``crypto_spot``| ``CurrencyPair``       | deferred (no fixture yet)                   |
 +----------------+------------------------+---------------------------------------------+
+
+The mapping is driven purely by ``asset_class`` (§4.5): each class dispatches to its
+native Nautilus instrument type and there is **no** ``FuturesContract`` fallback.
+``commodities`` (spot gold/XAUUSD, metal CFDs) map to a ``Cfd`` because they trade
+fractional 0.01 lots — a ``FuturesContract`` hardcodes integer ``size_increment=1``
+and cannot express them. ``futures`` is the only class that builds a
+``FuturesContract``.
 
 Precision/increments come from the canonical ``tick_size`` / ``contract_multiplier``,
 with the reference ``constants.py`` values as fallback defaults. Fees default to
@@ -32,6 +39,7 @@ from typing import Any
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import (
+    Cfd,
     CryptoPerpetual,
     CurrencyPair,
     Equity,
@@ -63,7 +71,7 @@ _DEFAULT_SIZE_PRECISION: dict[str, int] = {
     "crypto_perp": 3,
     "crypto_spot": 3,
     "futures": 0,
-    "commodities": 0,
+    "commodities": 2,
     "stocks": 0,
     "forex": 5,
 }
@@ -80,7 +88,7 @@ _DEFAULT_SIZE_INCREMENT: dict[str, str] = {
     "crypto_perp": "0.001",
     "crypto_spot": "0.001",
     "futures": "1",
-    "commodities": "1",
+    "commodities": "0.01",
     "stocks": "1",
     "forex": "0.00001",
 }
@@ -100,7 +108,7 @@ _DEFAULT_TICK_SIZE: dict[str, str] = {
 class NautilusInstrumentBuild:
     """The result of mapping a canonical :class:`Instrument` onto Nautilus."""
 
-    instrument: Any  # a concrete nautilus_trader instrument (FuturesContract, ...)
+    instrument: Any  # a concrete nautilus_trader instrument (FuturesContract, Cfd, ...)
     instrument_id: InstrumentId
 
 
@@ -163,9 +171,16 @@ def _precision(canonical: Instrument, overrides: Mapping[str, Any]) -> tuple[int
 
 
 def _size(canonical: Instrument, overrides: Mapping[str, Any]) -> tuple[int, str]:
-    """Resolve ``(size_precision, size_increment)`` for the instrument."""
-    precision = overrides.get("size_precision", _DEFAULT_SIZE_PRECISION[canonical.asset_class])
-    return int(precision), _DEFAULT_SIZE_INCREMENT[canonical.asset_class]
+    """Resolve ``(size_precision, size_increment)`` for the instrument.
+
+    Both fields can be overridden via ``engine_overrides``; absent an override the
+    per-asset-class defaults are used (§4.5).  The increment string is re-formatted
+    to the resolved precision so nautilus's ``size_precision == size_increment.precision``
+    invariant always holds.
+    """
+    precision = int(overrides.get("size_precision", _DEFAULT_SIZE_PRECISION[canonical.asset_class]))
+    increment = overrides.get("size_increment", _DEFAULT_SIZE_INCREMENT[canonical.asset_class])
+    return precision, f"{float(increment):.{precision}f}"
 
 
 def _margin(overrides: Mapping[str, Any]) -> tuple[Decimal, Decimal]:
@@ -211,19 +226,22 @@ def _symbol_id(canonical: Instrument, overrides: Mapping[str, Any]) -> tuple[Ins
 def _build_futures(
     canonical: Instrument, overrides: Mapping[str, Any]
 ) -> tuple[Any, InstrumentId]:
+    """Build a :class:`FuturesContract` for the ``futures`` asset class only (§4.5).
+
+    ``FuturesContract`` hardcodes ``size_precision=0`` / ``size_increment=1`` (integer
+    lots), so it is **never** used for commodities (XAUUSD etc.) that trade fractional
+    lots — those route to :func:`_build_cfd` instead.
+    """
     instrument_id, raw_symbol = _symbol_id(canonical, overrides)
     price_precision, price_increment = _precision(canonical, overrides)
     margin_init, margin_maint = _margin(overrides)
     maker_fee, taker_fee = _fees(overrides)
     _, quote = _base_quote(canonical)
     multiplier = canonical.contract_multiplier if canonical.contract_multiplier is not None else 1.0
-    asset_class = (
-        AssetClass.INDEX if canonical.asset_class == "futures" else AssetClass.COMMODITY
-    )
     instrument = FuturesContract(
         instrument_id=instrument_id,
         raw_symbol=raw_symbol,
-        asset_class=asset_class,
+        asset_class=AssetClass.INDEX,
         currency=Currency.from_str(quote),
         price_precision=price_precision,
         price_increment=Price.from_str(price_increment),
@@ -234,6 +252,44 @@ def _build_futures(
         expiration_ns=_FUTURES_EXPIRATION_NS,
         ts_event=0,
         ts_init=0,
+        margin_init=margin_init,
+        margin_maint=margin_maint,
+        maker_fee=maker_fee,
+        taker_fee=taker_fee,
+    )
+    return instrument, instrument_id
+
+
+def _build_cfd(
+    canonical: Instrument, overrides: Mapping[str, Any]
+) -> tuple[Any, InstrumentId]:
+    """Build a :class:`Cfd` for the ``commodities`` asset class (§4.5).
+
+    ``Cfd`` supports fractional ``size_precision``/``size_increment`` (default 2 dp /
+    0.01 lot for commodities), ``min_quantity``, and sets ``lot_size`` equal to the
+    size increment.  The nautilus-instrument ``multiplier`` is always 1; the ledger
+    fold uses the **canonical** ``contract_multiplier`` for PnL math, so this is
+    transparent to the backtest result.
+    """
+    instrument_id, raw_symbol = _symbol_id(canonical, overrides)
+    price_precision, price_increment = _precision(canonical, overrides)
+    size_precision, size_increment = _size(canonical, overrides)
+    margin_init, margin_maint = _margin(overrides)
+    maker_fee, taker_fee = _fees(overrides)
+    _, quote = _base_quote(canonical)
+    instrument = Cfd(
+        instrument_id=instrument_id,
+        raw_symbol=raw_symbol,
+        asset_class=AssetClass.COMMODITY,
+        quote_currency=Currency.from_str(quote),
+        price_precision=price_precision,
+        size_precision=size_precision,
+        price_increment=Price.from_str(price_increment),
+        size_increment=Quantity.from_str(size_increment),
+        ts_event=0,
+        ts_init=0,
+        lot_size=Quantity.from_str(size_increment),
+        min_quantity=Quantity.from_str(size_increment),
         margin_init=margin_init,
         margin_maint=margin_maint,
         maker_fee=maker_fee,
@@ -330,12 +386,12 @@ def _build_currency_pair(
     return instrument, instrument_id
 
 
-#: asset_class -> builder. ``crypto_spot`` maps to a ``CurrencyPair`` (reference
-#: ``constants.py``: ("crypto", "spot") -> "CurrencyPair"); shorting is not permitted
-#: on it (the actor's ``_allow_short`` rule, mirroring the reference ``signals.py``).
+#: asset_class -> builder.  No ``FuturesContract`` fallback: each class is explicit.
+#: ``commodities`` (spot gold/XAUUSD etc.) routes to :func:`_build_cfd`; only
+#: ``futures`` (index, full-sized) builds a :class:`FuturesContract`.
 _BUILDERS: dict[str, Any] = {
     "futures": _build_futures,
-    "commodities": _build_futures,
+    "commodities": _build_cfd,
     "crypto_perp": _build_crypto_perp,
     "crypto_spot": _build_currency_pair,
     "stocks": _build_equity,

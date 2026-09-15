@@ -46,6 +46,7 @@ class NautilusEngineOverrides(TypedDict, total=False):
     starting_balance: float
     price_precision: int
     size_precision: int
+    size_increment: str | float
     price_increment: str
     oms_type: Literal["NETTING", "HEDGING"]
     maker_fee: float
@@ -99,6 +100,24 @@ def _require_nonneg_int(value: Any, field: str) -> None:
         raise ConfigError(f"engine override {field!r} must be >= 0")
 
 
+def _require_positive_number_or_str(value: Any, field: str) -> None:
+    msg = f"engine override {field!r} must be a positive number or numeric string"
+    if isinstance(value, bool):
+        raise ConfigError(msg)
+    if isinstance(value, (int, float)):
+        if value <= 0:
+            raise ConfigError(f"engine override {field!r} must be > 0")
+        return
+    if isinstance(value, str) and value.strip():
+        try:
+            if float(value) <= 0:
+                raise ConfigError(f"engine override {field!r} must be > 0")
+        except ValueError as err:
+            raise ConfigError(msg) from err
+        return
+    raise ConfigError(msg)
+
+
 def _validate_synthetic_rates(value: Any, field: str) -> None:
     if not isinstance(value, (Mapping, list, tuple)):
         raise ConfigError(
@@ -113,6 +132,7 @@ _FIELD_VALIDATORS: dict[str, Callable[[Any, str], None]] = {
     "starting_balance": _require_positive_number,
     "price_precision": _require_nonneg_int,
     "size_precision": _require_nonneg_int,
+    "size_increment": _require_positive_number_or_str,
     "price_increment": _require_str,
     "oms_type": _validate_oms_type,
     "maker_fee": _require_fraction,
