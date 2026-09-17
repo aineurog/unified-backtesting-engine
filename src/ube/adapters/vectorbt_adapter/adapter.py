@@ -60,6 +60,7 @@ from ube.core.errors import (
     EngineError,
     InvalidSignalError,
 )
+from ube.core.instrument import allows_short
 from ube.core.ledger import EventLedger, EventType, FXSeries, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
 from ube.core.risk.sizing import _entry_fee_rate, size_position
@@ -254,6 +255,26 @@ def _fx_series_grid(
     return fx
 
 
+def _neutralize_shorts(signals: Signals) -> Signals:
+    """Return ``signals`` with the short leg cleared for a long-only asset class (§4.5).
+
+    ``crypto_spot`` cannot open a short — there is nothing to borrow — so
+    ``short_entry``/``short_exit`` are meaningless for it. Zeroing the columns (rather
+    than rejecting the series, which the strategy/actor layer gates elsewhere) makes the
+    ignore-at-the-engine guarantee caller-independent: a caller that passes short rows
+    (a flip encoding from ``from_target``, a provider that emits both sides, ...) still
+    gets a strict long-only run, and the parallel long-side action of a flip (the
+    ``long_exit``) is preserved so an open long still closes when its exit bar comes.
+    """
+    dead = np.zeros(signals.n_bars, dtype=np.bool_)
+    return Signals(
+        long_entry=signals.long_entry,
+        long_exit=signals.long_exit,
+        short_entry=dead,
+        short_exit=dead,
+    )
+
+
 class VectorbtAdapter(EngineAdapter):
     """Adapter for the vectorbt backtesting engine (§4.1, §4.2)."""
 
@@ -305,6 +326,14 @@ class VectorbtAdapter(EngineAdapter):
             )
 
         validate_long_only(signals, config.instrument.asset_class)
+
+        # §4.5 long-only gate at the engine layer (mirrors the backtrader strategy /
+        # nautilus actor gates): a long-only asset class has nothing to borrow, so
+        # shorting is undefined for it. The adapter ignores short signals entirely
+        # here — even when the caller passes ``short_entry``/``short_exit`` rows, only
+        # long entries/exits are acted on and vectorbt can never open a short position.
+        if not allows_short(config.instrument.asset_class):
+            signals = _neutralize_shorts(signals)
 
         overrides = validate_overrides(config.engine_overrides)
         cost_model: CostModel = (

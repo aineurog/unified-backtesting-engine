@@ -581,12 +581,13 @@ def test_vectorbt_run_rejects_single_bar_data():
         )
 
 
-def test_vectorbt_short_signal_on_long_only_asset_is_not_signal_gated():
-    # validate_long_only is a documented no-op at the signal level: short gating lives in the
-    # strategy/actor layer, not in the engine. The vectorbt engine executes the short and the
-    # run completes normally (no InvalidSignalError) — signalling responsibility moved.
-    # (crypto_spot is the only long-only asset class; it is not a preset, so build the
-    # instrument with that asset class explicitly.)
+def test_vectorbt_ignores_short_signals_on_long_only_crypto_spot():
+    # crypto_spot is the engine's one long-only class (§4.5): shorting is undefined
+    # (nothing to borrow), so the vectorbt adapter ignores short_entry/short_exit at
+    # the engine layer even when the caller passes them — only long entries/exits are
+    # acted on. from_target([0, -1, ...]) opens a short at bar 1; the adapter drops it,
+    # so the run completes with zero fills and no short-side events (no signal-gate
+    # error).  (crypto_spot is not a preset, so build the instrument explicitly.)
     inst = replace(PRESETS["stocks"].instrument, asset_class="crypto_spot")
     md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
     result = VectorbtAdapter().run(
@@ -594,8 +595,39 @@ def test_vectorbt_short_signal_on_long_only_asset_is_not_signal_gated():
         from_target([0, -1, -1, -1, -1, -1]),
         BacktestConfig(instrument=inst),
     )
+    assert _fills(result) == []
+    assert len(result.trades) == 0
+
+
+def test_vectorbt_crypto_spot_drops_short_leg_of_flip_keeps_long_exit():
+    # A flip encoding (long held, then short_entry) is legal (§6.2) but its short leg is
+    # dead for a long-only class: the adapter keeps the long_exit (a long-side action)
+    # and drops only short_entry/short_exit, so the long closes normally and no short
+    # ever opens.  [0, 1, 1, 1, -1, -1] emits long_entry at 1, flip long_exit +
+    # short_entry at 4, hold.
+    inst = replace(PRESETS["stocks"].instrument, asset_class="crypto_spot")
+    md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
+    result = VectorbtAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, -1, -1]),
+        BacktestConfig(instrument=inst),
+    )
     fills = _fills(result)
-    assert fills and fills[0].side == -1
+    assert [e.side for e in fills] == [1, -1]  # one long entry + one long exit
+    assert len(result.trades) == 1  # the long trade, not a short
+
+
+def test_vectorbt_short_signals_still_accepted_for_shortable_asset_class():
+    # Long-only neutralization is scoped to classes that cannot short (§4.5); a
+    # shortable class (crypto_perp) still opens and closes shorts normally.
+    inst = replace(PRESETS["crypto_perp"].instrument, asset_class="crypto_perp")
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=3, n_bars=6)
+    result = VectorbtAdapter().run(
+        md,
+        from_target([0, -1, -1, -1, -1, -1]),
+        BacktestConfig(instrument=inst),
+    )
+    assert any(e.side < 0 for e in _fills(result))
 
 
 # ---------------------------------------------------------------------------
