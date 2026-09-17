@@ -2,9 +2,9 @@
   "asset_class": "commodities",
   "engines": {
     "backtrader": {
-      "final_equity": 0.0,
-      "n_trades": 0,
-      "trades_hash": ""
+      "final_equity": 92040.0,
+      "n_trades": 1,
+      "trades_hash": "322e7fdc80a9fd0e1bcd9f224b36b47b514ce3d8e10bc6715ac81004bf776203"
     },
     "nautilus": {
       "final_equity": 92040.0,

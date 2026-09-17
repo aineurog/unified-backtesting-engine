@@ -47,15 +47,19 @@ the result. Schema:
   "tolerance": { "final_equity_rtol": 1e-6 },
   "engines": {
     "vectorbt":    { "final_equity": 0.0, "n_trades": 0, "trades_hash": "" },
-    "backtrader":  { "final_equity": 0.0, "n_trades": 0, "trades_hash": "" },
+    "backtrader":  { "final_equity": 91725.0, "n_trades": 1, "trades_hash": "…" },
     "nautilus":    { "final_equity": 91725.0, "n_trades": 1, "trades_hash": "…" }
   }
 }
 ```
 
-All five asset classes have a locked **nautilus** baseline (the reference engine).
-The ``vectorbt`` and ``backtrader`` blocks are zeroed placeholders — they are filled
-with real values once those adapters are implemented, at which point cross-engine
-parity is actually exercised. A baseline is a real, manually-reviewed run, never a
-hand-invented number; the test asserts the engine reproduces it within the stated
-tolerance (see ``tests/parity/test_nautilus_parity.py``).
+All five asset classes have a locked **nautilus** baseline (the reference engine) and a locked
+**backtrader** baseline. The ``vectorbt`` block is still a zeroed placeholder — it is filled with
+real values once that adapter is implemented, at which point cross-engine parity is fully
+exercised. A baseline is a real, manually-reviewed run, never a hand-invented number; the test
+asserts the engine reproduces it within the stated tolerance (see
+``tests/parity/test_nautilus_parity.py`` and ``tests/parity/test_backtrader_parity.py``).
+
+Backtrader fills market orders at the *next* bar's open, so its locked values are its own (e.g. a
+final-bar exit is realized at the final bar's close, `stop()` in ``strategy.py``); a per-engine
+trades_hash therefore differs from Nautilus' even where ``final_equity`` coincides.

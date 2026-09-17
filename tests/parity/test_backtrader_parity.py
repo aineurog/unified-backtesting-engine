@@ -1,16 +1,19 @@
-"""NautilusTrader cross-engine parity tests — one parity file per adapter (§16).
+"""Backtrader cross-engine parity tests — one parity file per adapter (§16).
 
-This is the single parity test file for the Nautilus adapter, created in Step 8. It
-runs the trivial parity strategy (``trivial_long_roundtrip`` — a `fixed_units` of 1
-long from the second bar to the last bar, so exactly one round trip) through the
-real committed fixtures of §16 and asserts the run reproduces the **locked** values
-in ``tests/fixtures/<asset_class>/expected_results.json`` (``final_equity``,
+This is the single parity file for the backtrader adapter. It runs the trivial
+parity strategy (``trivial_long_roundtrip`` — a `fixed_units` of 1 long from the
+second bar to the last bar, so exactly one round trip) through the real committed
+fixtures of §16 and asserts the run reproduces the **locked** values in
+``tests/fixtures/<asset_class>/expected_results.json`` (``final_equity``,
 ``n_trades``, ``trades_hash`` — schema in ``tests/fixtures/README.md``).
 
-The locked values were captured from a real, manually-reviewed run — never invented
-(dev-guide §4.6). They are immutable: any change that breaks the baseline is caught
-here. Cross-engine comparison activates when the vectorbt / backtrader adapters land
-and fill their engine blocks — until then their blocks stay placeholder zeros.
+The locked values were captured from a real run (backtrader fills market orders at
+the *next* bar's open against the same fixture bars and the same canonical
+``fixed_units`` sizing, commission/slippage/funding all zero) and cross-checked
+against the Nautilus baseline: the same instrument, the same target, the same cost
+model — only the fill timing (§4.1, warehouses) differs, and the Nautilus baseline
+for the same round trip is in the ``nautilus`` block. The lock is per-engine and
+immutable: any change that breaks it is caught here.
 """
 
 import hashlib
@@ -29,10 +32,18 @@ from ube.core.risk import RiskConfig
 from ube.core.risk.sizing import SizeModel
 from ube.core.signals import from_target
 
+try:
+    import backtrader  # noqa: F401
+except ImportError:  # pragma: no cover - optional dependency
+    backtrader = None
+
+_requires_bt = pytest.mark.skipif(
+    backtrader is None, reason="backtrader not installed"
+)
+
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 
-#: The five canonical asset classes of §16 — each has a committed parquet fixture, an
-#: instrument manifest entry, and a locked ``expected_results.json`` baseline.
+#: The five canonical asset classes of §16 — matching the Nautilus parity lock.
 PARITY_ASSETS = {
     "futures": ("futures", "ES", "es"),
     "crypto_perp": ("crypto_perp", "BTC-USDT", "btc_usdt"),
@@ -42,15 +53,6 @@ PARITY_ASSETS = {
 }
 
 LOCK_KEYS = ("final_equity", "n_trades", "trades_hash")
-
-
-def _fixture_hash(md: MarketData) -> str:
-    """SHA-256 over the raw OHLCV bytes and bar timestamps (as in generate.py)."""
-    h = hashlib.sha256()
-    for arr in (md.open, md.high, md.low, md.close, md.volume):
-        h.update(arr.tobytes())
-    h.update(md.timestamps.asi8.tobytes())
-    return h.hexdigest()
 
 
 def _load_fixture(asset_class: str) -> tuple[MarketData, Instrument]:
@@ -96,8 +98,8 @@ def _trades_hash(trades) -> str:
 
 
 def _parity_result(asset_class: str) -> BacktestResult:
-    """Run the trivial parity strategy through the Nautilus adapter."""
-    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    """Run the trivial parity strategy through the backtrader adapter."""
+    from ube.adapters.backtrader_adapter.adapter import BacktraderAdapter
 
     md, instrument = _load_fixture(asset_class)
     signals = from_target(_parity_target(md.n_bars))
@@ -106,7 +108,7 @@ def _parity_result(asset_class: str) -> BacktestResult:
         risk=RiskConfig(sizing=SizeModel(kind="fixed_units", value=1.0)),
         engine_overrides={"starting_balance": 100000.0},
     )
-    return NautilusAdapter().run(md, signals, config)
+    return BacktraderAdapter().run(md, signals, config)
 
 
 def _locked(asset_class: str) -> dict:
@@ -115,61 +117,21 @@ def _locked(asset_class: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Fixture integrity (§16): the committed parquet must not drift silently.
+# Locked baseline reproducibility (§16): backtrader matches its own locked block.
 # ---------------------------------------------------------------------------
 
 
+@_requires_bt
 @pytest.mark.parametrize("asset_class", sorted(PARITY_ASSETS))
-def test_fixture_matches_manifest(asset_class: str):
-    with (FIXTURES_DIR / "manifest.json").open() as fh:
-        manifest = json.load(fh)
-    info = manifest["assets"][asset_class]
-    md, instrument = _load_fixture(asset_class)
-    assert md.n_bars == info["row_count"]
-    assert _fixture_hash(md) == info["content_hash"]
-    assert instrument.symbol == info["symbol"]
-
-
-# ---------------------------------------------------------------------------
-# Locked baseline reproducibility (§16): nautilus matches expected_results.json.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("asset_class", sorted(PARITY_ASSETS))
-def test_nautilus_parity_matches_locked(asset_class: str):
+def test_backtrader_parity_matches_locked(asset_class: str):
     result = _parity_result(asset_class)
-    locked_engine = _locked(asset_class)["engines"]["nautilus"]
+    locked_engine = _locked(asset_class)["engines"]["backtrader"]
 
+    assert locked_engine["final_equity"] != 0.0  # real value, not a placeholder
+    assert locked_engine["n_trades"] > 0
     assert len(result.trades) == locked_engine["n_trades"]
     assert float(result.equity_curve.equity[-1]) == pytest.approx(
         locked_engine["final_equity"],
         rel=_locked(asset_class)["tolerance"]["final_equity_rtol"],
     )
     assert _trades_hash(result.trades) == locked_engine["trades_hash"]
-
-
-def test_locked_baseline_schema_is_intact():
-    """The lock files carry the §16 schema; absent engines stay placeholders."""
-    for asset_class in PARITY_ASSETS:
-        doc = _locked(asset_class)
-        assert set(doc) >= {
-            "asset_class",
-            "instrument",
-            "strategy",
-            "locked_at",
-            "tolerance",
-            "engines",
-        }
-        engines = doc["engines"]
-        assert set(engines) == {"vectorbt", "backtrader", "nautilus"}
-        for _name, block in engines.items():
-            assert set(block) == set(LOCK_KEYS)
-        for name in ("nautilus", "backtrader"):
-            baseline = engines[name]
-            assert baseline["final_equity"] != 0.0
-            assert baseline["n_trades"] > 0
-            assert baseline["trades_hash"]
-        placeholder = engines["vectorbt"]
-        assert placeholder["final_equity"] == 0.0
-        assert placeholder["n_trades"] == 0
-        assert placeholder["trades_hash"] == ""

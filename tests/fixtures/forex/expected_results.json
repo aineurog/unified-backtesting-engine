@@ -13,9 +13,9 @@
       "trades_hash": ""
     },
     "backtrader": {
-      "final_equity": 0.0,
-      "n_trades": 0,
-      "trades_hash": ""
+      "final_equity": 99999.981,
+      "n_trades": 1,
+      "trades_hash": "6ba0520d7a96616f85745c42e38e2456ddd1bf5afcadc552d2a72c5cb9ece1e3"
     },
     "nautilus": {
       "final_equity": 99999.981,

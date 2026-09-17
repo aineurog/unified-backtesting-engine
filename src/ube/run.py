@@ -166,6 +166,13 @@ def ensure_builtin_engines_registered() -> None:
     else:
         register_engine("vectorbt", VectorbtAdapter)
 
+    try:
+        from ube.adapters.backtrader_adapter.adapter import BacktraderAdapter
+    except ImportError:
+        pass
+    else:
+        register_engine("backtrader", BacktraderAdapter)
+
 
 def _standardize_data(data: object) -> MarketData:
     """Coerce ``data`` to a canonical :class:`MarketData` (§5.1)."""

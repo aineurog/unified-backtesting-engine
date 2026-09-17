@@ -1557,7 +1557,14 @@ def test_ensure_builtin_engines_registered_is_idempotent():
     except ImportError:
         assert engines == ("nautilus",)
     else:
-        assert engines == ("nautilus", "vectorbt")
+        expected = ["nautilus", "vectorbt"]
+        try:
+            import backtrader  # noqa: F401
+        except ImportError:
+            pass
+        else:
+            expected.append("backtrader")
+        assert engines == tuple(sorted(expected))
 
 
 def main() -> int:

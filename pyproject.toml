@@ -81,5 +81,11 @@ disable_error_code = ["override"]
 module = ["nautilus_trader.*"]
 ignore_missing_imports = true
 
+# backtrader is an optional dependency that ships no type stubs; it is also absent
+# from type-checking environments that haven't installed it.
+[[tool.mypy.overrides]]
+module = ["backtrader", "backtrader.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
