@@ -55,6 +55,7 @@ from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel, fill_cost, resolve_cost_model, slipped_price
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
+from ube.core.instrument import allows_short
 from ube.core.ledger import (
     EventLedger,
     EventType,
@@ -81,6 +82,27 @@ _KIND_RANK: dict[EventType, int] = {
 #: Margin initial requirement for leveraged classes (fraction of notional) — the reference
 #: futures policy, applied as ``automargin = margin_init / leverage`` in the comminfo.
 _MARGIN_INIT: float = 0.05
+
+
+def _neutralize_shorts(signals: Signals) -> Signals:
+    """Return ``signals`` with the short leg cleared for a long-only asset class (§4.5).
+
+    ``crypto_spot`` cannot open a short — there is nothing to borrow — so
+    ``short_entry``/``short_exit`` are meaningless for it. Zeroing the columns (rather
+    than rejecting the series, which the strategy/actor layer gates elsewhere) makes the
+    ignore-at-the-engine guarantee caller-independent: a caller that passes short rows
+    (a flip encoding from ``from_target``, a provider that emits both sides, ...) still
+    gets a strict long-only run, and the parallel long-side action of a flip (the
+    ``long_exit``) is preserved so an open long still closes when its exit bar comes.
+    Mirrors the vectorbt adapter's gate exactly.
+    """
+    dead = np.zeros(signals.n_bars, dtype=np.bool_)
+    return Signals(
+        long_entry=signals.long_entry,
+        long_exit=signals.long_exit,
+        short_entry=dead,
+        short_exit=dead,
+    )
 
 
 def _fx_series_grid(
@@ -169,6 +191,14 @@ class BacktraderAdapter(EngineAdapter):
 
         validate_long_only(signals, config.instrument.asset_class)
 
+        # §4.5 long-only gate at the engine layer (mirrors the vectorbt adapter / nautilus
+        # actor gates): a long-only asset class has nothing to borrow, so shorting is
+        # undefined for it. The adapter ignores short signals entirely here — even when
+        # the caller passes ``short_entry``/``short_exit`` rows, only long entries/exits
+        # are acted on and backtrader can never open a short position.
+        if not allows_short(config.instrument.asset_class):
+            signals = _neutralize_shorts(signals)
+
         overrides = validate_overrides(config.engine_overrides)
         cost_model: CostModel | None = (
             config.cost_model
@@ -219,6 +249,7 @@ class BacktraderAdapter(EngineAdapter):
             margin_account=margin_account,
             vol_arr=vol_arr,
             slip=slip,
+            starting_balance=starting_balance,
         )
         frame = to_signal_frame(data, signals)
         strat = run_backtrader(

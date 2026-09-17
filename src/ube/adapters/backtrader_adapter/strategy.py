@@ -22,10 +22,11 @@ that mirrors the other adapters' semantics on that loop:
   ``signal_records`` / ``order_records``; those (not the broker's cash) are what the adapter
   folds into the canonical ledger — the broker cash is only the *sizing* equity, and fills happen
   at raw open prices, with ``commission`` and ``slippage`` applied by the fold (§8).
-- **Final close**: an order placed on the last bar can never fill through the next-bar-open path,
-  so ``stop()`` realizes a position still open at the end at the final bar's close (an in-flight
-  exit keeps its reason; the remainder closes reasonless) — mirroring the reference adapter,
-  which realizes the final bar's exit at the bar close.
+- **Final bar**: an exit placed on the last bar can never fill through the next-bar-open path, so
+  ``stop()`` books an in-flight exit at the final bar's close (with its reason), mirroring the
+  reference adapter's same-bar fill. A position with no exit in flight is left *open* — the
+  references keep the final trade unrealized (realized PnL 0), so the ledger ends on an open
+  mark-to-market row rather than a reasonless close.
 """
 
 from __future__ import annotations
@@ -79,6 +80,7 @@ class BtRunContext:
     margin_account: float | None
     vol_arr: np.ndarray | None
     slip: float
+    starting_balance: float
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,16 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         self._pending_entry: dict[str, Any] | None = None
         self._pending_exit: dict[str, Any] | None = None
         self._pos: _OpenPosition | None = None
+        # §6.3 sizing capital: the reference (nautilus) actor sizes off the *unleveraged*
+        # realized net balance times the leverage — not the levered broker equity, which
+        # accrues PnL on the leveraged base and diverges from the reference from the second
+        # trade on. We track that balance ourselves: ``starting_balance`` plus the realized
+        # net PnL of every exited portion, computed at slipped fill prices and the core
+        # ``fill_cost`` fee (mirroring ``_net_pnl_per_unit`` in the vectorbt adapter), so
+        # quantities match the reference row for row. PnL is realized at exit *submission*:
+        # a flip sizes its re-entry in the same ``next()`` that submits the close, and the
+        # reference has already booked the closing trade's PnL before sizing the flip leg.
+        self._cash_balance = float(self._ctx.starting_balance)
         self.signal_records: list[BtSignalRecord] = []
         self.order_records: list[BtOrderRecord] = []
 
@@ -156,7 +168,12 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         if len(self.data) - 1 + 1 >= ctx.data.n_bars:
             return 0.0  # no next bar to fill on — entry cannot execute
         price = self._fill_price(side)
-        equity = float(self.broker.getvalue())
+        # §6.3 capital base: the *unleveraged* net cash balance scaled by the account
+        # leverage (the reference ``capital = balance × leverage``), tracked per fill in
+        # ``notify_order`` — not ``broker.getvalue()``, which is the levered equity that
+        # accrues PnL on the leveraged base. The sizer's own ``leverage`` knob is not
+        # re-applied here (the base is already leveraged), matching the nautilus actor.
+        equity = self._cash_balance * ctx.eff_leverage
         kwargs: dict[str, Any] = dict(
             capital=equity, price=price, cost_model=ctx.cost_model
         )
@@ -172,9 +189,9 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         # §8: mirrored reference ``NotionalSizer`` — size against the actual fill price
         # (next-bar open), not the decision close, and reserve the entry commission, so the
         # bookable notional *plus* fees can never exceed cash/leverage and the venue cannot
-        # spuriously reject a sized-for order. The broker equity is already the *leveraged*
-        # account (``starting_balance × leverage``), matching the reference sizing capital — the
-        # sizer's own ``leverage`` knob is not re-applied here. Cash-like classes book the full
+        # spuriously reject a sized-for order. The sizing capital is already leveraged
+        # (``cash_balance × eff_leverage``, see ``_cash_balance``) — the sizer's own
+        # ``leverage`` knob is not re-applied here. Cash-like classes book the full
         # notional; futures-like book margin = notional/lev via automargin ``1/lev``.
         fee_rate = (
             _entry_fee_rate(ctx.cost_model) if ctx.cost_model is not None else 0.0
@@ -202,13 +219,38 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             price = self._fill_price(side)
             notional = qty * price
             required = notional + float(fill_cost(ctx.cost_model, notional=notional))
-            capacity = float(self.broker.getvalue()) * ctx.eff_leverage
+            capacity = self._cash_balance * ctx.eff_leverage
             if required > capacity * (1.0 + 1e-9):
                 raise EngineError(
                     f"market order rejected by the venue: insufficient funds at bar "
                     f"{len(self.data) - 1} — requires {required:.6g}, available "
                     f"{capacity:.6g} {ctx.inst.settlement_currency}"
                 )
+
+    def _realize_exit_pnl(self, exit_side: int, qty: float) -> None:
+        """Book the realized net PnL of an exiting portion into ``_cash_balance`` (§6.3).
+
+        Mirrors the reference actor, which realizes a closing trade's net PnL (gross at
+        slipped fill prices minus the core ``fill_cost`` entry and exit fees) when it
+        closes — here at exit submission so a same-bar flip sizes its new leg on the
+        already-realized balance, exactly like the reference does before sizing the flip.
+        The entry leg is matched against the open position's raw fill price; both prices
+        are slipped the same way the fold slips them.
+        """
+        ctx = self._ctx
+        if self._pos is None or qty <= _FLAT_EPS or ctx.cost_model is None:
+            return
+        pos = self._pos
+        cost_model = ctx.cost_model
+        mult = ctx.inst.contract_multiplier
+        entry_slip = float(slipped_price(pos.entry_price, pos.side, ctx.slip))
+        exit_slip = self._fill_price(exit_side)
+        if not np.isfinite(exit_slip):
+            return
+        gross = pos.side * (exit_slip - entry_slip) * qty * mult
+        entry_fee = float(fill_cost(cost_model, notional=qty * entry_slip * mult))
+        exit_fee = float(fill_cost(cost_model, notional=qty * exit_slip * mult))
+        self._cash_balance += gross - entry_fee - exit_fee
 
     # ------------------------------------------------------------------
     # Next / per-bar event loop
@@ -254,6 +296,7 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                     exit_qty = min(ctx.inst.size_increment, open_units)
                 if exit_qty > _FLAT_EPS:
                     exit_side = -self._pos.side
+                    self._realize_exit_pnl(exit_side, exit_qty)
                     order = (
                         self.buy(size=exit_qty)
                         if exit_side == 1
@@ -388,37 +431,30 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                 self._pos = None
 
     def stop(self) -> None:
-        """Close any still-open position at the final bar's close (§4.5, §6.1).
+        """Realize an exit still in flight on the final bar; otherwise hold the position open.
 
         A market order submitted on the very last bar has no next bar to fill at, so its
         exit would otherwise be silently lost. Mirror the reference (Nautilus) adapter,
-        which realizes the final bar's exit at the bar close: an exit already in flight on
-        the final bar is booked with its own reason, and any remaining open quantity is
-        closed as a plain final close (reason ``None``). Both records use the raw final
-        close as fill price — the fold applies slippage like every other fill — and the
-        fold's running net returns to zero, so the ledger reproduces an honest closed
-        round trip instead of an open mark-to-market.
+        which fills the final bar's exit at the bar close: an exit already in flight is
+        booked here at the raw final close (the fold applies slippage like every other
+        fill) and keeps its reason. Any remaining open quantity is *not* force-closed —
+        the references leave a position with no exit signal open (realized PnL 0), so the
+        fold's running net stays non-zero and the ledger reproduces an open mark-to-market
+        row.
         """
         if self._pos is None or abs(self.position.size) <= _FLAT_EPS:
+            return
+        pending = self._pending_exit
+        if pending is None:
             return
         last = self._ctx.data.n_bars - 1
         close_price = float(self.data.close[0])
         total = abs(self.position.size)
-
-        pending = self._pending_exit
-        if pending is not None:
-            side = int(pending["side"])
-            qty = float(pending["size"])
-            self.order_records.append(
-                BtOrderRecord(last, last, side, qty, close_price, pending.get("reason"))
-            )
-            total -= qty
-            self._pending_exit = None
-
-        if total > _FLAT_EPS:
-            self.order_records.append(
-                BtOrderRecord(
-                    last, last, -self._pos.side, total, close_price, None
-                )
-            )
-        self._pos = None
+        side = int(pending["side"])
+        qty = float(pending["size"])
+        self.order_records.append(
+            BtOrderRecord(last, last, side, qty, close_price, pending.get("reason"))
+        )
+        self._pending_exit = None
+        if total - qty <= _FLAT_EPS:
+            self._pos = None
