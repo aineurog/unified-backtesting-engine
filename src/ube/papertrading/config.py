@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ube.core.calendar import TradingCalendar, resolve_calendar
 from ube.core.config import BacktestConfig
 
 __all__ = ["PaperConfig"]
@@ -38,16 +39,34 @@ class PaperConfig:
             account (default ``None`` → the adapter's ``DEFAULT_STARTING_BALANCE``).
         engine: The registered paper engine name (``"nautilus"`` by default). The
             registry is mirrored from :mod:`ube.adapters.base`.
+        calendar_validate: Whether to check incoming bars against the instrument's
+            declared trading calendar (§4.4). Default ``True`` — paper never silently
+            trades bars whose timestamps the declared calendar calls closed.
+        calendar_strict: When ``calendar_validate`` finds an out-of-session bar, raise
+            :class:`~ube.core.errors.CalendarMismatchError` (``True``, backtest parity)
+            instead of skipping the bar and warning (``False``, the paper default so one
+            bad bar never kills a long-running session).
     """
 
     base: BacktestConfig
     state_path: str | None = None
     starting_balance: float | None = None
     engine: str = "nautilus"
+    # Calendar gate for paper trading (§4.4): unlike backtests (which reject out-of-session
+    # bars hard via run.py), a paper session must not die on a single bad timestamp — by
+    # default off-session bars are skipped (and warned), with ``calendar_strict=True``
+    # opting into hard CalendarMismatchError parity with the backtest path. "24/7" labels
+    # are a no-op either way.
+    calendar_validate: bool = True
+    calendar_strict: bool = False
 
     def __post_init__(self) -> None:
         if self.starting_balance is not None and self.starting_balance <= 0:
             raise ValueError("starting_balance must be > 0")
+        if not isinstance(self.calendar_validate, bool):
+            raise ValueError("calendar_validate must be a bool")
+        if not isinstance(self.calendar_strict, bool):
+            raise ValueError("calendar_strict must be a bool")
         # Fold the convenience balance into the engine overrides so the backend sees a
         # single canonical config (no second source of truth for the balance).
         if self.starting_balance is not None:
@@ -64,3 +83,12 @@ class PaperConfig:
     def overrides(self) -> dict[str, Any]:
         """The engine overrides, as a plain dict (never ``None``)."""
         return dict(self.base.engine_overrides) if self.base.engine_overrides else {}
+
+    @property
+    def instrument_calendar(self) -> TradingCalendar:
+        """The resolved :class:`TradingCalendar` of ``base.instrument`` (§4.4).
+
+        ``None`` (no declared calendar) and ``"24/7"`` resolve to the always-open
+        calendar, so a paper session makes no calendar-derived checks for crypto (§4.5).
+        """
+        return resolve_calendar(self.base.instrument)

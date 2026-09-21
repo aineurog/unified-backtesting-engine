@@ -40,10 +40,10 @@ import pandas as pd
 
 from ube.adapters import get_engine, register_engine, resolve_engine_name
 from ube.core.benchmark import build_benchmark
-from ube.core.calendar import resolve_calendar, validate_in_session
+from ube.core.calendar import resolve_calendar, validate_in_session, validate_timestamps
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
-from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
+from ube.core.errors import ConfigError, DataShapeError, InvalidInstrumentError, InvalidSignalError
 from ube.core.experiment_log import DataReference, ExperimentLog, PortfolioDataReference
 from ube.core.result import BacktestResult, result_hash
 from ube.core.signals import Signals
@@ -299,6 +299,18 @@ def run(
         if config.date_range is not None:
             start, end = config.date_range
             data = {k: _slice_market_data(v, start, end)[0] for k, v in data.items()}
+        # Calendar validation (§4.4): each portfolio leg is checked against its *own*
+        # declared calendar — keys that are Instruments (or bare calendar names) resolve
+        # to their calendar; any other label carries no calendar and is skipped (no
+        # declared calendar ⇒ no calendar constraint, the §4.5 "24/7"/None reading).
+        for key, md in data.items():
+            try:
+                calendar = resolve_calendar(key)
+            except InvalidInstrumentError:
+                continue
+            if calendar.is_always_open:
+                continue
+            validate_timestamps(md.timestamps, calendar)
         ensure_builtin_engines_registered()
         engine_name = resolve_engine_name(config.engine)
         adapter_cls = get_engine(engine_name)

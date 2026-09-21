@@ -8,8 +8,10 @@ from ube.core.calendar import (
     CALENDAR_ALWAYS_OPEN,
     AlwaysOpenCalendar,
     ExchangeCalendar,
+    is_in_session,
     resolve_calendar,
     validate_in_session,
+    validate_timestamps,
 )
 from ube.core.data import MarketData
 from ube.core.errors import CalendarMismatchError, DataError, InvalidInstrumentError
@@ -115,3 +117,64 @@ def test_always_open_calendar_trivially_passes():
 
 def test_calendar_mismatch_error_is_a_data_error():
     assert issubclass(CalendarMismatchError, DataError)
+
+
+# ---------------------------------------------------------------------------
+# validate_timestamps (§4.4) — the shared timestamp validator.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_timestamps_passes_in_session_index():
+    cal = resolve_calendar("XNYS")
+    idx = pd.to_datetime(
+        ["2024-01-08 14:30", "2024-01-08 15:00", "2024-01-08 20:59"]
+    ).tz_localize("UTC")
+    validate_timestamps(idx, cal)  # must not raise
+
+
+def test_validate_timestamps_raises_on_any_out_of_session_timestamp():
+    cal = resolve_calendar("XNYS")
+    idx = pd.to_datetime(["2024-01-08 14:30", "2024-01-06 15:00"]).tz_localize(
+        "UTC"
+    )
+    with pytest.raises(CalendarMismatchError) as excinfo:
+        validate_timestamps(idx, cal)
+    assert "2024-01-06" in str(excinfo.value)
+
+
+def test_validate_timestamps_treats_naive_index_as_utc():
+    cal = resolve_calendar("XNYS")
+    # Naive timestamps are assumed UTC (§4.4), so 14:30 naive == 14:30 UTC, in session.
+    validate_timestamps(pd.to_datetime(["2024-01-08 14:30"]), cal)  # must not raise
+
+
+def test_validate_timestamps_passes_for_always_open():
+    cal = resolve_calendar("24/7")
+    idx = pd.to_datetime(["2024-01-06 15:00", "2024-01-07 03:00"]).tz_localize(
+        "UTC"
+    )
+    validate_timestamps(idx, cal)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# is_in_session (§4.4) — per-timestamp scalar check.
+# ---------------------------------------------------------------------------
+
+
+def test_is_in_session_weekday_membership():
+    cal = resolve_calendar("XNYS")
+    assert is_in_session("2024-01-08 15:00", cal)
+    assert not is_in_session("2024-01-08 13:00", cal)
+    assert not is_in_session("2024-01-06 15:00", cal)  # Saturday
+
+
+def test_is_in_session_treats_naive_string_as_utc():
+    cal = resolve_calendar("XNYS")
+    # Same instant as the tz-aware check above (passed as naive string, assumed UTC).
+    assert is_in_session("2024-01-08 15:00", cal)
+
+
+def test_is_in_session_always_open_short_circuits():
+    cal = resolve_calendar("24/7")
+    assert is_in_session("2024-01-06 03:00", cal)
+    assert is_in_session("2024-01-07 23:59", cal)

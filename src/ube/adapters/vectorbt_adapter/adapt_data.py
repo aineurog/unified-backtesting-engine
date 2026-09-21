@@ -99,12 +99,38 @@ class VbtSignalInputs:
     freq: str | None
 
 
+def _infer_freq(idx: pd.DatetimeIndex) -> str | None:
+    """Best-effort bar frequency for ``vbt.from_signals`` — never raises on short windows.
+
+    ``pd.infer_freq`` needs at least 3 dates and the live/paper feeds can run a 1-bar
+    window per step. Fall back to the observed bar spacing (or, for a single bar where no
+    spacing is observable, a 1-minute default — the value is only used for frequency
+    bookkeeping, never for bar arithmetic).
+    """
+    try:
+        freq = pd.infer_freq(idx)
+        if freq:
+            return str(freq)
+    except (ValueError, TypeError):
+        pass
+    try:
+        delta = (
+            pd.Timedelta(idx[1] - idx[0])
+            if len(idx) >= 2
+            else pd.Timedelta(minutes=1)
+        )
+        return str(pd.tseries.frequencies.to_offset(delta).freqstr)
+    except Exception:  # noqa: BLE001 - a bogus index must not block the call
+        return None
+
+
 def to_vbt_inputs(data: MarketData, signals: Signals) -> VbtSignalInputs:
     """Translate canonical ``MarketData`` + ``Signals`` into vectorbt pandas Series (§6.1).
 
     All Series share the bar index (``data.timestamps``); ``freq`` is inferred for
-    ``vbt.Portfolio.from_signals``. The four signal columns are taken verbatim from the
-    canonical container (``long_entry`` / ``long_exit`` / ``short_entry`` / ``short_exit``).
+    ``vbt.Portfolio.from_signals`` (see :func:`_infer_freq` for the short-window fallback).
+    The four signal columns are taken verbatim from the canonical container
+    (``long_entry`` / ``long_exit`` / ``short_entry`` / ``short_exit``).
     """
     idx = data.timestamps
     out = VbtSignalInputs()
@@ -116,5 +142,5 @@ def to_vbt_inputs(data: MarketData, signals: Signals) -> VbtSignalInputs:
     out.long_exits = pd.Series(signals.long_exit, index=idx)
     out.short_entries = pd.Series(signals.short_entry, index=idx)
     out.short_exits = pd.Series(signals.short_exit, index=idx)
-    out.freq = pd.infer_freq(idx)
+    out.freq = _infer_freq(idx)
     return out

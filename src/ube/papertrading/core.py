@@ -23,13 +23,17 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import warnings
 from collections.abc import Callable
 
 import numpy as np
+import pandas as pd
 import yaml  # type: ignore[import-untyped]
 
+from ube.core.calendar import TradingCalendar, validate_timestamps
 from ube.core.data import MarketData
 from ube.core.errors import (
+    CalendarMismatchError,
     ConfigError,
     DuplicateBarError,
     EngineError,
@@ -46,8 +50,10 @@ __all__ = [
     "PaperEngine",
     "RecordingBackend",
     "get_paper_engine",
+    "get_state_class",
     "init",
     "register_paper_engine",
+    "register_state_class",
     "run",
     "run_auto",
     "step",
@@ -55,6 +61,105 @@ __all__ = [
 
 # A tiny epsilon for open-position folds.
 _EPS = 1e-12
+
+
+# ---------------------------------------------------------------------------
+# Calendar gate (skip vs strict — §4.4).
+# ---------------------------------------------------------------------------
+
+
+def in_session_pair(
+    market_data: MarketData,
+    signals: Signals,
+    calendar: TradingCalendar,
+) -> tuple[MarketData, Signals] | None:
+    """Return the in-session subset of ``(data, signals)``, or ``None`` if none remain.
+
+    The paper engines call this on the incoming ``step`` slice so that off-session bars
+    (weekends for ``24/5``/exchange calendars) never produce orders. An always-open
+    calendar (``"24/7"``) returns the pair unchanged. When the slice is entirely
+    off-session, ``None`` is returned so the caller can short-circuit (no bars → no
+    events). Bars are dropped, never re-timed: the ledger timestamps that survive are
+    the original session timestamps, so paper results stay comparable to the backtest
+    (§9.4). Callers gate this on ``config.calendar_validate`` and translate strict mode
+    (raise :class:`~ube.core.errors.CalendarMismatchError` instead) via
+    :func:`~ube.core.calendar.validate_timestamps`.
+    """
+    if calendar.is_always_open:
+        return market_data, signals
+    mask = calendar.session_mask(market_data.timestamps)
+    if bool(mask.all()):
+        return market_data, signals
+    keep = np.flatnonzero(mask)
+    if keep.size == 0:
+        return None
+    index = market_data.timestamps[keep]
+    return (
+        MarketData(
+            open=market_data.open[keep],
+            high=market_data.high[keep],
+            low=market_data.low[keep],
+            close=market_data.close[keep],
+            volume=market_data.volume[keep],
+            index=index,
+        ),
+        Signals(
+            long_entry=signals.long_entry[keep],
+            long_exit=signals.long_exit[keep],
+            short_entry=signals.short_entry[keep],
+            short_exit=signals.short_exit[keep],
+        ),
+    )
+
+
+def apply_calendar_policy(
+    market_data: MarketData,
+    signals: Signals,
+    config: PaperConfig,
+    *,
+    engine_label: str,
+) -> tuple[MarketData, Signals] | None:
+    """Apply the paper session's calendar policy to a ``step`` slice (§4.4).
+
+    ``calendar_validate=False`` and always-open calendars are no-ops. Otherwise, with
+    ``calendar_strict=True`` an off-session bar raises
+    :class:`~ube.core.errors.CalendarMismatchError` (backtest parity); by default the
+    off-session bars are dropped (and warned) so one bad timestamp never kills a
+    long-running session, and ``None`` signals that no in-session bars remain.
+    """
+    if not config.calendar_validate:
+        return market_data, signals
+    calendar = config.instrument_calendar
+    if calendar.is_always_open:
+        return market_data, signals
+    if config.calendar_strict:
+        validate_timestamps(market_data.timestamps, calendar)
+        return market_data, signals
+    filtered = in_session_pair(market_data, signals, calendar)
+    if filtered is None:
+        last_ts = pd.Timestamp(market_data.timestamps[-1])
+        nxt = calendar.next_open_after(last_ts)
+        when = (
+            f" next open {nxt.isoformat(sep=' ')}"
+            if nxt is not None
+            else " (no future session found)"
+        )
+        warnings.warn(
+            f"{engine_label}: market closed for "
+            f"{getattr(config.base.instrument, 'symbol', calendar.name)!r} — all "
+            f"{market_data.n_bars} incoming bar(s) fall outside the declared trading "
+            f"calendar {calendar.name!r};{when}; skipping this slice",
+            stacklevel=3,
+        )
+        return None
+    kept_data, kept_signals = filtered
+    if kept_data.n_bars < market_data.n_bars:
+        warnings.warn(
+            f"{engine_label}: dropped {market_data.n_bars - kept_data.n_bars} bar(s) "
+            f"outside the declared trading calendar {calendar.name!r} (§4.4 skip mode)",
+            stacklevel=3,
+        )
+    return kept_data, kept_signals
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +214,7 @@ def register_paper_engine(name: str, engine: type[PaperEngine]) -> None:
 
 
 def get_paper_engine(name: str = "nautilus") -> type[PaperEngine]:
-    """Resolve the backend class for ``name``; lazily import the nautilus backend."""
+    """Resolve the backend class for ``name``; lazily import a backend on first use."""
     key = _normalize(name)
     if key not in _REGISTRY:
         if key == "nautilus":
@@ -120,11 +225,63 @@ def get_paper_engine(name: str = "nautilus") -> type[PaperEngine]:
                     "the nautilus paper backend requires nautilus-trader to be "
                     f"installed: {exc}"
                 ) from exc
+        elif key == "vectorbt":
+            try:
+                importlib.import_module("ube.papertrading.vbt")  # self-registers
+            except ImportError as exc:
+                raise EngineError(
+                    "the vectorbt paper backend requires vectorbt to be "
+                    f"installed: {exc}"
+                ) from exc
         else:
             raise ConfigError(
                 f"unknown paper engine {name!r}; registered: {sorted(_REGISTRY) or 'none'}"
             )
     return _REGISTRY[key]
+
+
+# ---------------------------------------------------------------------------
+# State-class registry (engine-specific PaperState subclasses).
+# ---------------------------------------------------------------------------
+
+
+_STATE_REGISTRY: dict[str, type[PaperState]] = {"nautilus": PaperState}
+
+
+def register_state_class(name: str, state_cls: type[PaperState]) -> None:
+    """Register the :class:`PaperState` subclass used by paper engine ``name``."""
+    key = _normalize(name)
+    if not isinstance(state_cls, type) or not issubclass(state_cls, PaperState):
+        raise ConfigError(
+            f"register_state_class({name!r}, ...) expects a PaperState subclass; "
+            f"got {state_cls!r}"
+        )
+    _STATE_REGISTRY[key] = state_cls
+
+
+def get_state_class(name: str | None = "nautilus") -> type[PaperState]:
+    """Resolve the state class for paper engine ``name`` (lazy-loading the backend).
+
+    ``None``/``""``/unknown engines resolve to the base :class:`PaperState` — the plan's
+    backward-compatibility rule for configs that predate the engine tag. ``"vectorbt"``
+    lazily imports :mod:`ube.papertrading.vbt` (which self-registers) so ``core`` never
+    hard-depends on the optional ``vectorbt`` package.
+    """
+    if name is None or (isinstance(name, str) and not name.strip()):
+        return PaperState
+    key = _normalize(name)
+    if key not in _STATE_REGISTRY:
+        if key == "vectorbt":
+            try:
+                importlib.import_module("ube.papertrading.vbt")  # self-registers
+            except ImportError as exc:
+                raise EngineError(
+                    "the vectorbt paper backend requires vectorbt to be "
+                    f"installed: {exc}"
+                ) from exc
+        else:
+            return PaperState
+    return _STATE_REGISTRY.get(key, PaperState)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +357,8 @@ def init(
     # db_path may come from config.state_path if not explicitly passed
     if db_path is None:
         db_path = config.state_path
-    return PaperState(
+    state_cls = get_state_class(config.engine)
+    return state_cls(
         instrument_id=instrument.symbol,
         ledger=EventLedger(),
         last_processed_ns=None,
@@ -271,8 +429,21 @@ def step(
     if not (np.diff(ts) > 0).all():
         raise DuplicateBarError("paper bars must be strictly increasing in time")
     # Idempotency (§9.6): replay protection. A bar at or before the cursor is a
-    # stale/duplicate and must never be reprocessed.
-    if state.last_processed_ns is not None and (ts <= state.last_processed_ns).any():
+    # stale/duplicate and must never be reprocessed. The vectorbt backend is the one
+    # exception: it *must* re-read context bars (the carried entry, or an indicator
+    # warmup) before the cursor each call, so a "window call" that advances the cursor is
+    # allowed; a slice that does not advance it is still a duplicate.
+    is_vbt = isinstance(config.engine, str) and config.engine.strip().lower() == "vectorbt"
+    is_vbt_window_call = (
+        is_vbt
+        and state.last_processed_ns is not None
+        and int(ts[-1]) > int(state.last_processed_ns)
+    )
+    if (
+        not is_vbt_window_call
+        and state.last_processed_ns is not None
+        and (ts <= state.last_processed_ns).any()
+    ):
         raise DuplicateBarError(
             f"bar timestamp {int(ts[ts <= state.last_processed_ns][0])} is not after "
             f"last_processed_ns={state.last_processed_ns} (idempotency, §9.6)"
@@ -289,12 +460,18 @@ def step(
         raise
     except EngineError:
         raise
+    except CalendarMismatchError:
+        # §4.4 strict mode: the declared calendar has authority — surface the data error
+        # unchanged (backtest parity) instead of wrapping it as an execution failure.
+        raise
     except Exception as exc:  # noqa: BLE001 — wrap engine failure as §15 EngineError
         raise EngineError(f"paper engine {config.engine!r} failed: {exc}") from exc
 
     for event in new_events:
         state.ledger.append(event)
-    if new_events:
+    if new_events or is_vbt:
+        # The vectorbt window re-reads bars <= the cursor, so a window call that produces
+        # no *new* events still advances the cursor past the bars it just evaluated.
         state.last_processed_ns = int(ts[-1])
     # Persist the last close so equity can be derived on resume even though bars are not
     # stored (plan blocker #5). Used to mark the open position to market on reload.
@@ -467,10 +644,9 @@ def run(
         pass
 
     # load-or-init (the try-load-fallback every caller was hand-rolling)
+    state_cls = get_state_class(config.engine)
     try:
-        from ube.papertrading.state import PaperState as _PS
-
-        state = _PS.load(str(effective_db), run_id=str(effective_run_id))
+        state = state_cls.load(str(effective_db), run_id=str(effective_run_id))
         # ensure the loaded state knows its persistence location for auto-save
         state.db_path = str(effective_db)
         state.run_id = str(effective_run_id)
@@ -614,6 +790,14 @@ class RecordingBackend(PaperEngine):
         config: PaperConfig,
     ) -> list[LedgerEvent]:
         from ube.core.cost import fill_cost, resolve_cost_model, slipped_price
+
+        # §4.4 calendar gate — the same policy every engine enforces: skip off-session
+        # bars (warned) by default, raise CalendarMismatchError when strict. The front-end
+        # (step/run/run_auto) reaches this via PaperEngine.execute in every backend.
+        filtered = apply_calendar_policy(data, signals, config, engine_label="recording")
+        if filtered is None:
+            return []
+        data, signals = filtered
 
         instrument = config.base.instrument
         asset_class = instrument.asset_class if isinstance(instrument, Instrument) else ""

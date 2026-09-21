@@ -39,6 +39,9 @@ __all__ = [
     "ExchangeCalendar",
     "resolve_calendar",
     "validate_in_session",
+    "validate_timestamps",
+    "is_in_session",
+    "next_open_after",
 ]
 
 #: The calendar reference that means "always open" (crypto — §4.5).
@@ -86,6 +89,15 @@ class TradingCalendar(ABC):
         Two timestamps in the same trading session share an ordinal.
         """
 
+    def next_open_after(self, ts: Any) -> pd.Timestamp | None:
+        """The next session open (UTC) strictly after ``ts``, or ``None``.
+
+        Used by the paper engines to tell the operator *when* a market that is
+        currently closed will reopen (e.g. ``APPL: market closed — next open
+        2026-09-21 14:30:00 UTC``). Always-open calendars return ``ts`` itself.
+        """
+        return None
+
 
 class AlwaysOpenCalendar(TradingCalendar):
     """A calendar that is always open (crypto ``"24/7"`` — §4.5)."""
@@ -103,6 +115,10 @@ class AlwaysOpenCalendar(TradingCalendar):
     def session_index(self, index: pd.DatetimeIndex) -> np.ndarray:
         # One logical session spanning all time; every bar is "in session".
         return np.zeros(len(index), dtype=np.int64)
+
+    def next_open_after(self, ts: Any) -> pd.Timestamp | None:
+        # Always open — the market is never closed, so it is already open at ``ts``.
+        return pd.Timestamp(ts)
 
 
 class ExchangeCalendar(TradingCalendar):
@@ -138,6 +154,28 @@ class ExchangeCalendar(TradingCalendar):
         in_session = valid & (ts >= open_candidate) & (ts <= close_candidate)
         return np.where(in_session, pos, -1).astype(np.int64)
 
+    def next_open_after(self, ts: Any) -> pd.Timestamp | None:
+        stamp = pd.Timestamp(ts)
+        stamp = (
+            stamp.tz_localize("UTC")
+            if stamp.tzinfo is None
+            else stamp.tz_convert("UTC")
+        )
+        # Query the schedule across a generous horizon (a week) so weekends and multi-day
+        # holiday closures are covered. `_calendar.schedule` needs a range, not an index.
+        start = stamp.normalize()
+        end = start + pd.Timedelta(days=7)
+        try:
+            schedule = self._calendar.schedule(start, end)
+        except Exception:
+            return None
+        opens = pd.DatetimeIndex(schedule["market_open"])
+        opens = opens.tz_convert("UTC")
+        future = opens[opens > stamp]
+        if len(future) == 0:
+            return None
+        return pd.Timestamp(future[0])
+
 
 def resolve_calendar(reference: str | Instrument | None = None) -> TradingCalendar:
     """Resolve a calendar reference to a :class:`TradingCalendar` (§4.5).
@@ -170,6 +208,88 @@ def resolve_calendar(reference: str | Instrument | None = None) -> TradingCalend
     return ExchangeCalendar(canonical, calendar)
 
 
+def validate_timestamps(ts_index: pd.DatetimeIndex, calendar: TradingCalendar) -> None:
+    """Raise :class:`~ube.core.errors.CalendarMismatchError` for out-of-session timestamps.
+
+    A timestamp that falls where the calendar says the market is *closed* means the data
+    contradicts the declared calendar — a §15 data error, never silently accepted.
+    Always-open calendars (``"24/7"``) trivially pass. This is the calendar's only
+    Phase-1 validation: it rejects bars that *should not exist*, and deliberately does
+    not try to detect or repair bars that *should exist but do not* (§4.4).
+
+    This is the shared single-timestamp/array validator: the data-driven backtest path
+    (:func:`validate_in_session`), the portfolio branch, and the event-driven paper
+    engines all run on it, so every engine enforces the *same* declared calendar.
+
+    Args:
+        ts_index: A tz-aware UTC ``DatetimeIndex`` of compiled bar/event timestamps.
+        calendar: The resolved :class:`TradingCalendar` for the instrument.
+
+    Raises:
+        CalendarMismatchError: If any timestamp is outside the declared calendar.
+    """
+    if calendar.is_always_open:
+        return
+    session = calendar.session_index(ts_index)
+    out_of_session = session < 0
+    if out_of_session.any():
+        i = int(np.argmax(out_of_session))
+        raise CalendarMismatchError(
+            f"bar {i} at {ts_index[i]} is outside the declared trading calendar "
+            f"{calendar.name!r}"
+        )
+
+
+def is_in_session(ts: Any, calendar: TradingCalendar) -> bool:
+    """Whether a single timestamp falls inside the declared calendar.
+
+    The scalar form of :func:`validate_timestamps` for event/bar-driven engines (paper
+    backends) that decide per-bar whether to act. An always-open calendar (``"24/7"``)
+    short-circuits to ``True``. The timestamp is coerced to the tz-aware UTC grid the
+    calendars require (naive timestamps are assumed UTC, which matches ``MarketData``).
+
+    Args:
+        ts: A single timestamp (``pd.Timestamp``-coercible, naive or tz-aware).
+        calendar: The resolved :class:`TradingCalendar` for the instrument.
+
+    Returns:
+        ``True`` when the calendar says the market is open at ``ts``.
+    """
+    if calendar.is_always_open:
+        return True
+    stamp = pd.Timestamp(ts)
+    stamp = (
+        stamp.tz_localize("UTC")
+        if stamp.tzinfo is None
+        else stamp.tz_convert("UTC")
+    )
+    index = pd.DatetimeIndex([stamp.as_unit("ns")])
+    return bool((calendar.session_index(index) >= 0)[0])
+
+
+def next_open_after(
+    ts: Any,
+    calendar: TradingCalendar,
+) -> pd.Timestamp | None:
+    """The next session open (UTC) strictly after a timestamp, or ``None``.
+
+    The operator-facing form of :meth:`TradingCalendar.next_open_after` — used by the
+    paper engines to report *when* a currently-closed market reopens (e.g. the AAPL
+    weekend/off-hours skip warning). Always-open calendars return ``ts`` itself; an
+    exchange calendar returns the first ``market_open`` at or after the next scheduled
+    session (a one-week horizon covers weekends and multi-day holiday closures).
+
+    Args:
+        ts: A single timestamp (``pd.Timestamp``-coercible, naive or tz-aware).
+        calendar: The resolved :class:`TradingCalendar` for the instrument.
+
+    Returns:
+        The UTC open of the next session strictly after ``ts``, or ``None`` when the
+        schedule cannot be determined (e.g. an exchange with no future sessions).
+    """
+    return calendar.next_open_after(ts)
+
+
 def validate_in_session(market_data: MarketData, calendar: TradingCalendar) -> None:
     """Raise :class:`~ube.core.errors.CalendarMismatchError` for out-of-session bars.
 
@@ -179,6 +299,9 @@ def validate_in_session(market_data: MarketData, calendar: TradingCalendar) -> N
     Phase-1 validation: it rejects bars that *should not exist*, and deliberately does
     not try to detect or repair bars that *should exist but do not* (§4.4).
 
+    Thin wrapper over :func:`validate_timestamps` so the whole-dataset path shares the
+    single validator implementation.
+
     Args:
         market_data: The canonical bar container.
         calendar: The resolved :class:`TradingCalendar` for the instrument.
@@ -186,14 +309,4 @@ def validate_in_session(market_data: MarketData, calendar: TradingCalendar) -> N
     Raises:
         CalendarMismatchError: If any bar timestamp is outside the declared calendar.
     """
-    if calendar.is_always_open:
-        return
-    ts = market_data.timestamps
-    session = calendar.session_index(ts)
-    out_of_session = session < 0
-    if out_of_session.any():
-        i = int(np.argmax(out_of_session))
-        raise CalendarMismatchError(
-            f"bar {i} at {ts[i]} is outside the declared trading calendar "
-            f"{calendar.name!r}"
-        )
+    validate_timestamps(market_data.timestamps, calendar)

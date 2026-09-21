@@ -22,10 +22,10 @@ from ube.adapters.nautilus_adapter.adapt_data import build_bar_type
 from ube.adapters.nautilus_adapter.instrument_map import build_instrument
 from ube.core.cost import resolve_cost_model
 from ube.core.data import max_price_decimals
-from ube.core.errors import EngineError
+from ube.core.errors import CalendarMismatchError, EngineError
 from ube.core.instrument import Instrument, allows_short
 from ube.core.ledger import EventType, LedgerEvent
-from ube.papertrading.core import PaperEngine, register_paper_engine
+from ube.papertrading.core import PaperEngine, apply_calendar_policy, register_paper_engine
 
 from .node import build_node, run_node
 from .runtime import reset_ready_event
@@ -75,6 +75,10 @@ class NautilusPaperEngine(PaperEngine):
 
         canonical = config.base.instrument
         asset_class = canonical.asset_class if isinstance(canonical, Instrument) else ""
+        filtered = apply_calendar_policy(data, signals, config, engine_label="nautilus paper")
+        if filtered is None:
+            return []
+        data, signals = filtered
         overrides = dict(config.base.engine_overrides) if config.base.engine_overrides else {}
         no_short = not allows_short(asset_class)
         # Explicit account-type mapping (fix 4): long-only (crypto_spot, stocks) => CASH
@@ -352,6 +356,9 @@ class NautilusPaperEngine(PaperEngine):
                     ),
                 )
             return events
+        except CalendarMismatchError:
+            # §4.4 strict mode: surface the calendar error unchanged (backtest parity).
+            raise
         except Exception as exc:  # pragma: no cover - defensive
             raise EngineError(
                 f"nautilus paper backend failed: {exc}"

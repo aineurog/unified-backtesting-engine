@@ -39,7 +39,8 @@ from ube.adapters.vectorbt_adapter.overrides import (
 )
 from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel
-from ube.core.errors import ConfigError, DataShapeError, EngineError, InvalidSignalError
+from ube.core.data import MarketData
+from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
 from ube.core.experiment_log import ExperimentLog
 from ube.core.ledger import EventType
 from ube.core.result import BacktestResult
@@ -211,6 +212,20 @@ def test_to_vbt_inputs_returns_aligned_series():
     assert bool(inp.entries.iloc[1])  # long entry at signal bar
     exit_bar = int(np.argmax(sig.long_exit))
     assert bool(inp.long_exits.iloc[exit_bar])
+
+
+def test_to_vbt_inputs_tolerates_short_windows():
+    # The paper engine feeds 1-2 bar windows per step; pd.infer_freq needs >=3 dates,
+    # so to_vbt_inputs must fall back to the observed spacing (or a per-bar default).
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=3)
+    ts = md.timestamps.as_unit("ns")
+    one = MarketData(open=md.open[:1], high=md.high[:1], low=md.low[:1],
+                     close=md.close[:1], volume=md.volume[:1], index=ts[:1])
+    two = MarketData(open=md.open[:2], high=md.high[:2], low=md.low[:2],
+                     close=md.close[:2], volume=md.volume[:2], index=ts[:2])
+    assert to_vbt_inputs(one, from_target([0])).freq is not None
+    assert to_vbt_inputs(two, from_target([0, 0])).freq is not None
+    assert to_vbt_inputs(md, from_target([0, 0, 0])).freq == "h"
 
 
 # ---------------------------------------------------------------------------
@@ -572,13 +587,18 @@ def test_vectorbt_run_rejects_row_misaligned_signals():
         )
 
 
-def test_vectorbt_run_rejects_single_bar_data():
+def test_vectorbt_run_tolerates_single_bar_data():
+    # 1-bar windows (the paper engine's per-step feed) previously crashed on
+    # pd.infer_freq("Need at least 3 dates"); the freq fallback makes them valid.
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=1)
     sig = from_target([0])
-    with pytest.raises((EngineError, DataShapeError, ValueError)):
-        VectorbtAdapter().run(
-            md, sig, BacktestConfig(instrument=PRESETS["futures"].instrument)
-        )
+    res = VectorbtAdapter().run(
+        md, sig, BacktestConfig(instrument=PRESETS["futures"].instrument)
+    )
+    # Completes (no frequency-inference crash) and only books the opening cash movement.
+    assert res.ledger.events and all(
+        e.event_type is EventType.CASH_MOVEMENT for e in res.ledger.events
+    )
 
 
 def test_vectorbt_ignores_short_signals_on_long_only_crypto_spot():
