@@ -37,6 +37,7 @@ from ube.core.cost import resolve_cost_model
 from ube.core.data import MarketData
 from ube.core.errors import EngineError
 from ube.core.instrument import Instrument, allows_short
+from ube.core.ledger import EventType
 from ube.core.risk.exits import ATRStop, ChandelierExit
 from ube.core.signals import Signals
 from ube.papertrading.core import (
@@ -57,6 +58,23 @@ from .state import (
 __all__ = ["VbtPaperEngine"]
 
 _PERIOD_FALLBACK_NS = 60_000_000_000
+
+
+def _ledger_has_cash(ledger: Any) -> bool:
+    """True when the persisted ledger already contains a cash event.
+
+    The adapter's ``_fold`` books the window-start balance as an inflow at ``bar_ts[0]``
+    (§4.6). On the first (cold) run that event is the true initial deposit; once any cash
+    event is already persisted, the checkpoint is *derived from* it and a fresh inflow at
+    the window start would double-count — so warm windows must not emit a new seed.
+    """
+    events = getattr(ledger, "events", None)
+    if not events:
+        return False
+    return any(
+        event.event_type is EventType.CASH_MOVEMENT
+        for event in events
+    )
 
 
 def _max_atr_period(risk: Any) -> int:
@@ -305,10 +323,31 @@ class VbtPaperEngine(PaperEngine):
         )
         result = VectorbtAdapter().run(win_data, encoded, vbt_config)
 
+        events = list(result.ledger.events)
+        # The adapter books the *window-start* balance as a cash inflow at ``bar_ts[0]``
+        # (§4.6) so sizing has an account to draw from. On the very first (cold) window
+        # that event is the real initial deposit and must persist. On every later (warm)
+        # step the checkpoint is *derived from* the already-persisted ledger, so a fresh
+        # +checkpoint inflow at the window start would double-count the balance and
+        # silently inflate the ledger (and the next checkpoint) whenever that bar falls
+        # strictly after the cursor. Emit the seed only for the cold window.
+        if events and _ledger_has_cash(state.ledger):
+            seed_ts = int(win_ts[0])
+            events = [
+                event
+                for event in events
+                if not (
+                    event.event_type is EventType.CASH_MOVEMENT
+                    and int(event.timestamp) == seed_ts
+                    and event.amount is not None
+                    and abs(float(event.amount) - float(checkpoint)) < 1e-9
+                )
+            ]
+
         cutoff = None if cursor is None else int(cursor)
         return [
             event
-            for event in result.ledger.events
+            for event in events
             if cutoff is None or int(event.timestamp) > cutoff
         ]
 

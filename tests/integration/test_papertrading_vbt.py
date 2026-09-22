@@ -277,3 +277,52 @@ def test_resume_carries_entry_when_signal_fn_does_not_reemit_it() -> None:
     assert [t[0] for t in got] == [1, -1]
     assert got[0][2] == 1_704_078_000_000_000_000  # entry bar 3
     assert state.open_position is None  # the bar-15 short is closed by bar 20's 0
+
+
+def test_gapped_resume_does_not_double_book_starting_balance() -> None:
+    # Regression: a warm window whose first bar falls strictly after the cursor (a data
+    # gap right after the flat last-close bar, e.g. the missing 1m bars observed in real
+    # XAUUSD history) used to leak the window-start ``+starting_balance`` cash event into
+    # the persisted ledger on every resume — inflating the ledger and the next checkpoint
+    # by exactly the checkpoint amount, on top of the single initial deposit.
+    data = synthetic_bars(PRESETS[AC], n_bars=24)
+    # Window 1: long entered at bar 4, closed (flat) at bar 9.
+    first = from_target(np.array([0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0]))
+    cfg = _config()
+    import tempfile
+    from pathlib import Path
+
+    from ube.core.ledger import EventType
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        run("x", _slice_md(data, slice(0, 12)), _slice_sig(first, slice(0, 12)), cfg, db_path=db)
+        # Window 2 SKIPS bars 10-11 (10m missing histogram) and re-enters at bar 12 — the
+        # resume window starts at bar 12, strictly after the cursor at bar 11.
+        second_full = np.zeros(24, dtype=int)
+        second_full[12:18] = 1
+        second = from_target(second_full)
+        state, _ = run(
+            "x",
+            _slice_md(data, slice(12, 24)),
+            _slice_sig(second, slice(12, 24)),
+            cfg,
+            db_path=db,
+        )
+
+    # The +10000 initial deposit may be booked EXACTLY ONCE. Entry/exit cash legs are
+    # legitimate; the bug was a second window-start re-seed (amount == the checkpoint,
+    # not the initial 10000) when a warm window's first bar fell strictly after the
+    # cursor.
+    seeds = [
+        e
+        for e in state.ledger.events
+        if e.event_type is EventType.CASH_MOVEMENT
+        and e.amount is not None
+        and abs(float(e.amount) - 10_000.0) < 1e-9
+    ]
+    assert len(seeds) == 1, (
+        f"initial deposit booked {len(seeds)} times (double-booking leak): "
+        f"{[c.amount for c in seeds]}"
+    )
