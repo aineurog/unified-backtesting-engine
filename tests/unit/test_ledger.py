@@ -169,6 +169,69 @@ def test_ledger_filters_by_instrument_id():
 
 
 # ---------------------------------------------------------------------------
+# Chronological placement of out-of-order events (async fills).
+# ---------------------------------------------------------------------------
+
+
+def test_append_places_late_event_chronologically():
+    ledger = EventLedger()
+    order = LedgerEvent(
+        EventType.ORDER_SUBMITTED, 1, "A", order_id="o1", side=1, quantity=10.0
+    )
+    exit_fill = _fill(2, "A", -1, 10.0, 110.0)
+    ledger.append(order)
+    ledger.append(exit_fill)
+    # The open fill's timestamp precedes events already recorded (asynchronously
+    # delivered one bar after submission): it must be inserted before them.
+    entry_fill = _fill(1, "A", 1, 10.0, 100.0)
+    ledger.append(entry_fill)
+    assert [e.timestamp for e in ledger.events] == [1, 1, 2]
+    assert ledger.events[0] is order
+    assert ledger.events[1] is entry_fill
+    assert ledger.events[2] is exit_fill
+
+
+def test_append_keeps_equal_timestamp_emission_order():
+    ledger = EventLedger()
+    first = _fill(5, "A", 1, 1.0, 100.0)
+    second = _fill(5, "A", -1, 1.0, 101.0)
+    ledger.append(first)
+    ledger.append(second)
+    # A late event sharing the timestamp lands after the existing ones.
+    late = _commission(5, "A", 1.0)
+    ledger.append(late)
+    assert [e.timestamp for e in ledger.events] == [5, 5, 5]
+    assert ledger.events == (first, second, late)
+
+
+def test_constructor_orders_disordered_input():
+    # The state-load path (_ledger_from_json) rebuilds via the constructor, so a
+    # persisted ledger recorded out of order is repaired on load.
+    ledger = EventLedger(
+        [_fill(2, "A", -1, 10.0, 110.0), _fill(0, "A", 1, 10.0, 100.0), _fill(1, "A", 1, 1.0, 105.0)]
+    )
+    assert [e.timestamp for e in ledger.events] == [0, 1, 2]
+
+
+def test_trades_after_late_open_fill_folds_entry_before_exit():
+    t1, t2 = 1, 2
+    ledger = EventLedger()
+    order = LedgerEvent(
+        EventType.ORDER_SUBMITTED, t1, "A", order_id="o1", side=1, quantity=10.0
+    )
+    ledger.append(order)
+    ledger.append(_fill(t2, "A", -1, 10.0, 110.0))
+    ledger.append(_fill(t1, "A", 1, 10.0, 100.0))
+    (t,) = trades(ledger)
+    assert t.side == 1
+    assert t.entry_timestamp == t1
+    assert t.exit_timestamp == t2
+    assert t.exit_timestamp > t.entry_timestamp
+    assert t.entry_price == pytest.approx(100.0)
+    assert t.exit_price == pytest.approx(110.0)
+
+
+# ---------------------------------------------------------------------------
 # trades view (round-trip fold).
 # ---------------------------------------------------------------------------
 

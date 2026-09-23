@@ -37,6 +37,7 @@ Design summary
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -304,12 +305,19 @@ class LedgerEvent:
 
 
 class EventLedger:
-    """Append-only container of :class:`LedgerEvent` entries (§4.6, §5 principle 5).
+    """Chronologically-ordered container of :class:`LedgerEvent` entries (§4.6, §5 principle 5).
 
-    The ledger is the one deliberately-mutable object per run — but only by appending.
-    Entries are frozen :class:`LedgerEvent` instances and the snapshot returned by
-    :attr:`events` is an immutable tuple, so already-appended entries cannot be mutated
+    The ledger is the one deliberately-mutable object per run — but only by adding
+    entries. Entries are frozen :class:`LedgerEvent` instances and the snapshot returned
+    by :attr:`events` is an immutable tuple, so already-added entries cannot be mutated
     or replaced. Portfolio backtests filter by instrument via :meth:`by_instrument`.
+
+    :meth:`append` places each entry at its timestamp (the common case is a plain
+    append to the end), so append order always equals chronological order. That
+    invariant matters because ``trades()`` folds entries in append order: an
+    asynchronously delivered event (e.g. a fill whose timestamp precedes events
+    already recorded) is inserted in place instead of landing after them and
+    flipping the fold.
     """
 
     def __init__(self, events: Iterable[LedgerEvent] = ()) -> None:
@@ -318,16 +326,27 @@ class EventLedger:
             self.append(event)
 
     def append(self, event: LedgerEvent) -> None:
-        """Append ``event`` to the end of the ledger (the only mutation allowed)."""
+        """Add ``event`` at its timestamp (the only mutation allowed).
+
+        Normally this appends to the end. An event older than the last recorded
+        entry is inserted after any existing entries sharing its timestamp, so
+        same-timestamp emission order is preserved (stable placement).
+        """
         if not isinstance(event, LedgerEvent):
             raise DataShapeError(
                 f"EventLedger.append expects a LedgerEvent; got {type(event).__name__}"
             )
-        self._events.append(event)
+        if not self._events or event.timestamp >= self._events[-1].timestamp:
+            self._events.append(event)
+            return
+        idx = bisect.bisect_right(
+            self._events, event.timestamp, key=lambda e: e.timestamp
+        )
+        self._events.insert(idx, event)
 
     @property
     def events(self) -> tuple[LedgerEvent, ...]:
-        """An immutable snapshot of the appended entries, in append order."""
+        """An immutable snapshot of the entries, in chronological (append) order."""
         return tuple(self._events)
 
     def by_instrument(self, instrument_id: str) -> tuple[LedgerEvent, ...]:

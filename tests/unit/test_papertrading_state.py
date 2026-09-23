@@ -52,9 +52,13 @@ def test_save_load_round_trip(tmp_path) -> None:
     assert loaded.open_position == state.open_position
     events = loaded.ledger.events
     assert len(events) == 3
+    # The persisted ledger recorded the commission out of order (ts 1000 after the
+    # ts 2000 close); the load path reorders entries chronologically, so append
+    # order equals timestamp order after a round trip.
+    assert [e.timestamp for e in events] == [1_000, 1_000, 2_000]
     assert events[0].event_type is EventType.FILL
     assert events[0].price == 100.0
-    assert events[2].amount == 0.05
+    assert events[1].amount == 0.05
 
 
 def test_load_missing_file(tmp_path) -> None:

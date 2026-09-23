@@ -417,6 +417,31 @@ class PaperState:
         self.run_id: str | None = run_id
         self.db_path: str | None = db_path
 
+    def window_start_ns(self, *, warmup_ns: int = 0) -> int:
+        """The int64-ns start of the context window this engine needs to resume (§6.1).
+
+        Shared across every engine state so the live runners fetch one *common* context
+        window ("from trade open to the latest closed bar") regardless of engine:
+
+        * Open position — the carried entry bar: the window must contain the entry so a
+          stateless/recomputable backend re-opens and manages the carried trade.
+        * Flat — the processed cursor (plus any ``warmup_ns`` indicator context).
+
+        Backends that need more context (e.g. ATR warmup) override this method; the base
+        implements the nautilus convention, whose engine only needs the bars after the
+        cursor and trims the fetched window to them anyway.
+        """
+        if self.open_position is not None:
+            return int(self.open_position.entry_ns)
+        base = int(self.last_processed_ns) if self.last_processed_ns is not None else 0
+        if self.ledger.events:
+            first = int(self.ledger.events[0].timestamp)
+            if base == 0 or first < base:
+                base = first
+        if warmup_ns > 0:
+            return base - int(warmup_ns)
+        return base
+
     def get_config_dict(self) -> dict[str, Any] | None:
         """Return the stored ``BacktestConfig`` as a dict, or ``None`` if absent.
 

@@ -190,6 +190,13 @@ class PaperEngine:
         """Execute one slice of bars and return the new ledger events."""
         raise NotImplementedError
 
+    # Whether the backend re-reads context bars at-or-before the idempotency cursor on
+    # every call (window replay, §9.6). ``True`` for recompute-from-window engines
+    # (vectorbt, backtrader) — the runner fetches "from trade open to the latest bar" and
+    # the engine re-slices to its own ``window_start_ns``; ``False`` for incremental
+    # engines (nautilus), whose runner trims each fetch to bars after the cursor.
+    WINDOW_REPLAY: bool = False
+
 
 _REGISTRY: dict[str, type[PaperEngine]] = {}
 
@@ -233,6 +240,14 @@ def get_paper_engine(name: str = "nautilus") -> type[PaperEngine]:
                     "the vectorbt paper backend requires vectorbt to be "
                     f"installed: {exc}"
                 ) from exc
+        elif key == "backtrader":
+            try:
+                importlib.import_module("ube.papertrading.backtrader")  # self-registers
+            except ImportError as exc:
+                raise EngineError(
+                    "the backtrader paper backend requires ube[paper-trading] [backtrader] "
+                    f"to be installed: {exc}"
+                ) from exc
         else:
             raise ConfigError(
                 f"unknown paper engine {name!r}; registered: {sorted(_REGISTRY) or 'none'}"
@@ -264,8 +279,8 @@ def get_state_class(name: str | None = "nautilus") -> type[PaperState]:
 
     ``None``/``""``/unknown engines resolve to the base :class:`PaperState` — the plan's
     backward-compatibility rule for configs that predate the engine tag. ``"vectorbt"``
-    lazily imports :mod:`ube.papertrading.vbt` (which self-registers) so ``core`` never
-    hard-depends on the optional ``vectorbt`` package.
+    and ``"backtrader"`` lazily import their respective backends (which self-register) so
+    ``core`` never hard-requires either optional package.
     """
     if name is None or (isinstance(name, str) and not name.strip()):
         return PaperState
@@ -273,14 +288,24 @@ def get_state_class(name: str | None = "nautilus") -> type[PaperState]:
     if key not in _STATE_REGISTRY:
         if key == "vectorbt":
             try:
-                importlib.import_module("ube.papertrading.vbt")  # self-registers
+                importlib.import_module("ube.papertrading.vbt")  # self-registers via register_state_class
             except ImportError as exc:
                 raise EngineError(
                     "the vectorbt paper backend requires vectorbt to be "
                     f"installed: {exc}"
                 ) from exc
+        elif key == "backtrader":
+            try:
+                importlib.import_module("ube.papertrading.backtrader")  # self-registers via register_state_class
+            except ImportError as exc:
+                raise EngineError(
+                    "the backtrader paper backend requires ube[paper-trading] [backtrader] "
+                    f"to be installed: {exc}"
+                ) from exc
         else:
             return PaperState
+    # After lazy import, the backend's ``register_state_class`` has already added the
+    # subclass to ``_STATE_REGISTRY``; fall through to fetch it.
     return _STATE_REGISTRY.get(key, PaperState)
 
 
@@ -429,18 +454,19 @@ def step(
     if not (np.diff(ts) > 0).all():
         raise DuplicateBarError("paper bars must be strictly increasing in time")
     # Idempotency (§9.6): replay protection. A bar at or before the cursor is a
-    # stale/duplicate and must never be reprocessed. The vectorbt backend is the one
-    # exception: it *must* re-read context bars (the carried entry, or an indicator
-    # warmup) before the cursor each call, so a "window call" that advances the cursor is
-    # allowed; a slice that does not advance it is still a duplicate.
-    is_vbt = isinstance(config.engine, str) and config.engine.strip().lower() == "vectorbt"
-    is_vbt_window_call = (
-        is_vbt
+    # stale/duplicate and must never be reprocessed. Window-replay engines (vectorbt,
+    # backtrader) are the exception: they *must* re-read context bars (the carried entry,
+    # or an indicator warmup) before the cursor each call, so a "window call" that
+    # advances the cursor is allowed; a slice that does not advance it is still a
+    # duplicate.
+    engine_cls = get_paper_engine(config.engine)
+    is_window_call = (
+        bool(getattr(engine_cls, "WINDOW_REPLAY", False))
         and state.last_processed_ns is not None
         and int(ts[-1]) > int(state.last_processed_ns)
     )
     if (
-        not is_vbt_window_call
+        not is_window_call
         and state.last_processed_ns is not None
         and (ts <= state.last_processed_ns).any()
     ):
@@ -452,7 +478,6 @@ def step(
     # feeds and are not replays. The plan previously conflated gaps with stale/duplicate
     # by requiring contiguity; that requirement is dropped (plan blocker #9).
 
-    engine_cls = get_paper_engine(config.engine)
     try:
         engine = engine_cls()
         new_events = engine.execute(state=state, data=data, signals=signals, config=config)
@@ -469,9 +494,9 @@ def step(
 
     for event in new_events:
         state.ledger.append(event)
-    if new_events or is_vbt:
-        # The vectorbt window re-reads bars <= the cursor, so a window call that produces
-        # no *new* events still advances the cursor past the bars it just evaluated.
+    if new_events or is_window_call:
+        # A window-replay engine re-reads bars <= the cursor, so a window call that
+        # produces no *new* events still advances the cursor past the bars it evaluated.
         state.last_processed_ns = int(ts[-1])
     # Persist the last close so equity can be derived on resume even though bars are not
     # stored (plan blocker #5). Used to mark the open position to market on reload.
