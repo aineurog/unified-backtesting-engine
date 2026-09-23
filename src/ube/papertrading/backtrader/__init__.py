@@ -7,10 +7,13 @@ Importing this package self-registers the ``"backtrader"`` engine and its
 
 from __future__ import annotations
 
-from ube.papertrading.core import register_paper_engine, register_state_class  # type: ignore[attr-defined]  noqa: F401
+from ube.papertrading.core import (  # noqa: F401
+    register_paper_engine,
+    register_state_class,
+)
 
-from .backend import BacktraderPaperEngine  # type: ignore[attr-defined]  noqa: F401
-from .state import BacktraderPaperState  # type: ignore[attr-defined]  noqa: F401
+from .backend import BacktraderPaperEngine  # noqa: F401
+from .state import BacktraderPaperState  # noqa: F401
 
-register_paper_engine("backtrader", BacktraderPaperEngine)  # type: ignore[attr-defined]
-register_state_class("backtrader", BacktraderPaperState)  # type: ignore[attr-defined]
+register_paper_engine("backtrader", BacktraderPaperEngine)
+register_state_class("backtrader", BacktraderPaperState)

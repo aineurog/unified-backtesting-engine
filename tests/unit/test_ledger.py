@@ -208,7 +208,11 @@ def test_constructor_orders_disordered_input():
     # The state-load path (_ledger_from_json) rebuilds via the constructor, so a
     # persisted ledger recorded out of order is repaired on load.
     ledger = EventLedger(
-        [_fill(2, "A", -1, 10.0, 110.0), _fill(0, "A", 1, 10.0, 100.0), _fill(1, "A", 1, 1.0, 105.0)]
+        [
+            _fill(2, "A", -1, 10.0, 110.0),
+            _fill(0, "A", 1, 10.0, 100.0),
+            _fill(1, "A", 1, 1.0, 105.0),
+        ]
     )
     assert [e.timestamp for e in ledger.events] == [0, 1, 2]
 

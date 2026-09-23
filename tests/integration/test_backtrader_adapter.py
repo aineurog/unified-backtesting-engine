@@ -32,6 +32,7 @@ from ube.adapters.backtrader_adapter.adapt_data import (
     bar_timestamps_ns,
     to_signal_frame,
 )
+from ube.adapters.backtrader_adapter.adapter import BacktraderAdapter
 from ube.adapters.backtrader_adapter.exits import (
     atr_from_aux,
     build_exit_plan,
@@ -55,25 +56,6 @@ from ube.core.risk import RiskConfig, SizeModel
 from ube.core.risk.exits import ATRStop, ChandelierExit, TakeProfit, TimeExit, TrailingStop
 from ube.core.signals import from_target
 from ube.testing.synthetic import PRESETS, synthetic_bars
-
-try:
-    import backtrader  # noqa: F401
-except ImportError:  # pragma: no cover - optional dependency
-    backtrader = None
-
-# The end-to-end path imports the strategy/engine/adapter modules that require backtrader.
-if backtrader is not None:
-    from ube.adapters.backtrader_adapter.adapter import BacktraderAdapter
-    from ube.adapters.backtrader_adapter.engine import run_backtrader
-    from ube.adapters.backtrader_adapter.strategy import BtRunContext
-else:  # pragma: no cover - exercised only without backtrader
-    BacktraderAdapter = None  # type: ignore[assignment,misc]
-    run_backtrader = None  # type: ignore[assignment,misc]
-    BtRunContext = None  # type: ignore[assignment,misc]
-
-_requires_bt = pytest.mark.skipif(
-    backtrader is None, reason="backtrader not installed"
-)
 
 
 def _fills(result):
@@ -285,7 +267,7 @@ def test_atr_from_aux_has_no_lookahead_shift():
 # ---------------------------------------------------------------------------
 
 
-@_requires_bt
+
 def test_full_loop_futures_signal_roundtrip():
     # Entry signal at bar 1 -> market order fills at bar 2 open; long_exit at bar 4 ->
     # fills at bar 5 open (backtrader's next-bar-open execution).
@@ -325,7 +307,7 @@ def test_full_loop_futures_signal_roundtrip():
     assert not _ledger_events(result, EventType.FUNDING_PAYMENT)
 
 
-@_requires_bt
+
 def test_full_loop_flat_run_stays_flat():
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
     result = BacktraderAdapter().run(
@@ -341,7 +323,7 @@ def test_full_loop_flat_run_stays_flat():
     assert (result.equity_curve.equity == 100000.0).all()
 
 
-@_requires_bt
+
 def test_full_loop_crypto_perp_books_fees_and_funding():
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
     result = BacktraderAdapter().run(
@@ -375,7 +357,7 @@ def test_full_loop_crypto_perp_books_fees_and_funding():
     assert trade.exit_reason == "signal"
 
 
-@_requires_bt
+
 def test_full_loop_crypto_perp_short():
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
     result = BacktraderAdapter().run(
@@ -395,7 +377,7 @@ def test_full_loop_crypto_perp_short():
     assert trade.exit_reason == "signal"
 
 
-@_requires_bt
+
 def test_trailing_stop_stamps_exit_reason():
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
     result = BacktraderAdapter().run(
@@ -415,7 +397,7 @@ def test_trailing_stop_stamps_exit_reason():
     assert float(result.equity_curve.equity[-1]) > 0.0
 
 
-@_requires_bt
+
 def test_time_exit_executes_and_stamps_reason():
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
     # Entry signal bar 1 -> fill bar 2 open; TimeExit(2) fires at entry_bar + 2 = bar 4,
@@ -437,7 +419,7 @@ def test_time_exit_executes_and_stamps_reason():
     assert fills[1].price == pytest.approx(float(md.open[5]), abs=1e-6)
 
 
-@_requires_bt
+
 def test_full_loop_flip_within_same_bar_submits_exit_then_entry():
     # 1 -> -1 flip at bar 2: from_target emits long_exit + short_entry on that bar. The
     # strategy submits the exit first, then (gated) the opposing entry — both fill at bar 3
@@ -476,7 +458,7 @@ def test_full_loop_flip_within_same_bar_submits_exit_then_entry():
     assert len(result.trades) == 2
 
 
-@_requires_bt
+
 def test_full_loop_final_bar_exit_signal_realizes_at_last_close():
     # Exit signal on the very last bar (target flat at bar 11): the order can't fill
     # next-bar-open, so stop() realizes it at the final bar's close with the signal reason
@@ -501,7 +483,7 @@ def test_full_loop_final_bar_exit_signal_realizes_at_last_close():
     assert float(result.equity_curve.equity[-1]) == pytest.approx(cash, abs=1e-6)
 
 
-@_requires_bt
+
 def test_full_loop_sizing_uses_realized_net_balance_times_leverage():
     # §6.3 — the reference (paper/nautilus) sizes off ``(starting_balance + realized net
     # PnL) * leverage`` — the *unleveraged* balance scaled afterwards — NOT the levered
@@ -538,7 +520,7 @@ def test_full_loop_sizing_uses_realized_net_balance_times_leverage():
     )
 
 
-@_requires_bt
+
 def test_full_loop_open_position_stays_open_without_signal():
     # No exit ever signalled: the final trade is left OPEN (realized PnL 0.0), marked to
     # market through the last bar — mirroring the paper/nautilus references, which do not
@@ -568,7 +550,7 @@ def test_full_loop_open_position_stays_open_without_signal():
     )
 
 
-@_requires_bt
+
 def test_take_profit_scale_out_partial_close():
     # TakeProfit with scale_out=0.5 closes half, then the signal exit closes the rest.
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=20)
@@ -594,7 +576,7 @@ def test_take_profit_scale_out_partial_close():
     assert sum(e.quantity for e in fills[1:]) == pytest.approx(entry_qty, abs=1e-6)
 
 
-@_requires_bt
+
 def test_volatility_target_sizing_runs():
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
     aux = {"vol_1h": synthetic_bars(PRESETS["futures"], seed=3, n_bars=12)}
@@ -614,7 +596,7 @@ def test_volatility_target_sizing_runs():
     assert result.trades[0].quantity > 0
 
 
-@_requires_bt
+
 def test_volatility_target_missing_vol_key_raises():
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
     with pytest.raises(ConfigError, match="volatility_target"):
@@ -631,7 +613,7 @@ def test_volatility_target_missing_vol_key_raises():
         )
 
 
-@_requires_bt
+
 def test_aux_atr_stop_runs_with_aux_data():
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=20)
     aux = {"atr_1h": synthetic_bars(PRESETS["crypto_perp"], seed=1, n_bars=20)}
@@ -648,7 +630,7 @@ def test_aux_atr_stop_runs_with_aux_data():
     assert len(result.trades) >= 1
 
 
-@_requires_bt
+
 def test_aux_guard_raises_without_aux_data():
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=20)
     with pytest.raises(ConfigError, match="aux_data"):
@@ -668,7 +650,7 @@ def test_aux_guard_raises_without_aux_data():
 # ---------------------------------------------------------------------------
 
 
-@_requires_bt
+
 def test_run_rejects_non_market_data_input():
     sig = from_target([0, 1, 0, 0])
     with pytest.raises(DataShapeError, match="MarketData"):
@@ -679,7 +661,7 @@ def test_run_rejects_non_market_data_input():
         )
 
 
-@_requires_bt
+
 def test_run_rejects_non_signals_input():
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=4)
     with pytest.raises(InvalidSignalError, match="Signals"):
@@ -690,7 +672,7 @@ def test_run_rejects_non_signals_input():
         )
 
 
-@_requires_bt
+
 def test_run_rejects_non_backtest_config():
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=4)
     sig = from_target([0, 1, 0, 0])
@@ -698,7 +680,7 @@ def test_run_rejects_non_backtest_config():
         BacktraderAdapter().run(md, sig, object())  # type: ignore[arg-type]
 
 
-@_requires_bt
+
 def test_run_rejects_row_misaligned_signals():
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=8)
     sig = from_target([0, 1, 0, 0])
@@ -708,7 +690,7 @@ def test_run_rejects_row_misaligned_signals():
         )
 
 
-@_requires_bt
+
 def test_backtrader_ignores_short_signals_on_long_only_crypto_spot():
     # crypto_spot is the engine's one long-only class (§4.5): shorting is undefined
     # (nothing to borrow), so the backtrader adapter ignores short_entry/short_exit at
@@ -727,7 +709,7 @@ def test_backtrader_ignores_short_signals_on_long_only_crypto_spot():
     assert len(result.trades) == 0
 
 
-@_requires_bt
+
 def test_backtrader_crypto_spot_drops_short_leg_of_flip_keeps_long_exit():
     # A flip encoding (long held, then short_entry) is legal (§6.2) but its short leg is
     # dead for a long-only class: the adapter keeps the long_exit (a long-side action)
@@ -746,7 +728,7 @@ def test_backtrader_crypto_spot_drops_short_leg_of_flip_keeps_long_exit():
     assert len(result.trades) == 1  # the long trade, not a short
 
 
-@_requires_bt
+
 def test_backtrader_short_signals_still_accepted_for_shortable_asset_class():
     # Long-only neutralization is scoped to classes that cannot short (§4.5); a
     # shortable class (crypto_perp) still opens and closes shorts normally.
@@ -765,7 +747,7 @@ def test_backtrader_short_signals_still_accepted_for_shortable_asset_class():
 # ---------------------------------------------------------------------------
 
 
-@_requires_bt
+
 def test_run_end_to_end_via_ube_run_with_backtrader(tmp_path):
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
     signals = from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
@@ -788,7 +770,7 @@ def test_run_end_to_end_via_ube_run_with_backtrader(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@_requires_bt
+
 def test_handles_all_asset_classes_with_lot_quantization():
     for key in ["stocks", "futures", "commodities", "forex", "crypto_perp"]:
         preset = PRESETS[key]

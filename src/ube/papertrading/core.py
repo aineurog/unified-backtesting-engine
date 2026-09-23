@@ -288,7 +288,8 @@ def get_state_class(name: str | None = "nautilus") -> type[PaperState]:
     if key not in _STATE_REGISTRY:
         if key == "vectorbt":
             try:
-                importlib.import_module("ube.papertrading.vbt")  # self-registers via register_state_class
+                # The module self-registers via `register_state_class`.
+                importlib.import_module("ube.papertrading.vbt")
             except ImportError as exc:
                 raise EngineError(
                     "the vectorbt paper backend requires vectorbt to be "
@@ -296,7 +297,8 @@ def get_state_class(name: str | None = "nautilus") -> type[PaperState]:
                 ) from exc
         elif key == "backtrader":
             try:
-                importlib.import_module("ube.papertrading.backtrader")  # self-registers via register_state_class
+                # The module self-registers via `register_state_class`.
+                importlib.import_module("ube.papertrading.backtrader")
             except ImportError as exc:
                 raise EngineError(
                     "the backtrader paper backend requires ube[paper-trading] [backtrader] "

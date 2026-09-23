@@ -32,15 +32,6 @@ from ube.core.risk import RiskConfig
 from ube.core.risk.sizing import SizeModel
 from ube.core.signals import from_target
 
-try:
-    import backtrader  # noqa: F401
-except ImportError:  # pragma: no cover - optional dependency
-    backtrader = None
-
-_requires_bt = pytest.mark.skipif(
-    backtrader is None, reason="backtrader not installed"
-)
-
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 
 #: The five canonical asset classes of §16 — matching the Nautilus parity lock.
@@ -121,7 +112,7 @@ def _locked(asset_class: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@_requires_bt
+
 @pytest.mark.parametrize("asset_class", sorted(PARITY_ASSETS))
 def test_backtrader_parity_matches_locked(asset_class: str):
     result = _parity_result(asset_class)

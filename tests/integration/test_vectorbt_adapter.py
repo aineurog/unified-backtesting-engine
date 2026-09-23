@@ -24,7 +24,7 @@ from ube.adapters.vectorbt_adapter.adapt_data import (
     to_vbt_inputs,
 )
 from ube.adapters.vectorbt_adapter.adapter import VectorbtAdapter
-from ube.adapters.vectorbt_adapter.engine import build_portfolio, vbt
+from ube.adapters.vectorbt_adapter.engine import build_portfolio
 from ube.adapters.vectorbt_adapter.exits import (
     atr_from_aux,
     classify_exit_reason,
@@ -290,7 +290,6 @@ def test_atr_from_aux_has_no_lookahead_shift():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(vbt is None, reason="vectorbt not installed")
 def test_build_portfolio_returns_records():
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
     sig = from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
