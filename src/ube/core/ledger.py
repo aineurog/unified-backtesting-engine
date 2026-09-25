@@ -692,26 +692,33 @@ def _freeze_trade(mt: _MutableTrade) -> Trade:
 
 def _process_fill(
     state: _FoldState,
-    out: list[Trade],
+    completed: list[_MutableTrade],
     event: LedgerEvent,
     multiplier: float = 1.0,
-) -> None:
+) -> list[_MutableTrade]:
     """Fold one ``fill`` event into round-trip trades (sequential, per instrument).
 
     ``multiplier`` is the instrument's ``contract_multiplier`` (§4.6): notional is
     ``quantity × price × multiplier``.
+
+    Returns the mutable trade(s) the fill operated on *in emission order*, so the
+    caller can pair the fill's cost events with the right trade. A round trip closed
+    by this fill is appended to ``completed`` **without freezing**: it must stay
+    mutable until the rest of the bar's cost events have been attributed (a same-bar
+    flip's exit-leg commission has to land on the outgoing trade, not the new one).
     """
     iid = event.instrument_id
     q = float(cast(int, event.side)) * float(cast(float, event.quantity))
     p = float(cast(float, event.price))
     pos = state.position.get(iid, 0.0)
 
+    touched: list[_MutableTrade] = []
     remaining = q
     while abs(remaining) > _EPS:
         if abs(pos) < _EPS:
             prev = state.current.get(iid)
             if prev is not None and (prev.entry_units > 0.0 or prev.exit_units > 0.0):
-                out.append(_freeze_trade(prev))
+                completed.append(prev)
             mt = _MutableTrade(
                 iid, 1 if remaining > 0.0 else -1, event.timestamp, multiplier=multiplier
             )
@@ -742,8 +749,10 @@ def _process_fill(
             remaining -= close_q
             if abs(mt.entry_units - mt.exit_units) < _EPS:
                 mt.exit_timestamp = event.timestamp
+        touched.append(mt)
 
     state.position[iid] = pos
+    return touched
 
 
 def _fold_trades(
@@ -754,24 +763,51 @@ def _fold_trades(
     Returns the completed round-trip trades (in entry order) and the per-instrument
     open accumulators (positions still held at the end of the run, keyed by
     ``instrument_id``).
+
+    Adapters emit the events of one bar in fill-before-cost order (kind-rank sort), so
+    a same-bar flip's close and re-open fills are both folded before their commissions.
+    Cost events carry no fill link, so each ``commission`` is paired with the trade the
+    immediately preceding fill at that bar operated on via a per-instrument FIFO keyed
+    by timestamp (adapters emit one cost per fill). A round trip closed by a fill is
+    only frozen at the bar boundary, so an exit-leg commission still lands on the
+    outgoing trade. ``funding_payment`` events follow the older rule and are allocated
+    to the open trade (or, while flat, the most-recently-closed one).
     """
     state = _FoldState(position={}, current={})
     out: list[Trade] = []
+    touches: dict[str, list[_MutableTrade]] = {}
+    completed: list[_MutableTrade] = []
+    current_bar: int | None = None
+
+    def _flush_bar() -> None:
+        for mt in completed:
+            out.append(_freeze_trade(mt))
+        completed.clear()
+        touches.clear()
 
     for event in ledger:
+        bar = event.timestamp
+        if current_bar is not None and bar != current_bar:
+            _flush_bar()
+        current_bar = bar
         t = event.event_type
         iid = event.instrument_id
         if t is EventType.FILL:
-            _process_fill(state, out, event, _contract_multiplier(instruments, iid))
-        elif t is EventType.COMMISSION or t is EventType.FUNDING_PAYMENT:
+            touched = _process_fill(
+                state, completed, event, _contract_multiplier(instruments, iid)
+            )
+            touches.setdefault(iid, []).extend(touched)
+        elif t is EventType.COMMISSION:
+            q = touches.get(iid)
+            mt = q.pop(0) if q else state.current.get(iid)
+            if mt is not None:
+                mt.commission += cast(float, event.amount)
+        elif t is EventType.FUNDING_PAYMENT:
             mt = state.current.get(iid)
             if mt is not None:
-                amount = cast(float, event.amount)
-                if t is EventType.COMMISSION:
-                    mt.commission += amount
-                else:
-                    mt.funding += amount
+                mt.funding += cast(float, event.amount)
 
+    _flush_bar()
     for mt in state.current.values():
         if mt.exit_units > 0.0 and abs(mt.entry_units - mt.exit_units) < _EPS:
             out.append(_freeze_trade(mt))
@@ -788,10 +824,13 @@ def trades(
     position, accumulates same-direction fills into a volume-weighted entry and
     opposite-direction fills into a volume-weighted exit, and closes when the position
     returns to flat (a flip through zero closes the old trade and opens a new one).
-    ``commission`` and ``funding_payment`` events are allocated to the open trade (or,
-    if the position is already flat, the most-recently-closed trade); a cost with no
-    associated round trip is not represented here (it still lives in the ledger and
-    affects equity via the cash-flow aggregation).
+    ``commission`` events are paired with the fill that generated them (a cost landing
+    on the same bar as a flip is charged to the trade that fill operated on, so the
+    exit-leg commission stays with the outgoing trade); ``funding_payment`` events are
+    allocated to the open trade (or, if the position is already flat, the
+    most-recently-closed trade); a cost with no associated round trip is not represented
+    here (it still lives in the ledger and affects equity via the cash-flow
+    aggregation).
 
     Notional is ``quantity × price × contract_multiplier`` (§4.6): ``instruments``
     supplies the multiplier (default ``1.0`` when ``None``). Only *closed* round trips

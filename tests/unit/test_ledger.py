@@ -319,6 +319,39 @@ def test_trades_commission_after_close_attaches_to_last_trade():
     assert result[0].commission == pytest.approx(7.0)
 
 
+def test_trades_same_bar_flip_attributes_commissions_to_correct_trades():
+    # A same-bar flip: the exit fill fully closes trade 1 and the entry fill opens
+    # trade 2 at the same bar. Both fills are folded before the bar's cost events, so
+    # the exit-leg commission must land on the trade being closed — not on the newly
+    # opened one (the backtrader paper engine books flip re-entries on the same bar,
+    # so a mis-attribution here charges one trade for the other's exit fee).
+    ledger = EventLedger(
+        [
+            _fill(0, "A", -1, 1.0, 100.0),   # open short
+            _commission(0, "A", 5.0),        # entry-leg commission of the short
+            _fill(1, "A", 1, 1.0, 101.0),    # exit the short
+            _fill(1, "A", 1, 1.0, 101.0),    # re-enter long (same bar)
+            _commission(1, "A", 7.0),        # exit-leg commission of the short
+            _commission(1, "A", 9.0),        # entry-leg commission of the long
+            _fill(2, "A", -1, 1.0, 102.0),   # exit the long
+            _commission(2, "A", 11.0),       # exit-leg commission of the long
+        ]
+    )
+    result = trades(ledger)
+    assert len(result) == 2
+    short_t, long_t = result
+    assert short_t.side == -1
+    assert short_t.quantity == pytest.approx(1.0)
+    assert short_t.commission == pytest.approx(5.0 + 7.0)
+    assert short_t.gross_pnl == pytest.approx(-1.0)  # sold 100, covered 101
+    assert short_t.net_pnl == pytest.approx(-13.0)
+    assert long_t.side == 1
+    assert long_t.quantity == pytest.approx(1.0)
+    assert long_t.commission == pytest.approx(9.0 + 11.0)
+    assert long_t.gross_pnl == pytest.approx(1.0)  # bought 101, sold 102
+    assert long_t.net_pnl == pytest.approx(-19.0)
+
+
 # ---------------------------------------------------------------------------
 # positions view.
 # ---------------------------------------------------------------------------
