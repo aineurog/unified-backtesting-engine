@@ -47,6 +47,7 @@ from ube.adapters.backtrader_adapter.overrides import (
 )
 from ube.adapters.backtrader_adapter.strategy import (
     BacktraderStrategy,
+    BtCarriedFill,
     BtOrderRecord,
     BtRunContext,
 )
@@ -154,6 +155,8 @@ class BacktraderAdapter(EngineAdapter):
         config: BacktestConfig,
         *,
         aux_data: Mapping[str, Any] | None = None,
+        carried: BtCarriedFill | None = None,
+        carry_final_exit: bool = False,
     ) -> BacktestResult:
         """Run a backtest via backtrader (§4.5).
 
@@ -164,6 +167,15 @@ class BacktraderAdapter(EngineAdapter):
             aux_data: Optional derived-series map (§5.2) referenced by name from ATR exits
                 and volatility_target sizing (``vol`` series must be supplied by the caller;
                 volatility is never computed from the signal data bars, §6.3).
+            carried: The position carried into ``data`` by a paper-trading resume (§3).
+                ``data[0]`` must be the carried entry's fill bar; the strategy holds it from
+                bar 0 instead of re-executing it. ``None`` for a fresh backtest and the
+                cold paper window.
+            carry_final_exit: When True, an exit still in flight on the final bar is left
+                open (not force-realized in ``stop()``), so a continuation window re-derives
+                and fills it at its genuine next-bar open. The paper backend sets this for
+                every window; standalone backtests leave the default (the final-bar close
+                booking).
 
         Returns:
             The canonical :class:`~ube.core.result.BacktestResult`.
@@ -250,6 +262,8 @@ class BacktraderAdapter(EngineAdapter):
             vol_arr=vol_arr,
             slip=slip,
             starting_balance=starting_balance,
+            carried=carried,
+            carry_final_exit=carry_final_exit,
         )
         frame = to_signal_frame(data, signals)
         strat = run_backtrader(
@@ -268,6 +282,7 @@ class BacktraderAdapter(EngineAdapter):
             starting_balance=starting_balance,
             funding_interval_hours=funding_interval_hours,
             slip=slip,
+            carried=carried,
         )
 
         # Multi-currency normalization (§4.6): build FXSeries from the synthetic-rates
@@ -305,8 +320,16 @@ class BacktraderAdapter(EngineAdapter):
         starting_balance: float,
         funding_interval_hours: float,
         slip: float,
+        carried: BtCarriedFill | None = None,
     ) -> EventLedger:
-        """Fold the strategy's signal/order records into a canonical append-only ledger (§4.6)."""
+        """Fold the strategy's signal/order records into a canonical append-only ledger (§4.6).
+
+        ``carried`` seeds the running signed position when the window resumes a persisted
+        open position (the strategy holds it, so no fill row is re-booked for it): the
+        ``position_after`` steps — and therefore the funding payments derived from them —
+        must be *cumulative* across the carried entry, exactly as a single full-window run
+        would fold them, not relative to the window's flat start.
+        """
         bar_ts = bar_timestamps_ns(data)
 
         sorted_events: list[tuple[int, int, int, LedgerEvent]] = []
@@ -361,7 +384,9 @@ class BacktraderAdapter(EngineAdapter):
         # Orders in strict submission order (chronological for market orders — see
         # strategy docstring; a flip places the exit first, then the entry, so the fold
         # reproduces the exact fill order).
-        net: float = 0.0
+        net: float = (
+            float(carried.side) * float(carried.quantity) if carried is not None else 0.0
+        )
         for orec in strat.order_records:
             _order_submitted(int(bar_ts[orec.submit_bar]), orec.side, orec.quantity)
             net += orec.side * orec.quantity
@@ -396,6 +421,20 @@ class BacktraderAdapter(EngineAdapter):
                 ],
                 dtype=np.float64,
             )
+            if carried is not None:
+                # The carried entry has no fill row in this window, so the position step
+                # series would be flat (0) until the first *new* fill. Prepend the carried
+                # step at the window's first bar (the entry bar) so the open notional /
+                # side series accrue funding across the carried leg exactly as a single
+                # full-window fold would (§24). ``step_timestamps`` keeps the last value
+                # on timestamp ties, so a same-bar new fill overrides it correctly.
+                entry_ns = int(bar_ts[0])
+                pc_ts = np.concatenate(
+                    ([entry_ns], pc_ts),
+                )
+                pc_val = np.concatenate(
+                    ([float(carried.side) * float(carried.quantity)], pc_val),
+                )
             step_ts, step_value = step_timestamps(pc_ts, pc_val)
             # §4.5/§24: the schedule travels with the instrument metadata, mirroring the
             # nautilus adapter's ``resolve_funding_interval_hours``.

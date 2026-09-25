@@ -1,0 +1,406 @@
+"""Integration tests for the backtrader paper backend (``engine="backtrader"``).
+
+Drives the real :class:`~ube.adapters.backtrader_adapter.adapter.BacktraderAdapter` through the
+paper ``init``/``run`` API over synthetic ``crypto_perp`` bars, and asserts the defining
+property of the recomputable backend: folding a long history in *multiple* windows produces
+exactly the ledger a single full-window run produces (including same-bar flips and carried
+positions), because every window re-derives its start and checkpoint balance from state.
+
+Unlike vectorbt (which fills at the signal bar), backtrader fills market orders at the
+*next* bar's open, so the entry/first-exit timestamps here are one bar later than the
+vectorbt mirrors (e.g. a bar-4 signal fills at bar 5 = ``1704085200000000000``).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from ube.core.config import BacktestConfig, SignalConfig
+from ube.core.data import MarketData
+from ube.core.errors import EngineError
+from ube.core.ledger import EventType, trades
+from ube.core.risk.exits import ATRStop, TakeProfit
+from ube.core.signals import Signals, from_target
+from ube.papertrading import get_paper_engine, get_state_class, init, run
+from ube.papertrading.backtrader.backend import (
+    BacktraderPaperEngine,
+    _apply_policy,
+    _max_atr_period,
+    _zero_at_or_before,
+)
+from ube.papertrading.backtrader.state import BacktraderPaperState
+from ube.papertrading.config import PaperConfig
+from ube.testing.synthetic import PRESETS, synthetic_bars
+
+AC = "crypto_perp"
+
+
+def _config(**kw: object) -> PaperConfig:
+    instr = PRESETS[AC].instrument
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+    )
+    return PaperConfig(base=bc, engine="backtrader", starting_balance=10_000.0, **kw)
+
+
+def _slice_md(md: MarketData, sl: slice) -> MarketData:
+    sliced = MarketData.__new__(MarketData)  # type: ignore[call-arg]
+    object.__setattr__(sliced, "open", md.open[sl])
+    object.__setattr__(sliced, "high", md.high[sl])
+    object.__setattr__(sliced, "low", md.low[sl])
+    object.__setattr__(sliced, "close", md.close[sl])
+    object.__setattr__(sliced, "volume", md.volume[sl])
+    object.__setattr__(sliced, "index", md.index[sl])
+    return sliced
+
+
+def _slice_sig(sig: Signals, sl: slice) -> Signals:
+    return Signals(
+        long_entry=sig.long_entry[sl],
+        long_exit=sig.long_exit[sl],
+        short_entry=sig.short_entry[sl],
+        short_exit=sig.short_exit[sl],
+    )
+
+
+def _summary(state: BacktraderPaperState, cfg: PaperConfig) -> list[tuple[int, float, int, int]]:
+    instr = cfg.base.instrument
+    return [
+        (t.side, round(t.net_pnl, 6), t.entry_timestamp, t.exit_timestamp)
+        for t in trades(state.ledger, instruments={instr.symbol: instr})
+    ]
+
+
+def _run_windows(
+    bounds: list[tuple[int, int]], *, n: int = 24, target: np.ndarray | None = None
+) -> tuple[list[tuple[int, float, int, int]], object]:
+    if target is None:
+        target = np.zeros(n, dtype=int)
+        target[4:10] = 1
+        target[10:18] = -1
+        target[20:24] = 1
+    data = synthetic_bars(PRESETS[AC], n_bars=n)
+    signals = from_target(target)
+    cfg = _config()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        state: BacktraderPaperState | None = None
+        for a, b in bounds:
+            state, _ = run(
+                "x",
+                _slice_md(data, slice(a, b)),
+                _slice_sig(signals, slice(a, b)),
+                cfg,
+                db_path=db,
+            )
+    assert state is not None
+    return _summary(state, cfg), state.open_position
+
+
+def _target_full_run() -> np.ndarray:
+    target = np.zeros(24, dtype=int)
+    target[4:10] = 1
+    target[10:18] = -1
+    target[20:24] = 1
+    return target
+
+
+# ---------------------------------------------------------------------------
+# registration
+# ---------------------------------------------------------------------------
+
+
+def test_engine_and_state_class_registered() -> None:
+    assert get_paper_engine("backtrader") is BacktraderPaperEngine
+    assert get_state_class("backtrader") is BacktraderPaperState
+
+
+# ---------------------------------------------------------------------------
+# pure helpers
+# ---------------------------------------------------------------------------
+
+
+def test_apply_policy_opens_and_holds_long() -> None:
+    sig = Signals(
+        long_entry=np.array([True, True, False, False]),
+        long_exit=np.zeros(4, dtype=bool),
+        short_entry=np.zeros(4, dtype=bool),
+        short_exit=np.zeros(4, dtype=bool),
+    )
+    out = _apply_policy(sig, allow_short=True, policy="reverse")
+    assert list(out.long_entry) == [True, False, False, False]
+    assert not out.long_exit.any()
+
+
+def test_apply_policy_reverse_emits_close_and_opposite_entry() -> None:
+    sig = Signals(
+        long_entry=np.array([True, False, False]),
+        long_exit=np.zeros(3, dtype=bool),
+        short_entry=np.array([False, True, False]),
+        short_exit=np.zeros(3, dtype=bool),
+    )
+    out = _apply_policy(sig, allow_short=True, policy="reverse")
+    assert list(out.long_entry) == [True, False, False]
+    assert list(out.long_exit) == [False, True, False]
+    assert list(out.short_entry) == [False, True, False]
+
+
+def test_apply_policy_seeds_carried_side_so_closes_reach_the_strategy() -> None:
+    # A window that resumes a carried short must keep encoding its *close* signal —
+    # seeding ``sim_side`` flat (``0``) would decide_action it away as a hold.
+    sig = Signals(
+        long_entry=np.zeros(3, dtype=bool),
+        long_exit=np.zeros(3, dtype=bool),
+        short_entry=np.zeros(3, dtype=bool),
+        short_exit=np.array([False, True, False]),
+    )
+    carried = _apply_policy(sig, allow_short=True, policy="reverse", initial_side=-1)
+    assert list(carried.short_exit) == [False, True, False]
+    # Flat simulation drops the orphan exit (there is nothing to close).
+    flat = _apply_policy(sig, allow_short=True, policy="reverse", initial_side=0)
+    assert not flat.short_exit.any()
+
+
+def test_apply_policy_exit_only_does_not_open_opposite() -> None:
+    sig = Signals(
+        long_entry=np.array([True, False, False]),
+        long_exit=np.zeros(3, dtype=bool),
+        short_entry=np.array([False, True, False]),
+        short_exit=np.zeros(3, dtype=bool),
+    )
+    out = _apply_policy(sig, allow_short=True, policy="exit_only")
+    assert list(out.long_exit) == [False, True, False]
+    assert not out.short_entry.any()
+
+
+def test_apply_policy_respects_allow_short() -> None:
+    sig = Signals(
+        long_entry=np.zeros(1, dtype=bool),
+        long_exit=np.zeros(1, dtype=bool),
+        short_entry=np.array([True]),
+        short_exit=np.zeros(1, dtype=bool),
+    )
+    out = _apply_policy(sig, allow_short=False, policy="reverse")
+    assert not out.short_entry.any()
+
+
+def test_zero_at_or_before_drops_bound_bar() -> None:
+    sig = Signals(
+        long_entry=np.array([True, False, True]),
+        long_exit=np.zeros(3, dtype=bool),
+        short_entry=np.zeros(3, dtype=bool),
+        short_exit=np.zeros(3, dtype=bool),
+    )
+    ts = np.array([10, 20, 30])
+    out = _zero_at_or_before(sig, ts, 20)
+    assert list(out.long_entry) == [False, False, True]
+
+
+def test_max_atr_period() -> None:
+    class Risk:
+        exit = (ATRStop(14, period=14), TakeProfit(percent=0.05))
+
+    assert _max_atr_period(Risk()) == 14
+    assert _max_atr_period(None) == 0
+
+
+# ---------------------------------------------------------------------------
+# full run vs. multi-window resume
+# ---------------------------------------------------------------------------
+
+
+def test_full_run_produces_flip_trades() -> None:
+    got, open_pos = _run_windows([(0, 24)])
+    assert [t[0] for t in got] == [1, -1]
+    assert got[0][2] == 1_704_085_200_000_000_000  # bar-4 signal fills at bar 5
+    assert got[1][3] == 1_704_135_600_000_000_000  # short-18 signal fills at bar 19
+    assert open_pos is not None and open_pos.side == 1  # bar-20 long still open
+    assert open_pos.entry_ns == 1_704_142_800_000_000_000  # bar-20 signal fills at bar 21
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        # Reviewer boundary matrix (the DEFECT-2 cases): window 1 ends on, around, and
+        # strictly before the flip / exit bars of the long and short legs.
+        [(0, 9), (4, 24)],
+        [(0, 10), (4, 24)],
+        [(0, 13), (4, 24)],
+        [(0, 17), (4, 24)],
+        [(0, 18), (4, 24)],
+        [(0, 19), (4, 24)],  # window 1's LAST bar carries the short-exit signal in flight
+        # vbt-style cascade carry/re-open cases.
+        [(0, 11), (4, 24)],  # window 1 ends exactly on the flip fill bar
+        [(0, 10), (4, 18), (9, 24)],  # open carry; resume at the entry bar
+        [(0, 12), (4, 20), (9, 24)],
+        [(0, 6), (4, 14), (9, 24)],
+        [(0, 11), (5, 20), (20, 24)],  # restart window 2 at the carried fill bar (5)
+    ],
+)
+def test_split_windows_match_full_run(bounds: list[tuple[int, int]]) -> None:
+    full, full_open = _run_windows([(0, 24)])
+    got, open_pos = _run_windows(bounds)
+    assert got == full
+    assert open_pos == full_open
+
+
+def test_carried_entry_is_not_double_booked() -> None:
+    # DEFECT 1: re-running the carried entry as a normal order would book a *second* fill
+    # one bar after the real one (backtrader fills at next-bar open), doubling the
+    # position. The carried entry must be seeded verbatim, never re-executed.
+    target = np.zeros(24, dtype=int)
+    target[4:10] = 1
+    got = _run_windows([(0, 6), (4, 24)], target=target)
+    full = _run_windows([(0, 24)], target=target)
+    assert got == full
+    assert [t[0] for t in got[0]] == [1]  # the long closes once at bar-11; no ghost short
+
+
+def test_pending_exit_in_flight_stays_open_for_the_next_window() -> None:
+    # A short-exit SIGNAL on window 1's very last bar (bar 18) cannot fill inside window
+    # 1 (there is no bar 19), and it must NOT be force-realized at the bar-18 close:
+    # the full run fills it at bar 19's open. The window must leave the short open so the
+    # next window's re-derived signal closes it at the genuine next-bar open.
+    data = synthetic_bars(PRESETS[AC], n_bars=24)
+    target = _target_full_run()
+    signals = from_target(target)
+    cfg = _config()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        state, _ = run(
+            "x", _slice_md(data, slice(0, 19)), _slice_sig(signals, slice(0, 19)), cfg, db_path=db
+        )
+        # The short entered at bar 11 is still open — the pending exit did not close it.
+        assert state.open_position is not None
+        assert state.open_position.side == -1
+        assert state.open_position.entry_ns == 1_704_106_800_000_000_000  # bar-10 signal, fill 11
+        state, _ = run(
+            "x", _slice_md(data, slice(4, 24)), _slice_sig(signals, slice(4, 24)), cfg, db_path=db
+        )
+
+    got = _summary(state, cfg)
+    full, full_open = _run_windows([(0, 24)])
+    assert got == full
+    assert state.open_position == full_open
+
+
+def test_resume_requires_entry_bar_in_window() -> None:
+    # After window 1 (bars 0..9) the long signalled at bar 4 was filled at bar 5 and is
+    # still open. A window that starts after bar 5 (i.e. omits the carried entry's fill
+    # bar) cannot re-open the carried trade.
+    data = synthetic_bars(PRESETS[AC], n_bars=24)
+    target = np.zeros(24, dtype=int)
+    target[4:10] = 1
+    target[10:18] = -1
+    signals = from_target(target)
+    cfg = _config()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        run("x", _slice_md(data, slice(0, 10)), _slice_sig(signals, slice(0, 10)), cfg, db_path=db)
+        with pytest.raises(EngineError, match="carried entry"):
+            run(
+                "x",
+                _slice_md(data, slice(6, 24)),
+                _slice_sig(signals, slice(6, 24)),
+                cfg,
+                db_path=db,
+            )
+
+
+def test_resume_carries_entry_when_signal_fn_does_not_reemit_it() -> None:
+    # Crash-2 regression (backtrader mirror): the live worker died when a *stateful* signal
+    # function could not reproduce the carried entry over the recomputed window. The
+    # persisted ledger is authoritative, so the backend must carry the open trade forward
+    # (with a warning) instead of aborting.
+    data = synthetic_bars(PRESETS[AC], n_bars=24)
+    # Window 1 (bars 0..11): the wall-clock fn originally emitted a long entry at bar 3
+    # (fills at bar 4) and holds it — the reference leg we must resume.
+    first = from_target(np.array([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]))
+    # Window 2: the same "wall-clock minute" re-derives a FLAT signal at bar 3 (the entry
+    # is not re-emitted at its own bar), but the next leg — a short at bar 15 — is.
+    signal_fn_target = np.zeros(24, dtype=int)
+    signal_fn_target[15:20] = -1
+    signals = from_target(signal_fn_target)
+    cfg = _config()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        run("x", _slice_md(data, slice(0, 12)), _slice_sig(first, slice(0, 12)), cfg, db_path=db)
+        # Window 2 restarts at the carried entry bar (bar 3); the wall-clock fn re-derives
+        # a flat signal there, so the window must be carried from the ledger, not crash.
+        with pytest.warns(UserWarning, match="not re-emitted"):
+            state, _ = run(
+                "x",
+                _slice_md(data, slice(3, 24)),
+                _slice_sig(signals, slice(3, 24)),
+                cfg,
+                db_path=db,
+            )
+
+    got = _summary(state, cfg)
+    # Long signalled bar 3 (fills bar 4), flipped short at bar 15 (fills bar 16), closed
+    # by bar 20's 0 (fills bar 21) — both legs survive the carry.
+    assert [t[0] for t in got] == [1, -1]
+    assert got[0][2] == 1_704_081_600_000_000_000  # bar-3 signal fills at bar 4
+    assert got[1][3] == 1_704_142_800_000_000_000  # bar-20 signal fills at bar 21
+    assert state.open_position is None  # the bar-15 short is closed by bar 20's 0
+
+
+def test_gapped_resume_does_not_double_book_starting_balance() -> None:
+    # Regression: a warm window whose first bar falls strictly after the cursor (a data
+    # gap right after the flat last-close bar) used to leak the window-start
+    # ``+starting_balance`` cash event into the persisted ledger on every resume.
+    data = synthetic_bars(PRESETS[AC], n_bars=24)
+    # Window 1: long signalled at bar 4 (fills bar 5), closed (flat) at bar 9's signal
+    # (fills bar 10).
+    first = from_target(np.array([0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0]))
+    cfg = _config()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        run("x", _slice_md(data, slice(0, 12)), _slice_sig(first, slice(0, 12)), cfg, db_path=db)
+        # Window 2 SKIPS bars 10-11 and re-enters at bar 12 — the resume window starts at
+        # bar 12, strictly after the cursor.
+        second_full = np.zeros(24, dtype=int)
+        second_full[12:18] = 1
+        second = from_target(second_full)
+        state, _ = run(
+            "x",
+            _slice_md(data, slice(12, 24)),
+            _slice_sig(second, slice(12, 24)),
+            cfg,
+            db_path=db,
+        )
+
+    # The +10000 initial deposit may be booked EXACTLY ONCE.
+    seeds = [
+        e
+        for e in state.ledger.events
+        if e.event_type is EventType.CASH_MOVEMENT
+        and e.amount is not None
+        and abs(float(e.amount) - 10_000.0) < 1e-9
+    ]
+    assert len(seeds) == 1, (
+        f"initial deposit booked {len(seeds)} times (double-booking leak): "
+        f"{[c.amount for c in seeds]}"
+    )

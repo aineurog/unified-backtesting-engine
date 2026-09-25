@@ -32,10 +32,13 @@ that mirrors the other adapters' semantics on that loop:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC
+from datetime import datetime as _py_dt
 from typing import Any, cast
 
 import numpy as np
-from backtrader import Order
+import pandas as pd
+from backtrader import Order, Position
 from backtrader import Strategy as BtStrategyBase
 
 from ube.adapters.backtrader_adapter.exits import BtExitLine, build_exit_plan
@@ -50,6 +53,7 @@ from ube.core.risk.exits import Exit
 from ube.core.risk.sizing import _entry_fee_rate, size_position
 
 __all__ = [
+    "BtCarriedFill",
     "BtRunContext",
     "BtSignalRecord",
     "BtOrderRecord",
@@ -81,6 +85,17 @@ class BtRunContext:
     vol_arr: np.ndarray | None
     slip: float
     starting_balance: float
+    #: The position carried into this run by a paper-trading resume (§3) — seeded into the
+    #: broker and the strategy's own tracker at ``start()``, never re-executed. ``None`` for
+    #: a fresh backtest (and the cold paper window).
+    carried: BtCarriedFill | None = None
+    #: When True, an exit still in flight on the final bar is *not* force-realized in
+    #: ``stop()``: the position stays open so the next paper window re-derives the exit
+    #: from the recomputed signals and fills it at its genuine next-bar open — keeping the
+    #: windowed ledger identical to a single full-window run (the vectorbt/nautilus backends
+    #: carry the pending exit the same way). ``False`` (a standalone backtest with no next
+    #: window) keeps the original final-bar close booking.
+    carry_final_exit: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,6 +122,28 @@ class BtOrderRecord:
     quantity: float
     price: float
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class BtCarriedFill:
+    """The persisted fill of the position carried across a paper-trading resume (§3).
+
+    The backtrader paper backend re-runs a window starting *at* the carried entry's fill
+    bar; the strategy must hold that position from the first bar instead of re-executing
+    it. Re-executing would (a) re-book the entry a bar later — double-booking the ledger —
+    and (b) re-size it off the resume balance instead of its original quantity. ``price``
+    is the raw (pre-slippage) entry fill price — the entry bar's open — which the exit
+    plan and the fold slip exactly like every other fill.
+
+    Attributes:
+        side: The fill direction (+1 long / -1 short).
+        quantity: The exact persisted fill size (positive units).
+        price: The raw entry fill price from the entry bar's open.
+    """
+
+    side: int
+    quantity: float
+    price: float
 
 
 @dataclass(frozen=True)
@@ -251,6 +288,53 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         entry_fee = float(fill_cost(cost_model, notional=qty * entry_slip * mult))
         exit_fee = float(fill_cost(cost_model, notional=qty * exit_slip * mult))
         self._cash_balance += gross - entry_fee - exit_fee
+
+    # ------------------------------------------------------------------
+    # Start / resume seeding
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Seed the broker and position tracker with a carried position on resume (§3).
+
+        The paper backend passes ``ctx.carried`` on a warm window whose open position was
+        persisted by an earlier step. backtrader must hold it from bar 0 — never re-submit
+        the entry order — or the fill would re-book a bar later (double-booking the ledger,
+        and the position itself) and be re-sized off the resume balance instead of carried
+        at its original quantity. Mirror the reference (nautilus) actor, which seeds its
+        own position tracker from the persisted open position and only books *new* fills.
+        """
+        carried = self._ctx.carried
+        if carried is None or float(carried.quantity) <= _FLAT_EPS:
+            return
+        ctx = self._ctx
+        raw = float(carried.price)
+        pos = Position(size=float(carried.side) * float(carried.quantity), price=raw)
+        # The broker's credit-interest pass reads ``pos.datetime.date()`` on every bar, so
+        # the seeded position must carry a fill-time ``datetime`` like broker-executed ones
+        # (``Position.update`` records it); stamp the entry bar's timestamp.
+        pos.datetime = _py_dt.fromtimestamp(
+            float(int(pd.Timestamp(ctx.data.timestamps[0]).value)) / 1_000_000_000.0,
+            tz=UTC,
+        ).replace(tzinfo=None)
+        # Anchor the seeded position at the entry bar's close so the broker's end-of-bar
+        # ``cashadjust`` steps reproduce the full run's from this bar on (the absolute cash
+        # level is sizing-equity only — the fold never reads the broker).
+        pos.adjbase = float(ctx.data.close[0])
+        self.broker.positions[self.data] = pos
+        plan = build_exit_plan(
+            ctx.exits,
+            ctx.data,
+            side=int(carried.side),
+            entry_price=float(slipped_price(raw, carried.side, ctx.slip)),
+            entry_bar=0,
+            atr_map=ctx.atr_map,
+        )
+        self._pos = _OpenPosition(
+            side=int(carried.side),
+            entry_bar=0,
+            entry_price=raw,
+            plan=plan,
+        )
 
     # ------------------------------------------------------------------
     # Next / per-bar event loop
@@ -441,7 +525,16 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         the references leave a position with no exit signal open (realized PnL 0), so the
         fold's running net stays non-zero and the ledger reproduces an open mark-to-market
         row.
+
+        A paper window is different (:attr:`BtRunContext.carry_final_exit`): the session
+        continues in the next window, so an exit in flight here must stay open — the next
+        window re-derives the signal from the recomputed bars and fills it at its genuine
+        next-bar open, exactly as a single full-window run would. Force-realizing it at the
+        final close would book a close price/timestamp the full run never had and drop the
+        position from ``open_position``.
         """
+        if self._ctx.carry_final_exit:
+            return
         if self._pos is None or abs(self.position.size) <= _FLAT_EPS:
             return
         pending = self._pending_exit

@@ -19,13 +19,19 @@ Per ``step`` the engine:
    (:func:`~ube.papertrading.backtrader.state.checkpoint_balance`) and seeds the backtrader run's
    ``starting_balance`` with it (leveraged by the adapter). A carried position is therefore
    carried at its original size, not re-sized off current equity.
-4. Runs the ``backtrader_adapter``, folding the strategy's signal/order records into a canonical
+4. Carries a persisted open position *into* the backtrader run verbatim (its exact fill
+   quantity and price — :class:`~ube.adapters.backtrader_adapter.strategy.BtCarriedFill`),
+   so the strategy holds it from the entry bar and never re-executes the entry order: a
+   re-execution would re-book the fill a bar late (double-booking the ledger) and re-size
+   it off the checkpoint balance.
+5. Runs the ``backtrader_adapter``, folding the strategy's signal/order records into a canonical
    append-only ledger (§4.6) — the same ``ts > last_processed_ns`` append rule the vectorbt and
    nautilus backends use.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import warnings
 from typing import Any
 
@@ -33,6 +39,7 @@ import numpy as np
 
 from ube.adapters.backtrader_adapter.adapter import BacktraderAdapter
 from ube.adapters.backtrader_adapter.overrides import DEFAULT_STARTING_BALANCE
+from ube.adapters.backtrader_adapter.strategy import BtCarriedFill
 from ube.core.cost import resolve_cost_model
 from ube.core.data import MarketData
 from ube.core.errors import EngineError
@@ -103,20 +110,22 @@ def _zero_at_or_before(signals: Signals, ts: np.ndarray, bound_ns: int) -> Signa
 
 
 def _apply_policy(
-    signals: Signals, *, allow_short: bool, policy: str
+    signals: Signals, *, allow_short: bool, policy: str, initial_side: int = 0
 ) -> Signals:
     """Encode the §9.3 position-change policy into fresh signal arrays.
 
-    ``sim_side`` is seeded flat (``0``) — the window starts at the carried entry bar when a
-    position is open, so the entry's own raw signal re-opens it. A bar whose four raw
-    columns are all ``False`` is skipped (raw ``False`` means "no action", never "close").
+    ``sim_side`` is seeded from the carried position's side (``0`` on a cold window) — a
+    window that resumes a persisted trade must keep encoding that side's *closes* and
+    flips exactly as the reference backend does (:func:`decide_action` on the carried
+    side). A bar whose four raw columns are all ``False`` is skipped (raw ``False`` means
+    "no action", never "close").
     """
     n = signals.n_bars
     long_entry = np.zeros(n, dtype=bool)
     long_exit = np.zeros(n, dtype=bool)
     short_entry = np.zeros(n, dtype=bool)
     short_exit = np.zeros(n, dtype=bool)
-    sim_side = 0
+    sim_side = int(initial_side)
     for i in range(n):
         a_le = bool(signals.long_entry[i])
         a_lx = bool(signals.long_exit[i])
@@ -249,6 +258,7 @@ class BacktraderPaperEngine(PaperEngine):
             win_sig,
             allow_short=allows_short(instrument.asset_class),
             policy=str(policy),
+            initial_side=int(open_pos.side) if open_pos is not None else 0,
         )
         if open_pos is not None:
             side = int(open_pos.side)
@@ -321,7 +331,32 @@ class BacktraderPaperEngine(PaperEngine):
             )
 
         adapter = BacktraderAdapter()
-        result = adapter.run(data=win_data, signals=encoded, config=config.base)
+        # The resumed window's sizing balance is the checkpoint, not the session start
+        # (the adapter reads ``engine_overrides["starting_balance"]``), so a carried
+        # position is seeded at its original size — never re-sized off current equity.
+        bt_overrides = dict(overrides) if overrides else {}
+        bt_overrides["starting_balance"] = float(checkpoint)
+        bt_config = dataclasses.replace(
+            config.base, engine="backtrader", engine_overrides=bt_overrides
+        )
+        carried = None
+        if open_pos is not None:
+            # ``win_ts[0]`` is the carried entry's fill bar (the window starts there, see
+            # ``window_start_ns``), so its raw open is the recorded raw fill price. The
+            # strategy holds the position verbatim from bar 0 instead of re-executing it,
+            # which would re-book and re-size the carried leg (review DEFECT 1 / DEFECT 2).
+            carried = BtCarriedFill(
+                side=int(open_pos.side),
+                quantity=float(open_pos.quantity),
+                price=float(win_data.open[0]),
+            )
+        result = adapter.run(
+            data=win_data,
+            signals=encoded,
+            config=bt_config,
+            carried=carried,
+            carry_final_exit=True,
+        )
 
         events = list(result.ledger.events)
         # The adapter books the *window-start* balance as a cash inflow at ``bar_ts[0]``
