@@ -114,13 +114,18 @@ class BtOrderRecord:
     ``submit_bar`` is the bar the order was placed on (the signal/trigger bar); ``fill_bar`` is
     the bar whose open it filled at (``submit_bar + 1`` for a market order). ``price`` is the raw
     fill price (fill-bar open); slippage is applied at the fold.
+
+    A paper window that ends with an order still in flight (its fill would land on the
+    next window's first bar) records the submission with ``fill_bar``/``price`` ``None``:
+    the next window re-derives the order and fills it there, so the seam window books
+    exactly the ``order_submitted`` row (§4.6) — no cash/fill/commission/position step.
     """
 
     submit_bar: int
-    fill_bar: int
-    side: int  # the fill direction (+1 buy / -1 sell)
-    quantity: float
-    price: float
+    fill_bar: int | None = None
+    side: int = 0  # the fill direction (+1 buy / -1 sell)
+    quantity: float = 0.0
+    price: float | None = None
     reason: str | None = None
 
 
@@ -192,17 +197,28 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
     # ------------------------------------------------------------------
 
     def _fill_price(self, side: int) -> float:
-        """Actual next-bar fill price for an entry (backtrader ``+1`` index = next bar)."""
+        """Actual next-bar fill price for an entry (backtrader ``+1`` index = next bar).
+
+        On a carry window's final bar there is no next bar *in this window*, but the
+        session continues: the entry fills at the next window's own next-bar open, so the
+        seam leg is sized against the decision bar's open (a venue-level proxy) and its
+        submit-only ``order_submitted`` row is booked — the next window re-derives and
+        fills the order at the genuine price. A standalone run has no successor, so a
+        final-bar entry cannot execute and reports ``nan`` to let ``_target_quantity``
+        decline it.
+        """
         ctx = self._ctx
         i = len(self.data) - 1
         if i + 1 >= ctx.data.n_bars:
+            if ctx.carry_final_exit:
+                return float(slipped_price(float(self.data.open[0]), side, ctx.slip))
             return float("nan")
         return float(slipped_price(float(self.data.open[1]), side, ctx.slip))
 
     def _target_quantity(self, side: int) -> float:
         """Core-sized entry quantity for one direction (§6.3), floored to the lot increment."""
         ctx = self._ctx
-        if len(self.data) - 1 + 1 >= ctx.data.n_bars:
+        if len(self.data) - 1 + 1 >= ctx.data.n_bars and not ctx.carry_final_exit:
             return 0.0  # no next bar to fill on — entry cannot execute
         price = self._fill_price(side)
         # §6.3 capital base: the *unleveraged* net cash balance scaled by the account
@@ -527,13 +543,40 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         row.
 
         A paper window is different (:attr:`BtRunContext.carry_final_exit`): the session
-        continues in the next window, so an exit in flight here must stay open — the next
-        window re-derives the signal from the recomputed bars and fills it at its genuine
+        continues in the next window, so an exit still in flight here must stay open — the
+        next window re-derives the signal from the recomputed bars and fills it at its genuine
         next-bar open, exactly as a single full-window run would. Force-realizing it at the
         final close would book a close price/timestamp the full run never had and drop the
-        position from ``open_position``.
+        position from ``open_position``. The submission itself *did* happen in this window,
+        though — record it as a submit-only :class:`BtOrderRecord` so the ledger books the
+        ``order_submitted`` row at the signal bar, matching the full run (the next window's
+        copy of the order falls at the same timestamp and is deduplicated away).
         """
         if self._ctx.carry_final_exit:
+            pending_exit = self._pending_exit
+            if pending_exit is not None:
+                self.order_records.append(
+                    BtOrderRecord(
+                        int(pending_exit["submit_bar"]),
+                        None,
+                        int(pending_exit["side"]),
+                        float(pending_exit["size"]),
+                        None,
+                        pending_exit.get("reason"),
+                    )
+                )
+            pending_entry = self._pending_entry
+            if pending_entry is not None:
+                self.order_records.append(
+                    BtOrderRecord(
+                        int(pending_entry["submit_bar"]),
+                        None,
+                        int(pending_entry["side"]),
+                        float(pending_entry["size"]),
+                        None,
+                        None,
+                    )
+                )
             return
         if self._pos is None or abs(self.position.size) <= _FLAT_EPS:
             return

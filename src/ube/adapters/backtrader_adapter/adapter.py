@@ -389,6 +389,12 @@ class BacktraderAdapter(EngineAdapter):
         )
         for orec in strat.order_records:
             _order_submitted(int(bar_ts[orec.submit_bar]), orec.side, orec.quantity)
+            if orec.fill_bar is None:
+                # Submit-only: an order left in flight at the window's final bar (the next
+                # window re-derives it and fills it there). Book only the order_submitted
+                # row, matching the full run's ledger — no cash/fill/commission/position
+                # step (the fill lands in the next window, at its genuine next-bar open).
+                continue
             net += orec.side * orec.quantity
             self._fold_fill(
                 bar_ts,
@@ -468,6 +474,8 @@ class BacktraderAdapter(EngineAdapter):
         slip: float,
     ) -> None:
         """One fill's events: cash leg, fill (with reason), commission, position change (§4.6)."""
+        assert rec.fill_bar is not None, "submit-only order records must not reach _fold_fill"
+        assert rec.price is not None, "submit-only order records must not reach _fold_fill"
         ts = int(bar_ts[rec.fill_bar])
         price = float(slipped_price(rec.price, rec.side, slip))
         notional = rec.quantity * price * multiplier
