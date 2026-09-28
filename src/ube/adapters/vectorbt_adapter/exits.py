@@ -325,19 +325,17 @@ def classify_exit_reason(
     aux_data: Mapping[str, Any] | None,
     signals: Signals,
 ) -> str:
-    """Label a closing fill using the core ``exit_triggered`` semantics (§4.6/§8)."""
-    if side == 1 and bool(signals.long_exit[exit_bar]):
-        return "signal"
-    if side == -1 and bool(signals.short_exit[exit_bar]):
-        return "signal"
-    # A flip (opposite-side entry) also closes the position via a signal: a long exited on
-    # the bar a short opens, or a short exited where a long opens. Nautilus journals these as
-    # "signal"; without this branch they would be mislabeled "end_of_run".
-    if side == 1 and bool(signals.short_entry[exit_bar]):
-        return "signal"
-    if side == -1 and bool(signals.long_entry[exit_bar]):
-        return "signal"
+    """Label a closing fill using the core ``exit_triggered`` semantics (§4.6/§8).
 
+    Risk exits are resolved **before** the signal exit, matching the reference (nautilus
+    returns from its risk block before it ever evaluates signals) and the backtrader
+    strategy (which only falls back to a signal close ``if fired is None``). When a stop or
+    target triggers on the same bar as a signal, the stop is what closed the trade and the
+    fill price proves it — the level, not the bar close. Checking the signal first
+    mislabeled every such trade as ``signal``, e.g. a live crypto-perp exit filled at the
+    exact stop level 83003.330925 stamped ``signal`` while nautilus/backtrader stamped
+    ``stop_loss``.
+    """
     # Among the exits that trigger on this bar, the one the bar *reached first* owns the
     # label (§4.7/§8) — nearest the bar's open, so a bar that ran through the target
     # before the stop is a take_profit, not a stop_loss.
@@ -390,7 +388,21 @@ def classify_exit_reason(
             )
         fired.append((reason, level))
 
-    if not fired:
-        return "end_of_run"
-    pick = first_reached_exit([lvl for _, lvl in fired], open_price=float(data.open[exit_bar]))
-    return fired[0 if pick is None else pick][0]
+    if fired:
+        pick = first_reached_exit([lvl for _, lvl in fired], open_price=float(data.open[exit_bar]))
+        return fired[0 if pick is None else pick][0]
+
+    # No risk exit fired on this bar, so the signal/flip close owns the label. A flip
+    # (opposite-side entry) also closes the position: a long exited on the bar a short
+    # opens, or a short exited where a long opens. Nautilus journals these as "signal";
+    # without this branch they would be mislabeled "end_of_run".
+    if side == 1 and bool(signals.long_exit[exit_bar]):
+        return "signal"
+    if side == -1 and bool(signals.short_exit[exit_bar]):
+        return "signal"
+    if side == 1 and bool(signals.short_entry[exit_bar]):
+        return "signal"
+    if side == -1 and bool(signals.long_entry[exit_bar]):
+        return "signal"
+
+    return "end_of_run"

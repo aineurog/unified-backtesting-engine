@@ -48,6 +48,7 @@ from ube.core.risk import RiskConfig, SizeModel
 from ube.core.risk.exits import (
     ATRStop,
     ChandelierExit,
+    StopLoss,
     TakeProfit,
     TimeExit,
     TrailingStop,
@@ -272,6 +273,53 @@ def test_classify_exit_reason_signal_bar():
         signals=sig,
     )
     assert reason == "signal"
+
+
+def _signal_and_stop_bar_md() -> MarketData:
+    """Two bars where bar 1 both flips the signal and touches a short's 102.0 stop.
+
+    Entry is 100.0, so a 2% ``StopLoss`` on a short sits at 100 * 1.02 = 102.0 and bar 1's
+    high of 102.5 reaches it.
+    """
+    return MarketData.from_records(
+        [
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1.0,
+             "timestamp": "2024-01-01T00:00:00Z"},
+            {"open": 100.0, "high": 102.5, "low": 99.0, "close": 100.0, "volume": 1.0,
+             "timestamp": "2024-01-01T01:00:00Z"},
+        ]
+    )
+
+
+@pytest.mark.parametrize("case", ["short_exit", "flip_to_long"])
+def test_classify_exit_reason_risk_exit_beats_coincident_signal(case: str):
+    """A risk exit that triggers on a signal bar still owns the label (§4.6/§4.7/§8).
+
+    Both the reference (nautilus) and backtrader evaluate risk exits *before* the signal
+    exit — nautilus returns from its risk block before reaching signal evaluation, and
+    backtrader only falls back to a ``_SignalExit`` ``if fired is None``. On a bar where a
+    stop and a signal coincide, the stop is what closed the trade, and the fill price proves
+    it (the level, not the bar close).
+
+    Testing the signal first mislabels every such trade as ``signal``. That is exactly what
+    the live crypto-perp ledger showed: an exit filled at the exact stop level 83003.330925
+    stamped ``signal`` by vectorbt while nautilus and backtrader stamped ``stop_loss``.
+    """
+    md = _signal_and_stop_bar_md()
+    # from_target([0, 1]) flips flat -> long on bar 1, which sets short_exit[1] (and
+    # long_entry[1]); both are signal-driven closes that must not outrank the stop.
+    sig = from_target([0, 1])
+    reason = classify_exit_reason(
+        (StopLoss(percent=0.02),),
+        md,
+        side=-1,
+        entry_price=100.0,
+        entry_bar=0,
+        exit_bar=1,
+        aux_data=None,
+        signals=sig,
+    )
+    assert reason == "stop_loss", f"the stop owns the exit (case={case})"
 
 
 def test_atr_from_aux_has_no_lookahead_shift():
