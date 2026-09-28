@@ -29,6 +29,7 @@ from ube.core.risk.exits import (
     TimeExit,
     TrailingStop,
     atr,
+    exit_level,
     exit_triggered,
     scale_out_fraction,
 )
@@ -218,12 +219,17 @@ class BtExitLine:
         fraction: The scale-out fraction this exit exits when it fires (§6.4).
         reason: The canonical reason string stamped on the closing fill.
         triggered: Causal per-bar bool array — ``True`` where this exit fires.
+        level: Causal per-bar price level, or ``None`` for a level-less exit
+            (:class:`TimeExit` and ``trigger="close"`` exits, which fill at the bar close).
+            Carried so the strategy can order same-bar exits by which the bar reached first
+            (§4.7/§8) rather than by configured order.
     """
 
     index: int
     fraction: float
     reason: str
     triggered: np.ndarray
+    level: np.ndarray | None = None
 
 
 def exit_reason_label(cfg: Exit) -> str:
@@ -255,8 +261,9 @@ def build_exit_plan(
     """Build the per-bar trigger plan for every configured exit, anchored to one entry (§8).
 
     Pure and causal: each line is the core ``exit_triggered`` result for the exit with this
-    trade's side/entry reference. The strategy checks the plan arrays on every bar while the
-    position is open; the first firing exit (in configured order) exits its ``fraction``.
+    trade's side/entry reference, plus that exit's per-bar level so the strategy can pick
+    the exit the bar reached *first* when several fire at once (§4.7/§8). Each bar, the
+    first-reached unspent exit exits its ``fraction``.
     """
     atr_map = atr_map if atr_map is not None else {}
     out: list[BtExitLine] = []
@@ -270,12 +277,30 @@ def build_exit_plan(
             entry_bar=entry_bar,
             atr_series=series,
         )
+        if isinstance(cfg, TimeExit) or getattr(cfg, "trigger", None) == "close":
+            level = None
+        else:
+            try:
+                level = np.asarray(
+                    exit_level(
+                        cfg,
+                        market_data=data,
+                        side=side,
+                        entry_price=entry_price,
+                        entry_bar=entry_bar,
+                        atr_series=series,
+                    ),
+                    dtype=np.float64,
+                )
+            except ConfigError:
+                level = None
         out.append(
             BtExitLine(
                 index=idx,
                 fraction=float(scale_out_fraction(cfg)),
                 reason=exit_reason_label(cfg),
                 triggered=np.asarray(triggered, dtype=np.bool_),
+                level=level,
             )
         )
     return tuple(out)

@@ -37,6 +37,7 @@ from ube.core.risk.exits import (
     TrailingStop,
     exit_level,
     exit_triggered,
+    first_reached_exit,
     scale_out_fraction,
 )
 from ube.core.risk.sizing import floor_to_step, size_position
@@ -329,11 +330,15 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         return md
 
     def _check_risk_exits(self) -> tuple[str, float, float | None] | None:
-        """Check RiskConfig.exit in order; return (exit_reason, fraction, level) if triggered.
+        """Return ``(exit_reason, fraction, level)`` for the first exit this bar reached.
 
         ``level`` is the exit's own price level at the current bar for ``trigger="touched"``
         exits — paper fills at the level (optimistic, §9.4) — and ``None`` for
         ``trigger="close"`` exits and :class:`TimeExit`, which fill at the bar close.
+
+        When several exits trigger on the same bar, the winner is the one the bar *reached
+        first* (``first_reached_exit``, §4.7/§8) rather than the one configured first, so a
+        bar that ran through the target before the stop exits as ``take_profit``.
         """
         if (
             not self._exits
@@ -353,6 +358,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         aux_atr: dict[str, Any] | None = None
         if hasattr(self, "_aux_data") and self._aux_data:
             aux_atr = self._aux_data
+        fired: list[tuple[str, float, float | None]] = []
         for cfg in self._exits:
             try:
                 # ATR-based exits need atr_series — resolve from aux_data if cfg.atr is set.
@@ -408,8 +414,15 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                         )
                     except Exception:
                         level = None
-                return reason, scale_out_fraction(cfg), level
-        return None
+                fired.append((reason, scale_out_fraction(cfg), level))
+        if not fired:
+            return None
+        # §4.7/§8: a bar that sweeps several levels has no unique intra-bar path, so the
+        # level nearest the bar's open is the one it reached first. Level-less exits
+        # (TimeExit, trigger="close") fill at the close, so they rank on the close price.
+        ranked = [lvl if lvl is not None else self._last_close for _, _, lvl in fired]
+        pick = first_reached_exit(ranked, open_price=float(md.open[cur_bar]))
+        return fired[0 if pick is None else pick]
 
     def on_bar(self, bar: Bar) -> None:
         if self._instrument is None:
@@ -447,7 +460,8 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 if len(self._atr_window) > self._atr_period + 1:
                     self._atr_window.pop(0)
 
-        # — Risk exits (T4) — checked before signals, stop precedence.
+        # — Risk exits (T4) — checked before signals; among exits that trigger on the
+        # same bar, the one the bar reached first wins (§4.7/§8).
         risk_exit = self._check_risk_exits()
         if risk_exit is not None and self._sim_side != 0:
             reason, fraction, exit_level_price = risk_exit

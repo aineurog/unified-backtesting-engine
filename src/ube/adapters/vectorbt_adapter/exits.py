@@ -28,7 +28,9 @@ from ube.core.risk.exits import (
     TimeExit,
     TrailingStop,
     atr,
+    exit_level,
     exit_triggered,
+    first_reached_exit,
 )
 from ube.core.signals import Signals
 
@@ -336,74 +338,59 @@ def classify_exit_reason(
     if side == -1 and bool(signals.long_entry[exit_bar]):
         return "signal"
 
+    # Among the exits that trigger on this bar, the one the bar *reached first* owns the
+    # label (§4.7/§8) — nearest the bar's open, so a bar that ran through the target
+    # before the stop is a take_profit, not a stop_loss.
+    fired: list[tuple[str, float]] = []
     for exit in exits:
-        if isinstance(exit, TakeProfit):
-            if bool(
-                exit_triggered(
-                    exit,
-                    market_data=data,
-                    side=side,
-                    entry_price=entry_price,
-                    entry_bar=entry_bar,
-                )[exit_bar]
-            ):
-                return "take_profit"
-        elif isinstance(exit, ATRStop):
-            series = atr_series_for_exit(exit, aux_data, data)
-            if bool(
-                exit_triggered(
-                    exit,
-                    market_data=data,
-                    side=side,
-                    entry_price=entry_price,
-                    entry_bar=entry_bar,
-                    atr_series=series,
-                )[exit_bar]
-            ):
-                return "atr_stop"
-        elif isinstance(exit, ChandelierExit):
-            series = atr_series_for_exit(exit, aux_data, data)
-            if bool(
-                exit_triggered(
-                    exit,
-                    market_data=data,
-                    side=side,
-                    entry_price=entry_price,
-                    entry_bar=entry_bar,
-                    atr_series=series,
-                )[exit_bar]
-            ):
-                return "chandelier"
-        elif isinstance(exit, TrailingStop):
-            if bool(
-                exit_triggered(
-                    exit,
-                    market_data=data,
-                    side=side,
-                    entry_price=entry_price,
-                    entry_bar=entry_bar,
-                )[exit_bar]
-            ):
-                return "trailing_stop"
-        elif isinstance(exit, StopLoss):
-            if bool(
-                exit_triggered(
-                    exit,
-                    market_data=data,
-                    side=side,
-                    entry_price=entry_price,
-                    entry_bar=entry_bar,
-                )[exit_bar]
-            ):
-                return "stop_loss"
-        elif isinstance(exit, TimeExit) and bool(
+        series = (
+            atr_series_for_exit(exit, aux_data, data)
+            if isinstance(exit, (ATRStop, ChandelierExit))
+            else None
+        )
+        if not bool(
             exit_triggered(
                 exit,
                 market_data=data,
                 side=side,
                 entry_price=entry_price,
                 entry_bar=entry_bar,
+                atr_series=series,
             )[exit_bar]
         ):
-            return "time_exit"
-    return "end_of_run"
+            continue
+        if isinstance(exit, TakeProfit):
+            reason = "take_profit"
+        elif isinstance(exit, ATRStop):
+            reason = "atr_stop"
+        elif isinstance(exit, ChandelierExit):
+            reason = "chandelier"
+        elif isinstance(exit, TrailingStop):
+            reason = "trailing_stop"
+        elif isinstance(exit, StopLoss):
+            reason = "stop_loss"
+        elif isinstance(exit, TimeExit):
+            reason = "time_exit"
+        else:
+            continue
+        # TimeExit has no level, and a "close"-triggered exit is evaluated against the
+        # close — both fill at the bar close, so they rank on the close price.
+        if isinstance(exit, TimeExit) or getattr(exit, "trigger", None) == "close":
+            level = float(data.close[exit_bar])
+        else:
+            level = float(
+                exit_level(
+                    exit,
+                    market_data=data,
+                    side=side,
+                    entry_price=entry_price,
+                    entry_bar=entry_bar,
+                    atr_series=series,
+                )[exit_bar]
+            )
+        fired.append((reason, level))
+
+    if not fired:
+        return "end_of_run"
+    pick = first_reached_exit([lvl for _, lvl in fired], open_price=float(data.open[exit_bar]))
+    return fired[0 if pick is None else pick][0]

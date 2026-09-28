@@ -23,6 +23,7 @@ from ube.core.risk import (
     chandelier_level,
     exit_level,
     exit_triggered,
+    first_reached_exit,
     is_triggered,
     scale_out_fraction,
     scale_out_plan,
@@ -365,9 +366,55 @@ def test_scale_out_plan_rejects_wrong_market_data_type():
 
 
 # ---------------------------------------------------------------------------
-# RiskConfig.
+# Same-bar exit ordering (first_reached_exit, §4.7/§8).
 # ---------------------------------------------------------------------------
 
+
+def test_first_reached_exit_prefers_level_nearest_the_open():
+    # A bar that sweeps both levels has no unique intra-bar path; §8 breaks the tie by
+    # proximity to the open. Here the open sits just above the target, so the target is
+    # reached first even though the stop is configured first.
+    assert first_reached_exit([100.0, 90.0], open_price=89.0) == 1
+    # Mirrored: the open is just below the stop, so the stop is reached first.
+    assert first_reached_exit([100.0, 90.0], open_price=99.0) == 0
+
+
+def test_first_reached_exit_uses_configured_order_on_a_tie():
+    # A bar symmetric about its open reaches both at the same distance: fall back to the
+    # configured order, which keeps the result deterministic.
+    assert first_reached_exit([100.0, 80.0], open_price=90.0) == 0
+
+
+def test_first_reached_exit_respects_the_trigger_filter():
+    levels = [100.0, 90.0]
+    assert first_reached_exit(levels, open_price=89.0, triggered=[False, True]) == 1
+    assert first_reached_exit(levels, open_price=89.0, triggered=[True, False]) == 0
+
+
+def test_first_reached_exit_returns_none_when_nothing_fires():
+    assert first_reached_exit([], open_price=100.0) is None
+    assert first_reached_exit([100.0], open_price=100.0, triggered=[False]) is None
+    assert first_reached_exit([None, float("nan")], open_price=100.0) is None
+
+
+def test_first_reached_exit_rejects_a_non_positive_open():
+    with pytest.raises(ConfigError):
+        first_reached_exit([100.0], open_price=0.0)
+
+
+def test_first_reached_exit_labels_a_swept_bar_take_profit_not_stop_loss():
+    # The reported bug: a bar whose range covers both the stop and the target was always
+    # labelled stop_loss because StopLoss was configured first. The paper configs run
+    # StopLoss(0.0002) then TakeProfit(0.0005), so reproduce that exact shape.
+    entry = 100.0
+    sl, tp = entry * 1.0002, entry * (1 - 0.0005)  # short: stop above, target below
+    open_ = tp + 0.00001  # opened near the target, so the target prints first
+    assert first_reached_exit([sl, tp], open_price=open_) == 1
+
+
+# ---------------------------------------------------------------------------
+# RiskConfig.
+# ---------------------------------------------------------------------------
 
 def test_risk_config_defaults():
     cfg = RiskConfig()

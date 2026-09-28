@@ -21,6 +21,7 @@ from ube.core.risk.exits import (
     chandelier_level,
     exit_level,
     exit_triggered,
+    first_reached_exit,
     is_triggered,
     scale_out_fraction,
     scale_out_plan,
@@ -74,6 +75,7 @@ __all__ = [
     "exit_level",
     "is_triggered",
     "exit_triggered",
+    "first_reached_exit",
     "scale_out_fraction",
     "scale_out_plan",
 ]

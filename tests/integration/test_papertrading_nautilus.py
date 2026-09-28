@@ -466,6 +466,64 @@ def test_crypto_perp_touched_stop_loss_fills_at_level() -> None:
     assert abs(closed[0].exit_price - 98.0) < 1e-6
 
 
+def test_crypto_perp_swept_bar_exits_at_the_level_reached_first() -> None:
+    """§4.7/§8 — when one bar sweeps *both* the stop and the target, the exit and its
+    ``reason`` follow the level the bar reached **first** (nearest its open), not the order
+    the exits are configured in.
+
+    The paper configs run ``StopLoss`` first and ``TakeProfit`` second, so the old
+    config-order rule stamped ``stop_loss`` on a trade whose bar ran to the target first —
+    the ``reason`` column then disagreed with what the trade actually did. Both bars below
+    print the same high/low and therefore trigger *both* exits; only the open differs, which
+    is what decides the intra-bar path.
+    """
+    instr = PRESETS["crypto_perp"].instrument
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        # Stop configured first, matching the paper configs (StopLoss then TakeProfit).
+        risk=RiskConfig(exit=(StopLoss(percent=0.02), TakeProfit(percent=0.05))),
+    )
+    cfg = PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
+
+    def _run(sweep_open: float) -> tuple[float, str]:
+        md = MarketData.from_records(
+            [
+                {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
+                 "timestamp": "2024-01-01T00:00:00Z"},
+                # Quiet hold so the entry fill (one-bar sandbox fill lag) has landed.
+                {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0,
+                 "timestamp": "2024-01-01T01:00:00Z"},
+                # Sweep bar: reaches the 105.0 target *and* dips through the 98.0 stop.
+                {"open": sweep_open, "high": 106.0, "low": 97.0, "close": sweep_open,
+                 "volume": 1000.0, "timestamp": "2024-01-01T02:00:00Z"},
+                # Quiet bars after the exit (the position is already flat).
+                {"open": sweep_open, "high": sweep_open + 1.0, "low": sweep_open - 1.0,
+                 "close": sweep_open, "volume": 1000.0, "timestamp": "2024-01-01T03:00:00Z"},
+                {"open": sweep_open, "high": sweep_open + 1.0, "low": sweep_open - 1.0,
+                 "close": sweep_open, "volume": 1000.0, "timestamp": "2024-01-01T04:00:00Z"},
+            ]
+        )
+        signals = from_target(np.array([1, 1, 0, 0, 0]))
+        state = init(cfg)
+
+        _, _events = step(md, signals, state, cfg)
+
+        (closed,) = trades(state.ledger, instruments={instr.symbol: instr})
+        return closed.exit_price, closed.exit_reason
+
+    # Opens beside the target (0.5 away) versus the stop (6.5 away) → the target prints
+    # first, so the trade must be booked as a take_profit filled at 105.0.
+    exit_px, reason = _run(104.5)
+    assert reason == "take_profit"
+    assert abs(exit_px - 105.0) < 1e-6
+
+    # Mirrored: the open sits beside the stop, so the stop prints first and still wins.
+    exit_px, reason = _run(99.0)
+    assert reason == "stop_loss"
+    assert abs(exit_px - 98.0) < 1e-6
+
+
 def test_crypto_perp_close_trigger_exit_fills_at_bar_close() -> None:
     """§9.4 — a ``trigger="close"`` SL still fills at the bar close, never the level.
 

@@ -58,6 +58,7 @@ __all__ = [
     "exit_level",
     "is_triggered",
     "exit_triggered",
+    "first_reached_exit",
     "scale_out_fraction",
     "scale_out_plan",
 ]
@@ -613,6 +614,51 @@ def exit_triggered(
         close=md.close,
         direction=_exit_direction(cfg, s),
     )
+
+
+def first_reached_exit(
+    levels: Sequence[object],
+    *,
+    open_price: object,
+    triggered: Sequence[bool] | None = None,
+) -> int | None:
+    """Which of several price levels the bar reached first (§4.7 intra-bar ambiguity).
+
+    A bar that sweeps *both* a stop and a target has no unique intra-bar path: OHLC records
+    only that each extreme was printed, never the order they printed in. §8 resolves that
+    ambiguity by proximity to the bar's **open** — price starts at ``open_price`` and gets to
+    the level nearest it first, so a level the open has already crossed is at distance zero
+    and fires immediately. This makes "which exit fired" a function of the bar's own geometry
+    rather than of the order the exits happen to sit in the config, so a trade whose bar ran
+    through the target before the stop is labelled ``take_profit``.
+
+    ``levels[i]`` is exit ``i``'s level on the bar under test. ``triggered[i]`` optionally
+    filters to the exits that actually fired; entries that are ``False``, ``None``,
+    non-finite, or non-positive are ignored. ``None``/``NaN`` levels stand for an exit with no
+    price level (:class:`TimeExit`, or a ``"close"``-triggered exit) — those fill at the bar
+    close, so callers should pass the close as their level. Exact ties (a bar symmetric about
+    its open) fall back to the configured order, keeping the result deterministic and
+    preserving the stop-first default.
+
+    Returns the index of the first exit reached, or ``None`` when nothing fired.
+    """
+    op = _validate_positive(open_price, "open_price")
+    ranked: list[tuple[float, int]] = []
+    for i, raw in enumerate(levels):
+        if triggered is not None and not bool(triggered[i]):
+            continue
+        if raw is None:
+            continue
+        try:
+            f = float(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(f) or f <= 0.0:
+            continue
+        ranked.append((abs(f - op), i))
+    if not ranked:
+        return None
+    return min(ranked)[1]
 
 
 # ---------------------------------------------------------------------------

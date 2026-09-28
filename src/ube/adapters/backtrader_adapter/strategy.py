@@ -49,7 +49,7 @@ from ube.adapters.backtrader_adapter.instrument_map import (
 from ube.core.cost import CostModel, fill_cost, slipped_price
 from ube.core.data import MarketData
 from ube.core.errors import EngineError
-from ube.core.risk.exits import Exit
+from ube.core.risk.exits import Exit, first_reached_exit
 from ube.core.risk.sizing import _entry_fee_rate, size_position
 
 __all__ = [
@@ -369,11 +369,21 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             and abs(self.position.size) > _FLAT_EPS
         ):
             fired: BtExitLine | _SignalExit | None = None
-            for line in self._pos.plan:
-                if line.index in self._pos.spent or not bool(line.triggered[i]):
-                    continue
-                fired = line
-                break
+            due = [
+                line
+                for line in self._pos.plan
+                if line.index not in self._pos.spent and bool(line.triggered[i])
+            ]
+            if due:
+                # Several exits can trigger on one bar; the one the bar reached first wins
+                # (§4.7/§8). Level-less exits (TimeExit, trigger="close") fill at the close,
+                # so they rank on the close price.
+                ranked = [
+                    float(line.level[i]) if line.level is not None else float(self.data.close[0])
+                    for line in due
+                ]
+                pick = first_reached_exit(ranked, open_price=float(self.data.open[0]))
+                fired = due[0 if pick is None else pick]
             if fired is None:
                 side = self._pos.side
                 if side == 1 and bool(self.data.long_exit[0]):

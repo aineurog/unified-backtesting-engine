@@ -53,8 +53,10 @@ Nautilus's bar-adaptive fill model legitimately differs from the core simulation
   realized P&L and ``exit_reason`` are the locked parity numbers.
 * On a bar crossing **both** a stop and a target, Nautilus fills the limit (target)
   *first*; no ``BacktestVenueConfig`` flag flips this (probe-verified on 1.221.0).
-  §8 prescribes stop-first; the actor honours §8 precedence for close-time exits and
-  documents this as a residual divergence for the parity report.
+  §8 instead resolves the collision by which level the bar reached first (nearest its
+  open), so the two agree when the target is the nearer level and diverge when the stop
+  is; the actor honours §8 precedence for close-time exits and documents this as a
+  residual divergence for the parity report.
 * Fees: ``commission`` is folded into the instrument's ``maker_fee`` /
   ``taker_fee``, so Nautilus charges per fill; ``funding`` / ``borrow`` have no native
   equivalent and are re-derived from the core ``CostModel`` by

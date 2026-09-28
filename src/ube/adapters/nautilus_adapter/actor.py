@@ -54,14 +54,16 @@ Trigger timing notes (probe-verified against Nautilus 1.221.0 backtest matching)
 
 Documented divergences (parity note): Nautilus's intra-bar matching is *target-first* —
 on a bar that crosses both a stop and a target, the LIMIT fills before the STOP, whereas
-§8 prescribes stop-before-target. No BacktestVenueConfig flag flips this (probe-proven:
+§8 resolves the same-bar collision by which level the bar reached first (``first_reached_exit``:
+nearest the bar's open). No BacktestVenueConfig flag flips this (probe-proven:
 ``bar_adaptive_high_low_ordering`` and ``reject_stop_orders`` in all four combinations
 still filled the target first). The Actor therefore implements §8 precedence
 deterministically only where it *can*: close-time risk exits are evaluated *before*
 close-time signal actions, and the same-bar stop/target *quantity* collision that would
 over-fill a scale-out is bounded by re-syncing exit quantities each bar. The residual
-same-bar stop-vs-target collision with native orders fills target-first; this is recorded
-as a known divergence for the parity report.
+same-bar stop-vs-target collision with native orders fills target-first, so the two agree
+whenever the target is the nearer level from the open and diverge when the stop is; this
+is recorded as a known divergence for the parity report.
 """
 
 from __future__ import annotations
