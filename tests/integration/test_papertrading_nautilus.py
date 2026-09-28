@@ -466,6 +466,123 @@ def test_crypto_perp_touched_stop_loss_fills_at_level() -> None:
     assert abs(closed[0].exit_price - 98.0) < 1e-6
 
 
+def test_crypto_perp_risk_exit_before_entry_fill_books_on_triggering_bar() -> None:
+    """A risk exit that fires *before* its entry fill lands must not be dropped.
+
+    The sandbox delivers the open fill one bar after submission, so a stop/target touched
+    on the very next bar triggers while ``_sim_qty`` is still 0. The old code called
+    ``_submit_close``, which returned early with nothing to close: the exit was silently
+    lost, the late entry fill re-opened the position, and the exit then re-fired on a later
+    bar against a *different* level — booking a different fill price and a different
+    ``reason`` than the backtest/vbt/backtrader engines.
+
+    The sandbox delivers the open fill *after* the next bar's ``on_bar``, so on the bar
+    right after the entry is submitted ``_sim_qty`` is still 0. Bar 1 — the bar the entry
+    fill arrives on, and the one that dips through the 98.0 stop — is the only bar that
+    reaches any level; bar 2 sweeps the 105.0 target. The exit must book on bar 1 as a
+    stop_loss at 98.0, never re-fire on bar 2 as a take_profit.
+    """
+    instr = PRESETS["crypto_perp"].instrument
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        # Stop first, matching the paper configs.
+        risk=RiskConfig(exit=(StopLoss(percent=0.02), TakeProfit(percent=0.05))),
+    )
+    cfg = PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
+    md = MarketData.from_records(
+        [
+            # Bar 0 — the open order is submitted here, so its fill is still in flight.
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T00:00:00Z"},
+            # Bar 1 — the entry fill arrives *after* this on_bar, and the bar dips through
+            # the 98.0 stop: the fill-lag window where the exit has no quantity to close.
+            {"open": 100.0, "high": 100.0, "low": 97.0, "close": 99.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T01:00:00Z"},
+            # Bar 2 sweeps the 105.0 target — a later bar must not re-fire the exit.
+            {"open": 99.0, "high": 106.0, "low": 98.5, "close": 105.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T02:00:00Z"},
+            {"open": 105.0, "high": 105.5, "low": 104.0, "close": 105.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T03:00:00Z"},
+            {"open": 105.0, "high": 105.5, "low": 104.0, "close": 105.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T04:00:00Z"},
+        ]
+    )
+    signals = from_target(np.array([1, 1, 1, 1, 0]))
+    state = init(cfg)
+
+    _, _events = step(md, signals, state, cfg)
+
+    (closed,) = trades(state.ledger, instruments={instr.symbol: instr})
+    assert closed.exit_reason == "stop_loss", "the stop on bar 1 must own the exit"
+    assert abs(closed.exit_price - 98.0) < 1e-6, "and it must fill at the stop level"
+    # The target on bar 3 must not produce a second, later exit.
+    assert len([e for e in state.ledger.events
+                if e.event_type == EventType.FILL and e.exit_reason is not None]) == 1
+
+
+def test_crypto_perp_partial_risk_exit_before_entry_fill_scales_out_and_keeps_remainder() -> None:
+    """A *partial* risk exit during the fill-lag window must scale out, not flatten.
+
+    Covers the scale-out branch of the fill-lag fix: a 50% take-profit that triggers while
+    the entry fill is still in flight must close half the (not-yet-filled) position at the
+    target level, and the resulting ``POSITION_CHANGE`` must report the *remainder* rather
+    than a hardcoded flat 0.0 — the position survives, so its entry reference must too.
+    """
+    instr = PRESETS["crypto_perp"].instrument
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        risk=RiskConfig(
+            exit=(StopLoss(percent=0.02), TakeProfit(percent=0.05, scale_out=0.5))
+        ),
+    )
+    cfg = PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
+    md = MarketData.from_records(
+        [
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T00:00:00Z"},
+            # Bar 1 sweeps the 105.0 target while the entry fill is still in flight.
+            {"open": 100.0, "high": 106.0, "low": 100.0, "close": 105.0, "volume": 1000.0,
+             "timestamp": "2024-01-01T01:00:00Z"},
+            # Bar 2 stays below the target, so only the signal exit closes the remainder.
+            {"open": 104.5, "high": 104.5, "low": 104.0, "close": 104.5, "volume": 1000.0,
+             "timestamp": "2024-01-01T02:00:00Z"},
+        ]
+    )
+    signals = from_target(np.array([1, 1, 0]))
+    state = init(cfg)
+
+    _, _events = step(md, signals, state, cfg)
+
+    events = state.ledger.events
+    opens = [e for e in events
+             if e.event_type == EventType.FILL and e.exit_reason is None]
+    fills = [e for e in events
+             if e.event_type == EventType.FILL and e.exit_reason is not None]
+    assert fills, "the pending scale-out must book once the entry fill lands"
+    first = fills[0]
+    assert first.exit_reason == "take_profit", "and it must keep the real exit reason"
+    assert abs(first.price - 105.0) < 1e-6, "filling at the target level"
+
+    # The timing is what makes this a real regression test: the target is swept on the bar
+    # after the entry, so the scale-out must book on that bar. Dropping it (the old
+    # behaviour) let it re-fire one bar later with the same reason and price, which is why
+    # a reason/price-only assertion is not enough to catch the bug.
+    hour = 3600 * 10**9
+    bar1 = opens[0].timestamp + hour
+    assert first.timestamp == bar1, "must book on the bar that swept the target"
+
+    assert abs(first.quantity - 0.5 * opens[0].quantity) < 1e-6, "half the position"
+
+    # A scale-out leaves a live position, so the POSITION_CHANGE that follows it must
+    # report the *remainder*, not the old hardcoded flat 0.0.
+    after = events[events.index(first) + 1:]
+    (change,) = [e for e in after if e.event_type == EventType.POSITION_CHANGE][:1]
+    assert change.position_after > 0, "remainder must be reported, not flat"
+    assert abs(change.position_after - 0.5 * opens[0].quantity) < 1e-6
+
+
 def test_crypto_perp_swept_bar_exits_at_the_level_reached_first() -> None:
     """§4.7/§8 — when one bar sweeps *both* the stop and the target, the exit and its
     ``reason`` follow the level the bar reached **first** (nearest its open), not the order

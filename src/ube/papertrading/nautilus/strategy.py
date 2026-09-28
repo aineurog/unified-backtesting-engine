@@ -116,6 +116,12 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._borrow_rate = float(getattr(config, "borrow_rate", 0.0) or 0.0)
         self._funding_interval_ns = int(getattr(config, "funding_interval_ns", 0) or 0)
         self._pending_credit: float = 0.0
+        # A risk exit that triggered before its entry fill landed (the sandbox delivers
+        # the open fill one bar after submission). Stashed as
+        # ``(exit_reason, fraction, level_price)`` and applied the moment that fill
+        # arrives, so the exit still books on the bar that triggered it instead of being
+        # silently dropped and re-evaluated on a later bar.
+        self._pending_risk_exit: tuple[str, float, float | None] | None = None
         # Bar history for exit level computation (vectorized, §8). Stored as
         # raw Bar objects to rebuild MarketData for exit_triggered.
         self._bars: list[Bar] = []
@@ -476,8 +482,17 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             # bar close. The level price is stashed per-order and read on fill in
             # ``on_order_filled`` (the sandbox would otherwise price the MARKET order at bar close).
             close_price = exit_level_price if exit_level_price is not None else self._last_close
-            # For partial closes, keep remaining position; for full, flatten.
-            self._submit_close(close_price, fraction=fraction, exit_reason=reason)
+            # Fill lag: the entry order submitted on the previous bar has not been filled
+            # yet, so ``_sim_qty`` is still 0 and ``_submit_close`` has nothing to close.
+            # Stash the exit instead of dropping it — a dropped exit leaves the position
+            # open, the late entry fill re-opens it, and the exit then re-fires on some
+            # later bar against a different level, changing both the fill price and the
+            # reason versus the backtest/vbt/backtrader engines. It is applied in
+            # ``on_order_filled`` the moment the entry fill lands.
+            if self._sim_qty <= 0 and self._pending_open_qty > 0:
+                self._pending_risk_exit = (reason, fraction, exit_level_price)
+            else:
+                self._submit_close(close_price, fraction=fraction, exit_reason=reason)
             if fraction >= 1.0 - 1e-12:
                 self._sim_side = 0
                 self._sim_qty = 0.0
@@ -588,6 +603,11 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 # stale.  Emit a synthetic close synchronously so the ledger's cash
                 # trail is complete before the new position opens.
                 self._emit_synthetic_close(self._last_close)
+            # A risk exit stashed against the entry fill that is still in flight is moot
+            # once this signal has closed the position — there is nothing left for it to
+            # close. Left set, it would emit a second close when the stale entry fill
+            # eventually lands, and that phantom close would clobber the new position.
+            self._pending_risk_exit = None
             self._sim_side = 0
             self._sim_qty = 0.0
             self._entry_bar = None
@@ -663,6 +683,25 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             else:
                 self._extreme_price = None
                 self._atr_window = []
+            # A risk exit that triggered before this entry fill landed (fill lag): close
+            # now that the quantity is known, at the level of the bar that triggered it, so
+            # the reason and price match the backtest / vbt / backtrader engines.
+            if self._pending_risk_exit is not None:
+                pending_reason, pending_fraction, pending_level = self._pending_risk_exit
+                self._pending_risk_exit = None
+                if pending_fraction >= 1.0 - 1e-12:
+                    px = pending_level if pending_level is not None else self._last_close
+                    self._emit_synthetic_close(px, exit_reason=pending_reason)
+                    self._sim_side = 0
+                    self._sim_qty = 0.0
+                    self._entry_bar = None
+                    self._entry_price = None
+                    self._reset_exit_seed()
+                else:
+                    partial = self._sim_qty * pending_fraction
+                    px = pending_level if pending_level is not None else self._last_close
+                    self._emit_synthetic_close(px, quantity=partial, exit_reason=pending_reason)
+                    self._sim_qty -= partial
         elif is_close:
             exit_reason = close_reason or "signal"
             # Clear pending credit if this close fill matches the pending credit
@@ -745,7 +784,13 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
 
     # -- synthetic close for fill-lag reversals ----------------------------- #
 
-    def _emit_synthetic_close(self, price: float | None) -> None:
+    def _emit_synthetic_close(
+        self,
+        price: float | None,
+        *,
+        quantity: float | None = None,
+        exit_reason: str = "signal",
+    ) -> None:
         """Emit a synthetic close when the prior fill hasn't landed yet.
 
         On a same-bar reverse the sandbox delivers the open fill *after* the next
@@ -755,18 +800,23 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         (``CASH_MOVEMENT`` + ``FILL`` + ``COMMISSION`` + ``POSITION_CHANGE``)
         synchronously so the ledger's cash trail is complete before the new
         position opens (§4.6).
+
+        The same fill lag strands a *risk* exit: a stop/target can trigger on the bar
+        right after the entry is submitted, before the entry fill exists to close. The
+        exit is then applied here once the quantity is known — carrying its own
+        ``exit_reason`` and level price, so it books as ``take_profit`` / ``stop_loss``
+        on the bar that triggered it rather than as a bare ``signal``.
+
+        ``quantity`` defaults to the whole open position; pass a fraction for a
+        scale-out. ``POSITION_CHANGE`` reports the post-close remainder.
         """
-        if (
-            self._instrument is None
-            or price is None
-            or price <= 0
-            or self._pending_open_qty <= 0
-        ):
+        qty = self._sim_qty if self._sim_qty > 0 else self._pending_open_qty
+        if quantity is not None:
+            qty = min(float(quantity), qty) if qty > 0 else float(quantity)
+        if self._instrument is None or price is None or price <= 0 or qty <= 0:
             return
 
         close_side = -self._sim_side  # sell to close long, buy to close short
-        qty = self._pending_open_qty
-        # Same §8 price-level slippage as a real fill of ``close_side``.
         price = self._slipped(price, close_side)
         notional = qty * price * self._multiplier
         hist = self._hist_ts
@@ -791,7 +841,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 price=price,
                 notional=notional,
                 order_id="",
-                exit_reason="signal",
+                exit_reason=exit_reason,
             )
         )
         # Commission.
@@ -809,19 +859,23 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                     currency=self._quote,
                 )
             )
-        # Position change: flat after close.
+        # Position change: the post-close remainder (0.0 for a full close, the leftover
+        # after a scale-out).
+        remainder = max(self._sim_qty - qty, 0.0)
         self._events.append(
             LedgerEvent(
                 EventType.POSITION_CHANGE,
                 hist,
                 self._iid,
-                side=0,
-                position_after=0.0,
+                side=self._sim_side if remainder > 0 else 0,
+                position_after=remainder if remainder > 0 else 0.0,
             )
         )
-        # Record close entry for trade ledger compatibility.
-        self._entry_price = None
-        self._entry_bar = None
+        # Record close entry for trade ledger compatibility. Cleared only on a full close —
+        # a scale-out keeps the position, so its entry reference must survive.
+        if remainder <= 0:
+            self._entry_price = None
+            self._entry_bar = None
 
     # -- order submission -------------------------------------------------- #
     def _slipped(self, price: float, side: int) -> float:
