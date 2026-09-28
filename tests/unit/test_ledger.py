@@ -352,6 +352,50 @@ def test_trades_same_bar_flip_attributes_commissions_to_correct_trades():
     assert long_t.net_pnl == pytest.approx(-19.0)
 
 
+def test_trades_same_bar_flip_survives_float_quantity_noise():
+    # Adapters size a flip's exit leg off the *current* equity, so the closing fill's
+    # quantity can land one float-ulp off the position it settles (e.g. 74658.12187
+    # closing a position of 74658.12186999999). The residue is pure float noise, far
+    # below any real flip, but it used to exceed the absolute _EPS floor and spin the
+    # fill loop into opening a phantom zero-quantity round trip — which then stole the
+    # next commission from the per-bar FIFO and mis-attributed fees across trades
+    # (GBPUSD paper: trade 3 charged 187.48 instead of 139.25). The two ledgers below
+    # are economically identical and must fold identically.
+    def _flip_ledger(lon_entry: float) -> EventLedger:
+        return EventLedger(
+            [
+                _fill(0, "GBPUSD", -1, 1000.0, 1.30),   # open short
+                _commission(0, "GBPUSD", 0.65),
+                _fill(1, "GBPUSD", 1, 1000.0, 1.31),    # close the short
+                _fill(1, "GBPUSD", 1, lon_entry, 1.31), # re-enter long, same bar
+                _commission(1, "GBPUSD", 0.60),          # exit-leg commission
+                _commission(1, "GBPUSD", 0.58),          # entry-leg commission
+                _fill(2, "GBPUSD", -1, 900.0, 1.32),    # close the long
+                _fill(2, "GBPUSD", -1, 800.0, 1.32),    # re-enter short, same bar
+                _commission(2, "GBPUSD", 0.55),          # exit-leg commission
+                _commission(2, "GBPUSD", 0.52),          # entry-leg commission
+            ]
+        )
+
+    exact = _flip_ledger(900.0)
+    noisy = _flip_ledger(900.0000000001)  # one ulp above the fill that closes it
+
+    for ledger in (exact, noisy):
+        result = trades(ledger)
+        assert len(result) == 2, "float noise must not open a phantom round trip"
+        short_t, long_t = result
+        assert short_t.side == -1
+        assert short_t.quantity == pytest.approx(1000.0)
+        assert short_t.commission == pytest.approx(0.65 + 0.60)
+        assert long_t.side == 1
+        assert long_t.quantity == pytest.approx(900.0)
+        # the entry leg of the re-entered short must not leak onto the long
+        assert long_t.commission == pytest.approx(0.58 + 0.55)
+        assert long_t.exit_timestamp == _ns(2), "a fully closed trade keeps its exit bar"
+
+    assert trades(noisy)[1].net_pnl == pytest.approx(trades(exact)[1].net_pnl)
+
+
 # ---------------------------------------------------------------------------
 # positions view.
 # ---------------------------------------------------------------------------

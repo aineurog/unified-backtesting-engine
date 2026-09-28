@@ -714,8 +714,15 @@ def _process_fill(
 
     touched: list[_MutableTrade] = []
     remaining = q
-    while abs(remaining) > _EPS:
-        if abs(pos) < _EPS:
+    # Scale-relative tolerance: adapters can emit a quantity one float-ulp off the
+    # position it settles (e.g. 74658.12186999999 vs 74658.12187), so a close that
+    # consumes the position exactly can leave a residual far below the absolute
+    # _EPS floor yet still above it. Treat residues below ~1e-9 relative (pure
+    # float noise, never a real flip) as flat, keeping the fold's per-bar FIFO
+    # commission pairing deterministic across engines on same-bar reversals.
+    tol = max(abs(q), 1.0) * 1e-9
+    while abs(remaining) > tol:
+        if abs(pos) < tol:
             prev = state.current.get(iid)
             if prev is not None and (prev.entry_units > 0.0 or prev.exit_units > 0.0):
                 completed.append(prev)
@@ -747,7 +754,9 @@ def _process_fill(
                 mt.exit_reason = event.exit_reason
             pos += close_q
             remaining -= close_q
-            if abs(mt.entry_units - mt.exit_units) < _EPS:
+            if abs(remaining) <= tol:
+                remaining = 0.0
+            if abs(mt.entry_units - mt.exit_units) < tol:
                 mt.exit_timestamp = event.timestamp
         touched.append(mt)
 
