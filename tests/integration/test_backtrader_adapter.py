@@ -48,12 +48,20 @@ from ube.adapters.backtrader_adapter.overrides import (
 )
 from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel
+from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
 from ube.core.experiment_log import ExperimentLog
 from ube.core.ledger import EventType
 from ube.core.result import BacktestResult
 from ube.core.risk import RiskConfig, SizeModel
-from ube.core.risk.exits import ATRStop, ChandelierExit, TakeProfit, TimeExit, TrailingStop
+from ube.core.risk.exits import (
+    ATRStop,
+    ChandelierExit,
+    StopLoss,
+    TakeProfit,
+    TimeExit,
+    TrailingStop,
+)
 from ube.core.signals import from_target
 from ube.testing.synthetic import PRESETS, synthetic_bars
 
@@ -575,6 +583,63 @@ def test_take_profit_scale_out_partial_close():
     entry_qty = fills[0].quantity
     assert sum(e.quantity for e in fills[1:]) == pytest.approx(entry_qty, abs=1e-6)
 
+
+
+def test_touched_stop_exit_fills_at_its_level_not_next_bar_open():
+    """§9.4 parity: a *touched* stop fills at its own level, not the venue's next-bar open.
+
+    The reference (nautilus) and vectorbt both price a touched stop/target at the exit's
+    own level. Backtrader submitted a plain market order, so the level was used only to
+    *rank* competing exits and the fill took the next bar's open instead — every touched
+    exit then booked a different price and PnL from the reference. In the live
+    crypto-perp ledger that showed up as a running ``balance`` that drifted mid-table
+    (10045.67 / 10025.82 against the reference 10041.79 / 9991.60) purely from stop rows.
+
+    Bar 2 is the first bar whose low reaches the 98.0 stop, and bar 3 opens at 97.0 — so
+    the level (98.0) and the next-bar open (97.0) are distinguishable.
+    """
+    md = MarketData.from_records(
+        [
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1.0,
+             "timestamp": "2024-01-01T00:00:00Z"},
+            # Entry fills here at the next-bar open of 100.0.
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1.0,
+             "timestamp": "2024-01-01T01:00:00Z"},
+            # First bar whose low reaches the 2% stop at 98.0.
+            {"open": 100.0, "high": 100.0, "low": 97.0, "close": 99.0, "volume": 1.0,
+             "timestamp": "2024-01-01T02:00:00Z"},
+            # Next-bar open is 97.0 — the old (wrong) fill price.
+            {"open": 97.0, "high": 98.0, "low": 96.0, "close": 97.0, "volume": 1.0,
+             "timestamp": "2024-01-01T03:00:00Z"},
+            {"open": 97.0, "high": 97.0, "low": 96.0, "close": 96.0, "volume": 1.0,
+             "timestamp": "2024-01-01T04:00:00Z"},
+        ]
+    )
+    result = BacktraderAdapter().run(
+        md,
+        from_target([1, 1, 1, 1, 0]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(StopLoss(percent=0.02),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+    (trade,) = result.trades
+    assert trade.exit_reason == "stop_loss"
+    assert trade.entry_price == pytest.approx(100.0, abs=1e-6)
+    assert trade.exit_price == pytest.approx(98.0, abs=1e-6), (
+        "a touched stop must fill at its own level, not the next bar's open"
+    )
+    # The realized PnL must be priced off the 98.0 level — gross is fee/funding agnostic,
+    # so this pins the exit price rather than the cost model.
+    mult = PRESETS["crypto_perp"].instrument.contract_multiplier or 1.0
+    assert trade.gross_pnl == pytest.approx(
+        (98.0 - 100.0) * trade.quantity * mult, abs=1e-6
+    )
+    # And the running balance must follow that level-priced trade.
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(
+        100000.0 + trade.net_pnl, abs=1e-6
+    )
 
 
 def test_volatility_target_sizing_runs():

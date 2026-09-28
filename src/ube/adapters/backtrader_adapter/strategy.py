@@ -280,7 +280,12 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                     f"{capacity:.6g} {ctx.inst.settlement_currency}"
                 )
 
-    def _realize_exit_pnl(self, exit_side: int, qty: float) -> None:
+    def _realize_exit_pnl(
+        self,
+        exit_side: int,
+        qty: float,
+        level_price: float | None = None,
+    ) -> None:
         """Book the realized net PnL of an exiting portion into ``_cash_balance`` (§6.3).
 
         Mirrors the reference actor, which realizes a closing trade's net PnL (gross at
@@ -289,6 +294,13 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         already-realized balance, exactly like the reference does before sizing the flip.
         The entry leg is matched against the open position's raw fill price; both prices
         are slipped the same way the fold slips them.
+
+        ``level_price`` is a *touched* risk exit's own level. §9.4 parity: the reference
+        fills a touched stop/target **at its level**, slipped like every other fill, not at
+        the venue's next-bar open — so the level is what has to be priced here, or the
+        realized PnL (and therefore the running balance) drifts from the reference. Pass
+        ``None`` to keep next-bar-open pricing, which is correct for signal closes, flips,
+        and level-less exits (``TimeExit`` / ``trigger="close"``).
         """
         ctx = self._ctx
         if self._pos is None or qty <= _FLAT_EPS or ctx.cost_model is None:
@@ -297,7 +309,11 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         cost_model = ctx.cost_model
         mult = ctx.inst.contract_multiplier
         entry_slip = float(slipped_price(pos.entry_price, pos.side, ctx.slip))
-        exit_slip = self._fill_price(exit_side)
+        exit_slip = (
+            self._fill_price(exit_side)
+            if level_price is None
+            else float(slipped_price(float(level_price), exit_side, ctx.slip))
+        )
         if not np.isfinite(exit_slip):
             return
         gross = pos.side * (exit_slip - entry_slip) * qty * mult
@@ -406,7 +422,16 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                     exit_qty = min(ctx.inst.size_increment, open_units)
                 if exit_qty > _FLAT_EPS:
                     exit_side = -self._pos.side
-                    self._realize_exit_pnl(exit_side, exit_qty)
+                    # A *touched* risk exit fills at its own level (§9.4 parity with the
+                    # reference), not at the venue's next-bar open. ``level`` is None for
+                    # level-less exits (TimeExit / trigger="close") and for signal closes,
+                    # which correctly keep next-bar-open pricing.
+                    level_price = (
+                        None
+                        if isinstance(fired, _SignalExit) or fired.level is None
+                        else float(fired.level[i])
+                    )
+                    self._realize_exit_pnl(exit_side, exit_qty, level_price)
                     order = (
                         self.buy(size=exit_qty)
                         if exit_side == 1
@@ -434,6 +459,7 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                         "side": exit_side,
                         "size": exit_qty,
                         "reason": fired.reason,
+                        "level_price": level_price,
                     }
                     if not isinstance(fired, _SignalExit):
                         self._pos.spent.add(fired.index)
@@ -526,6 +552,12 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             )
             self._pending_entry = None
         else:
+            # A touched risk exit is booked at its own level (slipped like every other
+            # fill), not at backtrader's next-bar market fill — §9.4 parity with the
+            # reference. Signal closes and level-less exits keep ``order.executed.price``.
+            level_price = meta.get("level_price")
+            if level_price is not None:
+                price = float(slipped_price(float(level_price), side, ctx.slip))
             self.order_records.append(
                 BtOrderRecord(
                     submit_bar,
