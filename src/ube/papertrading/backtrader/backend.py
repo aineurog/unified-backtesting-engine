@@ -350,12 +350,17 @@ class BacktraderPaperEngine(PaperEngine):
                 quantity=float(open_pos.quantity),
                 price=float(win_data.open[0]),
             )
+        # ATR-based exits (§5.2) resolve their named series from ``state.aux_data``; a
+        # ``MarketData`` value is re-aligned to the sliced window by timestamp inside the
+        # adapter, so the full-frame aux can be passed as-is.
+        aux = getattr(state, "aux_data", None)
         result = adapter.run(
             data=win_data,
             signals=encoded,
             config=bt_config,
             carried=carried,
             carry_final_exit=True,
+            aux_data=aux or None,
         )
 
         events = list(result.ledger.events)

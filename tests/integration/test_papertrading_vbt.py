@@ -16,6 +16,7 @@ from ube.core.config import BacktestConfig, SignalConfig
 from ube.core.data import MarketData
 from ube.core.errors import EngineError
 from ube.core.ledger import trades
+from ube.core.risk import RiskConfig
 from ube.core.risk.exits import ATRStop, TakeProfit
 from ube.core.signals import Signals, from_target
 from ube.papertrading import get_paper_engine, get_state_class, init, run
@@ -326,3 +327,94 @@ def test_gapped_resume_does_not_double_book_starting_balance() -> None:
         f"initial deposit booked {len(seeds)} times (double-booking leak): "
         f"{[c.amount for c in seeds]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# ATR exits via aux_data (§5.2)
+# ---------------------------------------------------------------------------
+
+
+def _atr_config(**kw: object) -> PaperConfig:
+    instr = PRESETS[AC].instrument
+    risk = RiskConfig(exit=(ATRStop(mult=0.05, period=3, atr="atr_1m"),))
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        risk=risk,
+    )
+    return PaperConfig(base=bc, engine="vectorbt", starting_balance=10_000.0, **kw)
+
+
+def test_atr_exit_without_aux_data_fails_fast() -> None:
+    # The adapter refuses an ATR exit whose named series is absent (never derives ATR from
+    # the signal bars). The paper path must surface that, not silently drop the exit.
+    data = synthetic_bars(PRESETS[AC], n_bars=24)
+    signals = from_target(np.array([0, 0, 0, 0, 1] + [0] * 19))
+    cfg = _atr_config()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        with pytest.raises(EngineError, match="atr_1m"):
+            run("x", data, signals, cfg, db_path=db)
+
+
+def test_atr_exit_with_aux_data_closes_the_trade() -> None:
+    # The same run with `aux_data={"atr_1m": md}` supplied: the named series resolves, the
+    # ATR stop becomes a live sl_stop fraction, and the long is closed by `atr_stop`.
+    data = synthetic_bars(PRESETS[AC], n_bars=24)
+    signals = from_target(np.array([0, 0, 0, 0, 1] + [0] * 19))
+    cfg = _atr_config()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        state, _ = run("x", data, signals, cfg, db_path=db, aux_data={"atr_1m": data})
+
+    # aux is persisted for the next window to reuse (the engine also stamps its own
+    # ``vbt`` marker key, so assert membership rather than the whole dict).
+    assert "atr_1m" in state.aux_data
+    assert isinstance(state.aux_data["atr_1m"], MarketData)
+
+    got = _summary(state, cfg)
+    assert got, "ATR stop never fired — the named aux series was not consumed"
+    assert got[0][0] == 1
+    assert state.open_position is None
+
+
+def test_atr_exit_survives_windowed_resume_with_aux() -> None:
+    # Split windows: the aux MarketData spans the full frame on every step, so the adapter
+    # re-aligns it to each sliced window by timestamp. Without that re-alignment the
+    # length check in `atr_series_for_exit` would fail on the shorter resume window.
+    data = synthetic_bars(PRESETS[AC], n_bars=24)
+    signals = from_target(np.array([0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1] + [0] * 12))
+    cfg = _atr_config()
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        run(
+            "x",
+            _slice_md(data, slice(0, 12)),
+            _slice_sig(signals, slice(0, 12)),
+            cfg,
+            db_path=db,
+            aux_data={"atr_1m": data},
+        )
+        # Window 2 is short but the aux still carries the full 24-bar frame.
+        state, _ = run(
+            "x",
+            _slice_md(data, slice(0, 24)),
+            _slice_sig(signals, slice(0, 24)),
+            cfg,
+            db_path=db,
+            aux_data={"atr_1m": data},
+        )
+
+    assert state.open_position is None

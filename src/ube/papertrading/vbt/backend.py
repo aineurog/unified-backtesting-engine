@@ -323,7 +323,13 @@ class VbtPaperEngine(PaperEngine):
         vbt_config = dataclasses.replace(
             config.base, engine="vectorbt", engine_overrides=vbt_overrides
         )
-        result = VectorbtAdapter().run(win_data, encoded, vbt_config)
+        # ATR-based exits (§5.2) resolve their named series from ``state.aux_data``; a
+        # ``MarketData`` value is re-aligned to the sliced window by timestamp inside the
+        # adapter, so the full-frame aux can be passed as-is.
+        aux = getattr(state, "aux_data", None)
+        result = VectorbtAdapter().run(
+            win_data, encoded, vbt_config, aux_data=aux or None
+        )
 
         events = list(result.ledger.events)
         # The adapter books the *window-start* balance as a cash inflow at ``bar_ts[0]``

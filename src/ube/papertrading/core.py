@@ -24,7 +24,8 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -402,6 +403,7 @@ def step(
     signals: Signals,
     state: PaperState,
     config: PaperConfig,
+    aux_data: Mapping[str, Any] | None = None,
 ) -> tuple[PaperState, list[LedgerEvent]]:
     """Process one slice of bars through the paper engine (§9.1 "I'll call you").
 
@@ -414,6 +416,13 @@ def step(
         state: The current session state (mutated in place: ledger appended, cursor
             advanced, open position recomputed).
         config: The paper-trading configuration.
+        aux_data: Optional derived-series map (§5.2) referenced by name from ATR exits
+            (``ATRStop`` / ``ChandelierExit``) — e.g. ``{"atr_1m": <MarketData>}`` for
+            ``ATRStop(atr="atr_1m")``. Stored on ``state.aux_data`` (and therefore
+            persisted) so the backend can hand it to the adapter with the exact names the
+            exit configs reference. A precomputed array may be used for a full-window
+            (non-window-replay) engine; window-replay engines re-align ``MarketData``
+            values to their own sliced window by timestamp.
 
     Returns:
         ``(state, new_events)`` — the (same) state and the events this slice produced.
@@ -479,6 +488,13 @@ def step(
     # Gaps (bars skipped between runs) are *allowed* — they are inherent to streaming
     # feeds and are not replays. The plan previously conflated gaps with stale/duplicate
     # by requiring contiguity; that requirement is dropped (plan blocker #9).
+
+    # Aux data for ATR-based exits (§5.2): the exit configs reference names, the backend
+    # reads them from ``state.aux_data`` on every step. Storing on the state (and thereby
+    # persisting it) keeps the engine invocation a plain ``execute(state, data, signals,
+    # config)`` call — no per-backend signature drift.
+    if aux_data is not None:
+        state.aux_data = dict(aux_data)
 
     try:
         engine = engine_cls()
@@ -609,6 +625,7 @@ def run(
     *,
     db_path: str | None = None,
     run_id: str | None = None,
+    aux_data: Mapping[str, Any] | None = None,
 ) -> tuple[PaperState, list[LedgerEvent]]:
     """One-call scheduled-run entry point (strategy_name → run_id → step → auto-save).
 
@@ -630,6 +647,8 @@ def run(
             ``config.state_path``.
         run_id: Optional explicit run_id override (defaults to
             ``strategy_name``).
+        aux_data: Optional derived-series map (§5.2) referenced by name from ATR exits —
+            forwarded to :func:`step` and stored on ``state.aux_data``.
 
     Returns:
         ``(state, new_events)`` — same as ``step`` but with auto-persistence
@@ -686,7 +705,7 @@ def run(
             raise
 
     # delegate to step (which now auto-saves and persists trades/equity)
-    return step(data, signals, state, config)
+    return step(data, signals, state, config, aux_data=aux_data)
 
 
 def run_auto(
