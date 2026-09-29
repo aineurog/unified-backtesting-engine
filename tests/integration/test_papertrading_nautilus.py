@@ -14,7 +14,7 @@ nautilus = pytest.importorskip("nautilus_trader")
 from ube.core.config import BacktestConfig, RiskConfig, SignalConfig  # noqa: E402
 from ube.core.data import MarketData  # noqa: E402
 from ube.core.ledger import EventType, trades  # noqa: E402
-from ube.core.risk.exits import StopLoss, TakeProfit  # noqa: E402
+from ube.core.risk.exits import ATRStop, StopLoss, TakeProfit  # noqa: E402
 from ube.core.signals import Signals, from_target  # noqa: E402
 from ube.papertrading import init, step  # noqa: E402
 from ube.papertrading.config import PaperConfig  # noqa: E402
@@ -177,6 +177,61 @@ def test_crypto_perp_resume() -> None:
     # fill landed on the bar it was submitted against (§9.4)
     assert abs(fills2[0].price - float(data.close[6])) < 1e-6
     assert fills2[0].timestamp == int(data.timestamps.as_unit("ns").asi8[6])
+
+
+def test_resume_with_non_trailing_atr_seeds_atr_warmup_only() -> None:
+    """Regression (crash-4): a persisted exit seed whose numeric extreme is ``None``.
+
+    With a non-trailing ``ATRStop`` (the atr configs — ``TrailingStop`` commented out),
+    ``strategy.exit_seed()`` writes ``ExitSeed(extreme_price=None, atr_window=[...])``: no
+    trailing exit forces the extreme to ``None`` while the ATR warmup is still persisted.
+    On resume the strategy ``__init__`` used to call ``float(seed.extreme_price)``
+    unconditionally and crashed with ``TypeError: float() argument must be a string or a
+    real number, not 'NoneType'``. The ATR warmup alone must seed cleanly.
+    """
+    data = synthetic_bars(PRESETS["crypto_perp"], n_bars=12, seed=1)
+    signals_full = from_target(np.array([1] * 8 + [0] * 4))
+    instr = PRESETS["crypto_perp"].instrument
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        # mult is far enough from price that the stop never fires within these windows;
+        # period=3 still feeds the ATR warmup buffer persisted as the exit seed.
+        risk=RiskConfig(exit=(ATRStop(mult=100.0, period=3, atr="atr_1m"),)),
+    )
+    cfg = PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
+    state = init(cfg)
+
+    # First slice: enter long and hold — persists the seed with a warmup but no extreme.
+    _, ev1 = step(
+        slice_md(data, slice(0, 6)),
+        slice_signals(signals_full, slice(0, 6)),
+        state,
+        cfg,
+        aux_data={"atr_1m": data},
+    )
+    assert state.open_position is not None and state.open_position.side == 1
+    assert state.exit_seed is not None
+    assert state.exit_seed.extreme_price is None  # non-trailing ATRStop → None extreme
+    assert state.exit_seed.atr_window, "ATR warmup must be persisted in the seed"
+    assert len([e for e in ev1 if e.event_type == EventType.FILL]) == 1
+
+    # Second slice: resume — used to raise EngineError wrapping `float(None)`.
+    _, ev2 = step(
+        slice_md(data, slice(6, 12)),
+        slice_signals(signals_full, slice(6, 12)),
+        state,
+        cfg,
+        aux_data={"atr_1m": data},
+    )
+
+    instr = cfg.base.instrument
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert closed and closed[0].side == 1
+    assert closed[0].exit_reason == "signal"  # closed by the bar-8 flat signal
+    assert state.open_position is None
+    fills2 = [e for e in ev2 if e.event_type == EventType.FILL]
+    assert len(fills2) == 1
 
 
 def test_duplicate_bar_raises() -> None:

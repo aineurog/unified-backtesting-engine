@@ -145,8 +145,13 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # not degenerate on the first bars after a restart.
         self._seed: ExitSeed | None = config.exit_seed
         self._seeded: bool = False
+        # A persisted seed may carry only an ATR warmup and no extreme price (no trailing
+        # exit configured — ``exit_seed()`` writes ``extreme_price=None`` then), so the
+        # presence of a seed must not imply a numeric extreme.
         self._extreme_price: float | None = (
-            float(config.exit_seed.extreme_price) if config.exit_seed else None
+            float(config.exit_seed.extreme_price)
+            if config.exit_seed and config.exit_seed.extreme_price is not None
+            else None
         )
         self._atr_window: list[list[float]] = []
         self._atr_period = self._max_atr_period()
