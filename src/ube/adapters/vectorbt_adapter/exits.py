@@ -42,6 +42,7 @@ __all__ = [
     "apply_time_exits",
     "exit_stop_params",
     "classify_exit_reason",
+    "core_stop_override",
 ]
 
 
@@ -315,6 +316,78 @@ def exit_stop_params(
     return sl_stop, tp_stop, sl_trail
 
 
+def _exit_reason_name(exit: Any) -> str | None:
+    """The canonical §4.6 reason string for an exit config (None for unknown types)."""
+    if isinstance(exit, TakeProfit):
+        return "take_profit"
+    if isinstance(exit, ATRStop):
+        return "atr_stop"
+    if isinstance(exit, ChandelierExit):
+        return "chandelier"
+    if isinstance(exit, TrailingStop):
+        return "trailing_stop"
+    if isinstance(exit, StopLoss):
+        return "stop_loss"
+    if isinstance(exit, TimeExit):
+        return "time_exit"
+    return None
+
+
+def _exits_fired_at(
+    exits: tuple[Any, ...],
+    data: MarketData,
+    side: int,
+    entry_price: float,
+    entry_bar: int,
+    bar: int,
+    aux_data: Mapping[str, Any] | None,
+) -> list[tuple[str, float]]:
+    """The exits ``(reason, level-or-close)`` that fire on ``bar`` under the core rule (§4.7/§8).
+
+    Shared by :func:`classify_exit_reason` (single-bar label) and
+    :func:`core_stop_override` (first-bar re-location) so the winner selection is the same
+    everywhere. :class:`TimeExit` has no price level, and a ``"close"``-triggered exit is
+    evaluated against the close — both fill at the bar close, so they rank on the close
+    price (mirroring the nautilus actor §9.4).
+    """
+    fired: list[tuple[str, float]] = []
+    for exit in exits:
+        series = (
+            atr_series_for_exit(exit, aux_data, data)
+            if isinstance(exit, (ATRStop, ChandelierExit))
+            else None
+        )
+        if not bool(
+            exit_triggered(
+                exit,
+                market_data=data,
+                side=side,
+                entry_price=entry_price,
+                entry_bar=entry_bar,
+                atr_series=series,
+            )[bar]
+        ):
+            continue
+        reason = _exit_reason_name(exit)
+        if reason is None:
+            continue
+        if isinstance(exit, TimeExit) or getattr(exit, "trigger", None) == "close":
+            level = float(data.close[bar])
+        else:
+            level = float(
+                exit_level(
+                    exit,
+                    market_data=data,
+                    side=side,
+                    entry_price=entry_price,
+                    entry_bar=entry_bar,
+                    atr_series=series,
+                )[bar]
+            )
+        fired.append((reason, level))
+    return fired
+
+
 def classify_exit_reason(
     exits: tuple[Any, ...],
     data: MarketData,
@@ -339,54 +412,7 @@ def classify_exit_reason(
     # Among the exits that trigger on this bar, the one the bar *reached first* owns the
     # label (§4.7/§8) — nearest the bar's open, so a bar that ran through the target
     # before the stop is a take_profit, not a stop_loss.
-    fired: list[tuple[str, float]] = []
-    for exit in exits:
-        series = (
-            atr_series_for_exit(exit, aux_data, data)
-            if isinstance(exit, (ATRStop, ChandelierExit))
-            else None
-        )
-        if not bool(
-            exit_triggered(
-                exit,
-                market_data=data,
-                side=side,
-                entry_price=entry_price,
-                entry_bar=entry_bar,
-                atr_series=series,
-            )[exit_bar]
-        ):
-            continue
-        if isinstance(exit, TakeProfit):
-            reason = "take_profit"
-        elif isinstance(exit, ATRStop):
-            reason = "atr_stop"
-        elif isinstance(exit, ChandelierExit):
-            reason = "chandelier"
-        elif isinstance(exit, TrailingStop):
-            reason = "trailing_stop"
-        elif isinstance(exit, StopLoss):
-            reason = "stop_loss"
-        elif isinstance(exit, TimeExit):
-            reason = "time_exit"
-        else:
-            continue
-        # TimeExit has no level, and a "close"-triggered exit is evaluated against the
-        # close — both fill at the bar close, so they rank on the close price.
-        if isinstance(exit, TimeExit) or getattr(exit, "trigger", None) == "close":
-            level = float(data.close[exit_bar])
-        else:
-            level = float(
-                exit_level(
-                    exit,
-                    market_data=data,
-                    side=side,
-                    entry_price=entry_price,
-                    entry_bar=entry_bar,
-                    atr_series=series,
-                )[exit_bar]
-            )
-        fired.append((reason, level))
+    fired = _exits_fired_at(exits, data, side, entry_price, entry_bar, exit_bar, aux_data)
 
     if fired:
         pick = first_reached_exit([lvl for _, lvl in fired], open_price=float(data.open[exit_bar]))
@@ -406,3 +432,44 @@ def classify_exit_reason(
         return "signal"
 
     return "end_of_run"
+
+
+def core_stop_override(
+    exits: tuple[Any, ...],
+    data: MarketData,
+    *,
+    side: int,
+    entry_price: float,
+    entry_bar: int,
+    exit_bar: int,
+    aux_data: Mapping[str, Any] | None,
+) -> tuple[int, float, str] | None:
+    """Re-locate a vectorbt stop fill to the core first-trigger ``(bar, level, reason)``.
+
+    vectorbt's native stop primitives are **entry-anchored** (the fraction is taken at the
+    entry bar) and **close-triggered** — neither matches the core ``touched`` + moving
+    per-bar level rule that backtrader and nautilus run bar-by-bar (e.g. a non-trailing
+    ATR stop at ``entry - mult * atr[i]``). The two engines therefore can stop on different
+    bars, and at different prices, for the same bars/signals/config — the live divergence
+    where vectorbt stayed in a trade backtrader/nautilus had stopped on the same bar.
+
+    This scans ``entry_bar..exit_bar`` for the first bar where *any* exit fires under the
+    core rule and returns that bar, the winning exit's fill price there (its own level for
+    ``trigger="touched"``, the bar close for ``"close"``/``TimeExit`` — §9.4), and its
+    reason. Bars strictly after ``exit_bar`` are ignored so a legitimate earlier
+    signal/time exit is never re-timed backwards. Returns ``None`` when no exit fires on or
+    before ``exit_bar`` — vectorbt's own bar/price stands.
+    """
+    n = data.n_bars
+    if not (0 <= entry_bar < n) or not (0 <= exit_bar < n) or entry_bar > exit_bar:
+        return None
+    for bar in range(entry_bar, exit_bar + 1):
+        fired = _exits_fired_at(exits, data, side, entry_price, entry_bar, bar, aux_data)
+        if not fired:
+            continue
+        # §4.7: a bar that sweeps several levels is ambiguous; the one nearest the open was
+        # reached first (same rule as the nautilus actor and classify_exit_reason).
+        pick = first_reached_exit([lvl for _, lvl in fired], open_price=float(data.open[bar]))
+        reason, level = fired[0 if pick is None else pick]
+        return bar, float(level), reason
+    return None

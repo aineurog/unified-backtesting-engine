@@ -10,10 +10,13 @@ cost-event stream (§24).
 
 The single architectural difference from Nautilus: vectorbt exits on its own stop primitives
 (``sl_stop`` / ``tp_stop`` / ``sl_trail``), parameterised by per-bar fractions derived from the
-core exit levels — not an exact replica of the event-driven ratchet. The exit *reason* is still
-classified against the core ``exit_triggered`` semantics so a trade is labelled consistently
-with Nautilus (divergence in the exact fill price is expected and documented in the parity
-tolerance, requirements §16).
+core exit levels — not an exact replica of the event-driven ratchet. Because vectorbt's native
+stops are entry-anchored and close-triggered (never the core ``touched`` + moving per-bar rule),
+every level-form exit (``StopLoss`` / ``TakeProfit`` / ``ATRStop`` / ``TrailingStop`` /
+``ChandelierExit`` / ``TimeExit``) is **re-located by :func:`core_stop_override`**: it books the
+core first-trigger bar, the winning exit's level there, and its reason — the same bar/price
+backtrader and nautilus fill at. The *reason* is classified against the same core
+``exit_triggered`` semantics so a trade is labelled consistently with Nautilus (§16 parity).
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from ube.adapters.vectorbt_adapter.engine import build_portfolio, vbt
 from ube.adapters.vectorbt_adapter.exits import (
     apply_time_exits,
     classify_exit_reason,
+    core_stop_override,
     exit_stop_params,
     resolve_vol_for_sizing,
     validate_aux,
@@ -157,6 +161,8 @@ def _build_size_series(
     *,
     leverage: float = 1.0,
     settlement: str = "USD",
+    exits: tuple[Any, ...] = (),
+    aux_data: Mapping[str, Any] | None = None,
 ) -> pd.Series:
     """Per-bar ``size`` (amount) array: target qty at entry bars, same qty at exit bars.
 
@@ -165,12 +171,17 @@ def _build_size_series(
     slipped PnL (§8), and a market-rejection check surfaces an ``EngineError`` when a
     sized entry cannot be funded (matching the Nautilus venue rejection on insufficient
     margin/cash).
+
+    The per-unit realised PnL and the exit-bar size clear use the same core re-location as the
+    fold (:func:`core_stop_override`), so the running equity that sizes the next entry grows by
+    the level fill backtrader/nautilus book — not vectorbt's entry-anchored close fill.
     """
     ts = bar_timestamps_ns(data)
     n = data.n_bars
     size = np.full(n, np.nan, dtype=np.float64)
     running = float(starting_balance)
     multiplier = vbt_inst.contract_multiplier
+    slip = float(cost_model.slippage if cost_model is not None else 0.0)
     for _, trade in records.iterrows():
         entry_bar = bar_index(ts, pd.Timestamp(trade["Entry Timestamp"]))
         exit_bar = bar_index(ts, pd.Timestamp(trade["Exit Timestamp"]))
@@ -178,8 +189,20 @@ def _build_size_series(
         side = 1 if direction == "Long" else -1
         raw_entry = float(trade["Avg Entry Price"])
         raw_exit = float(trade["Avg Exit Price"])
-        slip = float(cost_model.slippage if cost_model is not None else 0.0)
         slipped_entry = float(slipped_price(raw_entry, side, slip))
+        # The fold books the core first-trigger level (bt/nautilus fill) for level-form
+        # exits — mirror that here so the running equity grows by the same realised PnL.
+        core_exit = core_stop_override(
+            exits,
+            data,
+            side=side,
+            entry_price=slipped_entry,
+            entry_bar=entry_bar,
+            exit_bar=exit_bar,
+            aux_data=aux_data,
+        )
+        if core_exit is not None:
+            exit_bar, raw_exit, _reason = core_exit
         vol = float(vol_arr[entry_bar]) if vol_arr is not None and 0 <= entry_bar < n else None
         qty = _target_quantity(sizing, slipped_entry, running, vol, cost_model, vbt_inst, leverage)
         if qty <= 0.0:
@@ -396,6 +419,8 @@ class VectorbtAdapter(EngineAdapter):
                 vbt_inst,
                 leverage=eff_leverage,
                 settlement=settlement,
+                exits=exits,
+                aux_data=aux_data,
             )
             pf = build_portfolio(
                 inputs,
@@ -519,11 +544,28 @@ class VectorbtAdapter(EngineAdapter):
             # Slipped fill prices (§8): entry fill at ``price * (1 + side*slip)``, exit
             # fill at ``price * (1 - side*slip)`` — the fill the venue would actually book.
             entry_price = float(slipped_price(raw_entry, side, slip))
-            exit_price = float(slipped_price(raw_exit, -side, slip))
-
-            exit_reason = classify_exit_reason(
-                exits, data, side, entry_price, entry_bar, exit_bar, aux_data, signals
+            # Level-form exits are booked at the core first-trigger bar and level — the
+            # same fill backtrader/nautilus book — not vectorbt's entry-anchored, close-based
+            # native stop. A vectorbt "open" record that the core stop fires on inside the
+            # window (live "stuck" trade) is thereby closed here too.
+            core_exit = core_stop_override(
+                exits,
+                data,
+                side=side,
+                entry_price=entry_price,
+                entry_bar=entry_bar,
+                exit_bar=exit_bar,
+                aux_data=aux_data,
             )
+            if core_exit is not None:
+                exit_bar, raw_exit, exit_reason = core_exit
+                exit_price = float(slipped_price(raw_exit, -side, slip))
+                is_open = False
+            else:
+                exit_price = float(slipped_price(raw_exit, -side, slip))
+                exit_reason = classify_exit_reason(
+                    exits, data, side, entry_price, entry_bar, exit_bar, aux_data, signals
+                )
 
             # Signal evaluation recorded at the entry bar (§6.1): holds are never
             # emitted, and only real entries reach the ledger — matching the Nautilus fold.
