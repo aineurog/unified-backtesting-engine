@@ -64,7 +64,7 @@ from ube.core.instrument import allows_short
 from ube.core.ledger import EventLedger, EventType, FXSeries, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
 from ube.core.risk.sizing import _entry_fee_rate, size_position
-from ube.core.signals import Signals, validate_long_only
+from ube.core.signals import Signals, neutralize_shorts, validate_long_only
 
 __all__ = ["VectorbtAdapter"]
 
@@ -266,13 +266,7 @@ def _neutralize_shorts(signals: Signals) -> Signals:
     gets a strict long-only run, and the parallel long-side action of a flip (the
     ``long_exit``) is preserved so an open long still closes when its exit bar comes.
     """
-    dead = np.zeros(signals.n_bars, dtype=np.bool_)
-    return Signals(
-        long_entry=signals.long_entry,
-        long_exit=signals.long_exit,
-        short_entry=dead,
-        short_exit=dead,
-    )
+    return neutralize_shorts(signals)
 
 
 class VectorbtAdapter(EngineAdapter):

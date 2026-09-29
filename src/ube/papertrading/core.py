@@ -42,7 +42,7 @@ from ube.core.errors import (
 )
 from ube.core.instrument import Instrument, allows_short
 from ube.core.ledger import EventLedger, EventType, LedgerEvent
-from ube.core.signals import Signals, from_target, validate_long_only
+from ube.core.signals import Signals, from_target, neutralize_shorts, validate_long_only
 
 from .config import PaperConfig
 from .state import OpenPosition, PaperState
@@ -457,6 +457,13 @@ def step(
     instrument = config.base.instrument
     asset_class = instrument.asset_class if isinstance(instrument, Instrument) else ""
     validate_long_only(signals, asset_class)
+    # §4.5 long-only gate at the paper front-end: ``crypto_spot``/``stocks`` ignore
+    # short signals entirely — only long entry/exit rows are acted on. Same
+    # ``neutralize_shorts`` the backtest adapters apply, so paper matches backtest: a
+    # short signal can never open, and a bare ``short_entry`` cannot close an open long
+    # (the parallel ``long_exit`` of a flip is preserved).
+    if asset_class and not allows_short(asset_class):
+        signals = neutralize_shorts(signals)
 
     ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
     ts = np.asarray(ts, dtype=np.int64)

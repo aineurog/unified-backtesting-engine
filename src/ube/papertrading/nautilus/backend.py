@@ -81,23 +81,13 @@ class NautilusPaperEngine(PaperEngine):
         data, signals = filtered
         overrides = dict(config.base.engine_overrides) if config.base.engine_overrides else {}
         no_short = not allows_short(asset_class)
-        # Explicit account-type mapping (fix 4): long-only (crypto_spot, stocks) => CASH
-        # in a true spot model, margined (crypto_perp, futures, etc.) => MARGIN.
-        # For paper trading, spot currently retains MARGIN to allow phantom closes on
-        # resume (sandbox not seeded — issue A deferred). True CASH would reject a
-        # reduce_only close without a real position.
+        # Explicit account-type mapping: long-only (crypto_spot, stocks) and margined
+        # (crypto_perp, futures, ...) classes both trade on a MARGIN account by default
+        # (issue A — the sandbox is not seeded with open positions, and a true CASH spot
+        # venue would reject a reduce_only close without a real position). opt into CASH
+        # explicitly via ``engine_overrides.account_type='cash'`` when wanted.
         if "account_type" not in overrides:
-            # Ideal: "cash" if no_short else "margin". Keep MARGIN for no_short until seeding.
             overrides["account_type"] = "margin"
-            if no_short:
-                import warnings
-
-                warnings.warn(
-                    "Spot/stocks paper trading defaulting to MARGIN account for resume "
-                    "compatibility (sandbox not seeded with open position). For true "
-                    "CASH spot, set engine_overrides.account_type='cash'.",
-                    stacklevel=2,
-                )
         # Warn if resuming a CASH spot with open position (will be rejected without seeding)
         _acct_tmp = overrides.get("account_type", "margin")
         _acct_type_tmp = "MARGIN" if _acct_tmp == "margin" else "CASH"
@@ -308,6 +298,7 @@ class NautilusPaperEngine(PaperEngine):
                 exit_seed=state.exit_seed,
                 bar_period_ns=period_ns,
                 last_funding_ns=state.last_funding_ns,
+                aux_data=dict(state.aux_data or {}),
             )
             strategy = UbePaperStrategy(config=strat_cfg)
 

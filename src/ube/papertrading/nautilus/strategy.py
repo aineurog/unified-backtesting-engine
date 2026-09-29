@@ -15,9 +15,10 @@ time exits fill at the bar close; the slice otherwise exits on the signal
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
+import pandas as pd
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide
@@ -35,6 +36,7 @@ from ube.core.risk.exits import (
     Exit,
     TimeExit,
     TrailingStop,
+    atr,
     exit_level,
     exit_triggered,
     first_reached_exit,
@@ -52,6 +54,42 @@ from .bridge import (
 )
 from .runtime import get_ready_event
 from .signals import SIGNAL_REGISTRY
+
+
+def _ts_ns_int(ts: Any) -> np.ndarray:
+    """Epoch-ns ints for a timestamp index, whatever dtype the caller exposes
+    (the strategy rebuilds MarketData with ``datetime64[ns, UTC]`` timestamps while the
+    aux ``MarketData`` keeps ``int64``; pandas ``reindex`` cannot compare the two dtypes).
+    """
+    idx = pd.Index(np.asarray(ts))
+    if str(idx.dtype).startswith("datetime64"):
+        # pandas may store the aux index at coarser resolution (e.g. datetime64[us]);
+        # the strategy's rebuilt market-data index is int64 ns. Normalize both to ns
+        # so the ffill reindex in ``_atr_from_aux`` aligns instead of collapsing to
+        # the aux's trailing value.
+        return cast(np.ndarray, idx.as_unit("ns").asi8)
+    return np.asarray(idx, dtype=np.int64)
+
+
+def _atr_from_aux(data: MarketData, aux_md: MarketData, period: int) -> np.ndarray:
+    """Main-grid ATR from a raw OHLCV aux ``MarketData`` — mirrors the vectorbt/backtrader
+    adapters (§5.2) so the nautilus paper strategy uses the exact same series.
+
+    ATR is computed on the aux bars and forward-filled onto the strategy's own bar grid
+    (keyed by historical timestamp), then shifted one bar so no bar sees the aux/own bar it
+    is inside (no look-ahead).
+    """
+    atr_aux = atr(aux_md, period)
+    ffill = pd.Series(atr_aux, index=_ts_ns_int(aux_md.timestamps)).reindex(
+        _ts_ns_int(data.timestamps), method="ffill"
+    )
+    out: np.ndarray = ffill.to_numpy(dtype=np.float64)
+    out = np.roll(out, 1)
+    out[0] = np.nan
+    first_valid = int(np.argmax(~np.isnan(out))) if np.any(~np.isnan(out)) else 0
+    if first_valid < out.shape[0]:
+        out[: first_valid + 1] = out[first_valid]
+    return np.where(np.isnan(out), 0.0, out)
 
 
 class UbePaperConfig(StrategyConfig):  # type: ignore[misc]
@@ -74,6 +112,7 @@ class UbePaperConfig(StrategyConfig):  # type: ignore[misc]
     exit_seed: Any = None  # ube ExitSeed — seeds trailing/ATR exits on resume (issue C)
     bar_period_ns: int = 0  # median bar period for seeding synthetic timestamps (issue 1)
     last_funding_ns: int | None = None  # persisted funding clock (issue 2)
+    aux_data: dict[str, Any] | None = None  # PaperState.aux_data — ATR/vol series (§5.2)
 
 
 class UbePaperStrategy(Strategy):  # type: ignore[misc]
@@ -133,7 +172,12 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             float(config.open_position.entry_price) if config.open_position else None
         )
         # Aux data for ATR-based exits (from PaperState.aux_data, backtest parity §5.2).
-        self._aux_data: dict[str, Any] = {}
+        # The engine must consume the *same* aux ATR series as the vectorbt/backtrader
+        # backends (``atr_from_aux`` over the full aux MarketData, timestamp-aligned), not
+        # an ATR re-derived from the strategy's short incremental bar history — otherwise
+        # the same config/aux produces different ATR-stop levels per engine (cross-engine
+        # ledger parity).
+        self._aux_data: dict[str, Any] = dict(config.aux_data or {})
         # Funding: track last funding timestamp to avoid double-counting. Persisted in
         # PaperState.last_funding_ns so a resume continues from the exact saved point
         # (issue 2) — not from bar spacing, which would be contaminated by synthetic seed bars.
@@ -192,9 +236,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             extreme = None
         window: list[list[float]] | None = None
         if self._atr_period > 0 and self._atr_window:
-            window = [
-                [float(high), float(low), float(c)] for high, low, c in self._atr_window
-            ]
+            window = [[float(high), float(low), float(c)] for high, low, c in self._atr_window]
         if extreme is None and window is None:
             return None
         return ExitSeed(extreme_price=extreme, atr_window=window)
@@ -380,10 +422,10 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                     if isinstance(raw, np.ndarray):
                         atr_series = raw
                     elif isinstance(raw, MarketData):
-                        # Compute ATR from aux MarketData, aligned to main grid.
-                        from ube.core.risk.exits import atr as _atr
-
-                        atr_series = _atr(raw, getattr(cfg, "period", 14))
+                        # ATR from the aux MarketData, aligned to the strategy's own bar
+                        # grid by timestamp — identical to the vectorbt/backtrader backends
+                        # (§5.2 parity), so a config's ATR-stop level is engine-invariant.
+                        atr_series = _atr_from_aux(md, raw, getattr(cfg, "period", 14))
                     else:
                         atr_series = np.asarray(raw, dtype=np.float64)
                 triggered = exit_triggered(
@@ -580,9 +622,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             desired = -self._sim_side
 
         t = self._hist_ts
-        self._events.append(
-            LedgerEvent(EventType.SIGNAL_EVALUATED, t, self._iid, action=action)
-        )
+        self._events.append(LedgerEvent(EventType.SIGNAL_EVALUATED, t, self._iid, action=action))
         # Predictive position tracking: update ``_sim_side`` synchronously here, on the
         # same bar the orders are submitted — not in ``on_order_filled`` (which lags a
         # fill). This is what prevents ``decide_action`` from double-submitting on the
@@ -594,9 +634,11 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         if close_first and self._sim_qty > 0:
             _close_ref = self._slipped(self._last_close or 0.0, -self._sim_side)
             _close_notional = self._sim_qty * _close_ref * self._multiplier
-            _close_comm = float(
-                fill_cost(self.config.cost_model, notional=_close_notional)
-            ) if self.config.cost_model else 0.0
+            _close_comm = (
+                float(fill_cost(self.config.cost_model, notional=_close_notional))
+                if self.config.cost_model
+                else 0.0
+            )
             _close_credit = float(self._sim_side) * _close_notional - _close_comm
             self._pending_credit = _close_credit
 
@@ -712,7 +754,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             # Clear pending credit if this close fill matches the pending credit
             if self._pending_credit != 0.0:
                 self._pending_credit = 0.0
-            
+
             # For a reverse, the opening order is already in flight; let its fill set the
             # new side/qty, and only flatten here when the close is a true exit.
             if not self._entry_order_ids:
@@ -850,9 +892,11 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             )
         )
         # Commission.
-        comm = float(
-            fill_cost(self.config.cost_model, notional=notional)
-        ) if self.config.cost_model else 0.0
+        comm = (
+            float(fill_cost(self.config.cost_model, notional=notional))
+            if self.config.cost_model
+            else 0.0
+        )
         # Cash/commission are derived from the CASH_MOVEMENT/COMMISSION events above.
         if comm > 0.0:
             self._events.append(

@@ -284,10 +284,10 @@ def test_max_atr_period() -> None:
 def test_full_run_produces_flip_trades() -> None:
     got, open_pos = _run_windows([(0, 24)])
     assert [t[0] for t in got] == [1, -1]
-    assert got[0][2] == 1_704_085_200_000_000_000  # bar-4 signal fills at bar 5
-    assert got[1][3] == 1_704_135_600_000_000_000  # short-18 signal fills at bar 19
+    assert got[0][2] == 1_704_081_600_000_000_000  # bar-4 signal fills at bar 4 (same-bar close)
+    assert got[1][3] == 1_704_132_000_000_000_000  # short closed by the bar-18 signal at bar 18
     assert open_pos is not None and open_pos.side == 1  # bar-20 long still open
-    assert open_pos.entry_ns == 1_704_142_800_000_000_000  # bar-20 signal fills at bar 21
+    assert open_pos.entry_ns == 1_704_139_200_000_000_000  # bar-20 signal fills at bar 20
 
 
 # Window plans for the reviewer boundary matrix (DEFECT-2 cases) and the vbt-style
@@ -305,8 +305,8 @@ BOUNDS: list[list[tuple[int, int]]] = [
     [(0, 10), (4, 18), (9, 24)],  # open carry; resume at the entry bar
     [(0, 12), (4, 20), (9, 24)],
     [(0, 6), (4, 14), (9, 24)],
-    [(0, 11), (5, 20), (20, 24)],  # restart window 2 at the carried fill bar (5)
-    [(0, 6), (5, 12), (11, 18), (11, 24)],  # dense overlap cascade, one bar re-run
+    [(0, 11), (4, 20), (20, 24)],  # restart window 2 at the carried entry bar (4)
+    [(0, 6), (4, 12), (10, 18), (10, 24)],  # dense overlap cascade, one bar re-run
 ]
 
 
@@ -344,11 +344,12 @@ def test_carried_entry_is_not_double_booked() -> None:
     assert [t[0] for t in got[0]] == [1]  # the long closes once at bar-11; no ghost short
 
 
-def test_pending_exit_in_flight_stays_open_for_the_next_window() -> None:
-    # A short-exit SIGNAL on window 1's very last bar (bar 18) cannot fill inside window
-    # 1 (there is no bar 19), and it must NOT be force-realized at the bar-18 close:
-    # the full run fills it at bar 19's open. The window must leave the short open so the
-    # next window's re-derived signal closes it at the genuine next-bar open.
+def test_final_bar_exit_in_flight_fills_at_the_final_close() -> None:
+    # A short-exit SIGNAL on window 1's very last bar (bar 18) fills at the bar-18 close,
+    # exactly like a single full-window run: the references fill a signal exit at the same
+    # bar's close. backtrader's broker would execute it at bar 19's open, so ``stop()``
+    # realizes the in-flight exit at the final bar's close (reason attached) instead of
+    # leaving it open or dropping it.
     data = synthetic_bars(PRESETS[AC], n_bars=24)
     target = _target_full_run()
     signals = from_target(target)
@@ -362,10 +363,8 @@ def test_pending_exit_in_flight_stays_open_for_the_next_window() -> None:
         state, _ = run(
             "x", _slice_md(data, slice(0, 19)), _slice_sig(signals, slice(0, 19)), cfg, db_path=db
         )
-        # The short entered at bar 11 is still open — the pending exit did not close it.
-        assert state.open_position is not None
-        assert state.open_position.side == -1
-        assert state.open_position.entry_ns == 1_704_106_800_000_000_000  # bar-10 signal, fill 11
+        # The short entered at bar 10 is closed by the bar-18 exit at its close.
+        assert state.open_position is None
         state, _ = run(
             "x", _slice_md(data, slice(4, 24)), _slice_sig(signals, slice(4, 24)), cfg, db_path=db
         )
@@ -437,11 +436,11 @@ def test_resume_carries_entry_when_signal_fn_does_not_reemit_it() -> None:
             )
 
     got = _summary(state, cfg)
-    # Long signalled bar 3 (fills bar 4), flipped short at bar 15 (fills bar 16), closed
-    # by bar 20's 0 (fills bar 21) — both legs survive the carry.
+    # Long signalled bar 3 (fills bar 3), flipped short at bar 15 (fills bar 15), closed
+    # by bar 20's 0 (fills bar 20) — both legs survive the carry.
     assert [t[0] for t in got] == [1, -1]
-    assert got[0][2] == 1_704_081_600_000_000_000  # bar-3 signal fills at bar 4
-    assert got[1][3] == 1_704_142_800_000_000_000  # bar-20 signal fills at bar 21
+    assert got[0][2] == 1_704_078_000_000_000_000  # bar-3 signal fills at bar 3
+    assert got[1][3] == 1_704_139_200_000_000_000  # bar-20 signal fills at bar 20
     assert state.open_position is None  # the bar-15 short is closed by bar 20's 0
 
 

@@ -1,26 +1,26 @@
 {
-  "asset_class": "crypto_perp",
-  "engines": {
-    "backtrader": {
-      "final_equity": 91260.73985499996,
-      "n_trades": 1,
-      "trades_hash": "fca949ac3bee0b1618b2ab3e0e47c3139730178d69258c6b5b567cfdb984669b"
-    },
-    "nautilus": {
-      "final_equity": 91259.9899,
-      "n_trades": 1,
-      "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
-    },
-    "vectorbt": {
-      "final_equity": 0.0,
-      "n_trades": 0,
-      "trades_hash": ""
-    }
+ "asset_class": "crypto_perp",
+ "engines": {
+  "backtrader": {
+   "final_equity": 91259.98991624996,
+   "n_trades": 1,
+   "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
   },
-  "instrument": "BTC-USDT",
-  "locked_at": "2026-08-24",
-  "strategy": "trivial_long_roundtrip",
-  "tolerance": {
-    "final_equity_rtol": 1e-06
+  "nautilus": {
+   "final_equity": 91259.9899,
+   "n_trades": 1,
+   "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
+  },
+  "vectorbt": {
+   "final_equity": 0.0,
+   "n_trades": 0,
+   "trades_hash": ""
   }
+ },
+ "instrument": "BTC-USDT",
+ "locked_at": "2026-09-29",
+ "strategy": "trivial_long_roundtrip",
+ "tolerance": {
+  "final_equity_rtol": 1e-06
+ }
 }

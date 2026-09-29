@@ -1,26 +1,26 @@
 {
-  "asset_class": "futures",
-  "engines": {
-    "backtrader": {
-      "final_equity": 91725.0,
-      "n_trades": 1,
-      "trades_hash": "9a8ab501b09dcb0cba47cfb9e779e252a49b5efaaf4872f3d55540e06e6f007a"
-    },
-    "nautilus": {
-      "final_equity": 91725.0,
-      "n_trades": 1,
-      "trades_hash": "cf057b9903613d080b3773d4958556b8cf9c357fc201b574bbfd483d94962d7e"
-    },
-    "vectorbt": {
-      "final_equity": 0.0,
-      "n_trades": 0,
-      "trades_hash": ""
-    }
+ "asset_class": "futures",
+ "engines": {
+  "backtrader": {
+   "final_equity": 91725.0,
+   "n_trades": 1,
+   "trades_hash": "cf057b9903613d080b3773d4958556b8cf9c357fc201b574bbfd483d94962d7e"
   },
-  "instrument": "ES",
-  "locked_at": "2026-08-19",
-  "strategy": "trivial_long_roundtrip",
-  "tolerance": {
-    "final_equity_rtol": 1e-06
+  "nautilus": {
+   "final_equity": 91725.0,
+   "n_trades": 1,
+   "trades_hash": "cf057b9903613d080b3773d4958556b8cf9c357fc201b574bbfd483d94962d7e"
+  },
+  "vectorbt": {
+   "final_equity": 0.0,
+   "n_trades": 0,
+   "trades_hash": ""
   }
+ },
+ "instrument": "ES",
+ "locked_at": "2026-09-29",
+ "strategy": "trivial_long_roundtrip",
+ "tolerance": {
+  "final_equity_rtol": 1e-06
+ }
 }

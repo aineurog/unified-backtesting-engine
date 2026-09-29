@@ -47,6 +47,7 @@ __all__ = [
     "Signals",
     "from_target",
     "from_callable",
+    "neutralize_shorts",
     "validate_long_only",
 ]
 
@@ -284,6 +285,30 @@ def from_callable(fn: Callable[[MarketData], int], bars: MarketData) -> Signals:
         window = bars.head(i + 1)
         targets.append(fn(window))
     return from_target(np.asarray(targets))
+
+
+def neutralize_shorts(signals: Signals) -> Signals:
+    """Return ``signals`` with the short leg cleared for a long-only asset class (§4.5).
+
+    ``crypto_spot`` cannot open a short — there is nothing to borrow — so
+    ``short_entry``/``short_exit`` are meaningless for it. Zeroing the columns (rather
+    than rejecting the series, which the strategy/actor layer gates elsewhere) makes the
+    ignore-at-the-engine guarantee caller-independent: a caller that passes short rows
+    (a flip encoding from ``from_target``, a provider that emits both sides, ...) still
+    gets a strict long-only run, and the parallel long-side action of a flip (the
+    ``long_exit``) is preserved so an open long still closes when its exit bar comes.
+
+    Single source of truth for the long-only gate: the vectorbt/backtrader backtest
+    adapters and the paper front-end all apply this so short signals (``crypto_spot``,
+    ``stocks``) can never open, keep, or close a position.
+    """
+    dead = np.zeros(signals.n_bars, dtype=np.bool_)
+    return Signals(
+        long_entry=signals.long_entry,
+        long_exit=signals.long_exit,
+        short_entry=dead,
+        short_exit=dead,
+    )
 
 
 def validate_long_only(signals: Signals, asset_class: str) -> None:

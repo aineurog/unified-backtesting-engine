@@ -38,6 +38,7 @@ from typing import Any
 import numpy as np
 
 from ube.adapters.backtrader_adapter.adapter import BacktraderAdapter
+from ube.adapters.backtrader_adapter.instrument_map import resolve_price_precision
 from ube.adapters.backtrader_adapter.overrides import DEFAULT_STARTING_BALANCE
 from ube.adapters.backtrader_adapter.strategy import BtCarriedFill
 from ube.core.cost import resolve_cost_model
@@ -272,14 +273,21 @@ class BacktraderPaperEngine(PaperEngine):
                 # not re-emit it. Re-open the carried side at the entry bar and drop any
                 # conflicting bar-0 signals so backtrader carries the trade forward, instead
                 # of aborting the live worker (event-driven strategy still gets bars 1+
-                # untouched).
-                warnings.warn(
-                    f"backtrader paper: carried {'long' if side == 1 else 'short'} entered "
-                    f"at {open_pos.entry_ns} was not re-emitted by the recomputed "
-                    "window; carrying it from the persisted ledger (the signal function "
-                    "is not recomputable over the window)",
-                    stacklevel=3,
-                )
+                # untouched). Warn once per carried trade, not on every window call.
+                warn_key = (iid, int(open_pos.entry_ns), side, open_pos.trade_id)
+                warned = getattr(state, "_carried_warned", None)
+                if warned is None:
+                    warned = set()
+                    state._carried_warned = warned  # transient; never persisted
+                if warn_key not in warned:
+                    warned.add(warn_key)
+                    warnings.warn(
+                        f"backtrader paper: carried {'long' if side == 1 else 'short'} entered "
+                        f"at {open_pos.entry_ns} was not re-emitted by the recomputed "
+                        "window; carrying it from the persisted ledger (the signal function "
+                        "is not recomputable over the window)",
+                        stacklevel=3,
+                    )
                 le = np.array(encoded.long_entry, dtype=bool)
                 lx = np.array(encoded.long_exit, dtype=bool)
                 se = np.array(encoded.short_entry, dtype=bool)
@@ -336,19 +344,26 @@ class BacktraderPaperEngine(PaperEngine):
         # position is seeded at its original size — never re-sized off current equity.
         bt_overrides = dict(overrides) if overrides else {}
         bt_overrides["starting_balance"] = float(checkpoint)
+        price_precision = resolve_price_precision(
+            config.base.instrument, bt_overrides
+        )
         bt_config = dataclasses.replace(
             config.base, engine="backtrader", engine_overrides=bt_overrides
         )
         carried = None
         if open_pos is not None:
             # ``win_ts[0]`` is the carried entry's fill bar (the window starts there, see
-            # ``window_start_ns``), so its raw open is the recorded raw fill price. The
+            # ``window_start_ns``), so its raw close is the recorded raw fill price. The
             # strategy holds the position verbatim from bar 0 instead of re-executing it,
             # which would re-book and re-size the carried leg (review DEFECT 1 / DEFECT 2).
+            # The price is re-snapped to the instrument grid, exactly as the strategy
+            # booked the original fill, so the carried leg reproduces the full-run record.
             carried = BtCarriedFill(
                 side=int(open_pos.side),
                 quantity=float(open_pos.quantity),
-                price=float(win_data.open[0]),
+                price=float(
+                    f"{win_data.close[0]:.{price_precision}f}"
+                ),
             )
         # ATR-based exits (§5.2) resolve their named series from ``state.aux_data``; a
         # ``MarketData`` value is re-aligned to the sliced window by timestamp inside the
@@ -359,7 +374,6 @@ class BacktraderPaperEngine(PaperEngine):
             signals=encoded,
             config=bt_config,
             carried=carried,
-            carry_final_exit=True,
             aux_data=aux or None,
         )
 

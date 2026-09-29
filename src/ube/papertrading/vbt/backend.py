@@ -260,14 +260,21 @@ class VbtPaperEngine(PaperEngine):
                 # not re-emit it. Re-open the carried side at the entry bar and drop any
                 # conflicting bar-0 signals so vectorbt carries the trade forward, instead
                 # of aborting the live worker (event-driven strategy still gets bars 1+
-                # untouched).
-                warnings.warn(
-                    f"vectorbt paper: carried {'long' if side == 1 else 'short'} entered "
-                    f"at {open_pos.entry_ns} was not re-emitted by the recomputed "
-                    "window; carrying it from the persisted ledger (the signal function "
-                    "is not recomputable over the window)",
-                    stacklevel=3,
-                )
+                # untouched). Warn once per carried trade, not on every window call.
+                warn_key = (iid, int(open_pos.entry_ns), side, open_pos.trade_id)
+                warned = getattr(state, "_carried_warned", None)
+                if warned is None:
+                    warned = set()
+                    state._carried_warned = warned  # transient; never persisted
+                if warn_key not in warned:
+                    warned.add(warn_key)
+                    warnings.warn(
+                        f"vectorbt paper: carried {'long' if side == 1 else 'short'} entered "
+                        f"at {open_pos.entry_ns} was not re-emitted by the recomputed "
+                        "window; carrying it from the persisted ledger (the signal function "
+                        "is not recomputable over the window)",
+                        stacklevel=3,
+                    )
                 le = np.array(encoded.long_entry, dtype=bool)
                 lx = np.array(encoded.long_exit, dtype=bool)
                 se = np.array(encoded.short_entry, dtype=bool)

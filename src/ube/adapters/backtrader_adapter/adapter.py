@@ -13,10 +13,9 @@ first bar, ``signal_evaluated`` / ``order_submitted`` at the signal (submit) bar
 sibling adapters (§24). A partial scale-out exit is just another exit fill against the open
 position — the ledger fold already handles partial closes (§4.6).
 
-The one architectural difference from vectorbt: backtrader's actor loop fills orders at the
-*next* bar open, so fill prices differ from vbt's bar-synchronous fills. That divergence is an
-expected and documented parity tolerance (requirements §16); the exit *reason* is still
-classified against the core ``exit_triggered`` semantics by the strategy's precomputed plan.
+Fills are bar-synchronous (same bar as the signal/trigger, at that bar's close or at a touched
+exit's own level), matching the vectorbt/nautilus references — the exit *reason* is classified
+against the core ``exit_triggered`` semantics by the strategy's precomputed plan.
 """
 
 from __future__ import annotations
@@ -65,7 +64,7 @@ from ube.core.ledger import (
     funding_payments,
 )
 from ube.core.result import BacktestResult
-from ube.core.signals import Signals, validate_long_only
+from ube.core.signals import Signals, neutralize_shorts, validate_long_only
 
 __all__ = ["BacktraderAdapter"]
 
@@ -97,13 +96,7 @@ def _neutralize_shorts(signals: Signals) -> Signals:
     ``long_exit``) is preserved so an open long still closes when its exit bar comes.
     Mirrors the vectorbt adapter's gate exactly.
     """
-    dead = np.zeros(signals.n_bars, dtype=np.bool_)
-    return Signals(
-        long_entry=signals.long_entry,
-        long_exit=signals.long_exit,
-        short_entry=dead,
-        short_exit=dead,
-    )
+    return neutralize_shorts(signals)
 
 
 def _fx_series_grid(
@@ -156,7 +149,6 @@ class BacktraderAdapter(EngineAdapter):
         *,
         aux_data: Mapping[str, Any] | None = None,
         carried: BtCarriedFill | None = None,
-        carry_final_exit: bool = False,
     ) -> BacktestResult:
         """Run a backtest via backtrader (§4.5).
 
@@ -171,11 +163,6 @@ class BacktraderAdapter(EngineAdapter):
                 ``data[0]`` must be the carried entry's fill bar; the strategy holds it from
                 bar 0 instead of re-executing it. ``None`` for a fresh backtest and the
                 cold paper window.
-            carry_final_exit: When True, an exit still in flight on the final bar is left
-                open (not force-realized in ``stop()``), so a continuation window re-derives
-                and fills it at its genuine next-bar open. The paper backend sets this for
-                every window; standalone backtests leave the default (the final-bar close
-                booking).
 
         Returns:
             The canonical :class:`~ube.core.result.BacktestResult`.
@@ -263,7 +250,6 @@ class BacktraderAdapter(EngineAdapter):
             slip=slip,
             starting_balance=starting_balance,
             carried=carried,
-            carry_final_exit=carry_final_exit,
         )
         frame = to_signal_frame(data, signals)
         strat = run_backtrader(
@@ -390,10 +376,10 @@ class BacktraderAdapter(EngineAdapter):
         for orec in strat.order_records:
             _order_submitted(int(bar_ts[orec.submit_bar]), orec.side, orec.quantity)
             if orec.fill_bar is None:
-                # Submit-only: an order left in flight at the window's final bar (the next
-                # window re-derives it and fills it there). Book only the order_submitted
-                # row, matching the full run's ledger — no cash/fill/commission/position
-                # step (the fill lands in the next window, at its genuine next-bar open).
+                # Defensive: an order with no fill bar (should not occur — ``stop()``
+                # realizes any final-bar in-flight order at the final close). Book only
+                # the order_submitted row if it ever does: no cash/fill/commission/
+                # position step.
                 continue
             net += orec.side * orec.quantity
             self._fold_fill(

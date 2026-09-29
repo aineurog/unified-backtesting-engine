@@ -7,13 +7,13 @@ fixtures of §16 and asserts the run reproduces the **locked** values in
 ``tests/fixtures/<asset_class>/expected_results.json`` (``final_equity``,
 ``n_trades``, ``trades_hash`` — schema in ``tests/fixtures/README.md``).
 
-The locked values were captured from a real run (backtrader fills market orders at
-the *next* bar's open against the same fixture bars and the same canonical
-``fixed_units`` sizing, commission/slippage/funding all zero) and cross-checked
-against the Nautilus baseline: the same instrument, the same target, the same cost
-model — only the fill timing (§4.1, warehouses) differs, and the Nautilus baseline
-for the same round trip is in the ``nautilus`` block. The lock is per-engine and
-immutable: any change that breaks it is caught here.
+The locked values were captured from a real run (backtrader fills market orders at the
+*same* bar's close — §9.4 parity with the nautilus reference — so the ``backtrader``
+block's ``trades_hash`` is byte-identical to the ``nautilus`` block's for every
+asset class; commission/slippage/funding are all zero for the fixture cost model) and
+cross-checked against the Nautilus baseline: the same instrument, the same target, the
+same cost model, and the same fill timing. The lock is per-engine and immutable: any
+change that breaks it is caught here.
 """
 
 import hashlib
@@ -126,3 +126,33 @@ def test_backtrader_parity_matches_locked(asset_class: str):
         rel=_locked(asset_class)["tolerance"]["final_equity_rtol"],
     )
     assert _trades_hash(result.trades) == locked_engine["trades_hash"]
+
+
+# ---------------------------------------------------------------------------
+# Cross-engine lock identity (§16): backtrader must stay byte-equal to Nautilus.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("asset_class", sorted(PARITY_ASSETS))
+def test_backtrader_block_matches_nautilus_block(asset_class: str):
+    """The backtrader lock must reproduce the Nautilus lock exactly.
+
+    Same-bar-close fills (§9.4) mean the backtrader vault reproduces the Nautilus
+    baseline byte-for-byte (same trades, same recorded floats), so the two blocks in
+    ``expected_results.json`` are identical. A divergence here would flag a real
+    fill-timing regression, not fixture churn.
+    """
+    result = _parity_result(asset_class)
+    fixtures = _locked(asset_class)
+    engines = fixtures["engines"]
+    nautilus = engines["nautilus"]
+    backtrader = engines["backtrader"]
+
+    assert _trades_hash(result.trades) == nautilus["trades_hash"]
+    assert backtrader["trades_hash"] == nautilus["trades_hash"]
+    # The trades are byte-identical; the folded running balance may still accumulate
+    # float noise (≤ rtol) in each engine's equity aggregation.
+    assert float(backtrader["final_equity"]) == pytest.approx(
+        float(nautilus["final_equity"]),
+        rel=fixtures["tolerance"]["final_equity_rtol"],
+    )

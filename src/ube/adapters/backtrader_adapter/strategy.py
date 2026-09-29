@@ -4,29 +4,34 @@ backtrader is an actor loop, not a vector engine: the strategy walks the bars an
 market orders via the broker. This module implements the single-instrument execution policy
 that mirrors the other adapters' semantics on that loop:
 
-- **Entry**: a ``long_entry``/``short_entry`` signal bar submits a market order that fills at the
-  *next* bar's open. Sizing uses the core :func:`~ube.core.risk.sizing.size_position` against the
-  broker equity levered by the effective leverage (§6.3), priced at the slipped current close,
-  floored to the asset-class lot increment and additionally floored to what the broker margin
-  allows — mirroring the reference ``NotionalSizer`` so a leveraged perp entry can never be
-  rejected by the venue for insufficient margin.
+- **Entry**: a ``long_entry``/``short_entry`` signal bar submits a market order that fills at that
+  bar's close (same-bar, bar-synchronous fills matching the vectorbt/nautilus references). Sizing
+  uses the core :func:`~ube.core.risk.sizing.size_position` against the broker equity levered by
+  the effective leverage (§6.3), priced at the slipped current close, floored to the asset-class
+  lot increment and additionally floored to what the broker margin allows — mirroring the
+  reference ``NotionalSizer`` so a leveraged perp entry can never be rejected by the venue for
+  insufficient margin.
 - **Exits**: at entry fill time the strategy precomputes the per-bar trigger arrays of every
   configured exit via :func:`~ube.adapters.backtrader_adapter.exits.build_exit_plan` (anchored
   to the actual fill and the slipped entry price, causal — §8). Each bar, the first not-yet-spent
-  exit whose array fires (in configured order) exits its ``scale_out_fraction`` at the next open;
-  stops always exit the whole remaining position. A spent line never re-fires.
+  exit whose array fires (in configured order) exits its ``scale_out_fraction`` at the bar's close;
+  stops always exit the whole remaining position. A spent line never re-fires. A *touched* stop
+  fills at its own level (the reference books the touched level, not the bar close).
 - **Signal exits / flips**: a matching ``long_exit``/``short_exit`` (or an opposite-side entry)
-  closes the position via a *signal* exit; a flip then re-enters the opposite side on the bar the
-  close order is placed.
+  closes the position via a *signal* exit at the bar close; a flip then re-enters the opposite
+  side on the same bar.
 - **Accounting**: the strategy records every evaluated signal and submitted order into
   ``signal_records`` / ``order_records``; those (not the broker's cash) are what the adapter
   folds into the canonical ledger — the broker cash is only the *sizing* equity, and fills happen
-  at raw open prices, with ``commission`` and ``slippage`` applied by the fold (§8).
-- **Final bar**: an exit placed on the last bar can never fill through the next-bar-open path, so
-  ``stop()`` books an in-flight exit at the final bar's close (with its reason), mirroring the
-  reference adapter's same-bar fill. A position with no exit in flight is left *open* — the
-  references keep the final trade unrealized (realized PnL 0), so the ledger ends on an open
-  mark-to-market row rather than a reasonless close.
+  at raw bar closes (or touched levels), with ``commission`` and ``slippage`` applied by the fold
+  (§8).
+- **Final bar**: backtrader's broker executes a market order at the *next* bar's open, so an order
+  placed on the last bar can never fill through the broker within the run. Because the reference
+  fills it at the same bar's close, ``stop()`` books an in-flight exit or entry on the final bar
+  at that bar's close (with its reason), so a final-bar signal still trades exactly like the
+  references. A position with no exit signal is left *open* — the references keep the final trade
+  unrealized (realized PnL 0), so the ledger ends on an open mark-to-market row rather than a
+  reasonless close.
 """
 
 from __future__ import annotations
@@ -89,13 +94,6 @@ class BtRunContext:
     #: broker and the strategy's own tracker at ``start()``, never re-executed. ``None`` for
     #: a fresh backtest (and the cold paper window).
     carried: BtCarriedFill | None = None
-    #: When True, an exit still in flight on the final bar is *not* force-realized in
-    #: ``stop()``: the position stays open so the next paper window re-derives the exit
-    #: from the recomputed signals and fills it at its genuine next-bar open — keeping the
-    #: windowed ledger identical to a single full-window run (the vectorbt/nautilus backends
-    #: carry the pending exit the same way). ``False`` (a standalone backtest with no next
-    #: window) keeps the original final-bar close booking.
-    carry_final_exit: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,13 +110,13 @@ class BtOrderRecord:
     """One submitted + filled order (§4.6) — the fold's ``order_submitted``/``fill`` rows.
 
     ``submit_bar`` is the bar the order was placed on (the signal/trigger bar); ``fill_bar`` is
-    the bar whose open it filled at (``submit_bar + 1`` for a market order). ``price`` is the raw
-    fill price (fill-bar open); slippage is applied at the fold.
+    the bar it filled on — ``submit_bar`` for a bar-synchronous market order (same-bar close).
+    ``price`` is the raw fill price (the fill bar's close, or a *touched* exit's own level);
+    slippage is applied at the fold.
 
-    A paper window that ends with an order still in flight (its fill would land on the
-    next window's first bar) records the submission with ``fill_bar``/``price`` ``None``:
-    the next window re-derives the order and fills it there, so the seam window books
-    exactly the ``order_submitted`` row (§4.6) — no cash/fill/commission/position step.
+    ``fill_bar``/``price`` are ``None`` for an order submitted on the market's final bar that
+    ``stop()`` could not book (defensive; the current ``stop()`` always realizes final-bar
+    in-flight orders at the final close, so the fold shouldn't see one).
     """
 
     submit_bar: int
@@ -137,13 +135,13 @@ class BtCarriedFill:
     bar; the strategy must hold that position from the first bar instead of re-executing
     it. Re-executing would (a) re-book the entry a bar later — double-booking the ledger —
     and (b) re-size it off the resume balance instead of its original quantity. ``price``
-    is the raw (pre-slippage) entry fill price — the entry bar's open — which the exit
+    is the raw (pre-slippage) entry fill price — the entry bar's close — which the exit
     plan and the fold slip exactly like every other fill.
 
     Attributes:
         side: The fill direction (+1 long / -1 short).
         quantity: The exact persisted fill size (positive units).
-        price: The raw entry fill price from the entry bar's open.
+        price: The raw entry fill price from the entry bar's close.
     """
 
     side: int
@@ -165,7 +163,7 @@ class _SignalExit:
 class _OpenPosition:
     side: int  # +1 long / -1 short
     entry_bar: int
-    entry_price: float  # raw fill price (fill-bar open)
+    entry_price: float  # raw fill price (fill-bar close)
     plan: tuple[BtExitLine, ...] = ()
     spent: set[int] = field(default_factory=set)  # plan line indices already fired
 
@@ -196,30 +194,45 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
     # Sizing
     # ------------------------------------------------------------------
 
-    def _fill_price(self, side: int) -> float:
-        """Actual next-bar fill price for an entry (backtrader ``+1`` index = next bar).
+    def _venue_price(self, side: int) -> float:
+        """The price the broker will actually execute a market order at.
 
-        On a carry window's final bar there is no next bar *in this window*, but the
-        session continues: the entry fills at the next window's own next-bar open, so the
-        seam leg is sized against the decision bar's open (a venue-level proxy) and its
-        submit-only ``order_submitted`` row is booked — the next window re-derives and
-        fills the order at the genuine price. A standalone run has no successor, so a
-        final-bar entry cannot execute and reports ``nan`` to let ``_target_quantity``
-        decline it.
+        backtrader's broker fills a market order at the *next* bar's open (the ``+1``
+        line index, already loaded within the feed), not at the recorded close — so
+        capacity and affordability checks must be priced at that open. On the final bar
+        there is no next open inside this run (a same-bar entry is realized by
+        ``stop()`` at the recorded close), so the recorded close is used instead.
         """
-        ctx = self._ctx
-        i = len(self.data) - 1
-        if i + 1 >= ctx.data.n_bars:
-            if ctx.carry_final_exit:
-                return float(slipped_price(float(self.data.open[0]), side, ctx.slip))
-            return float("nan")
-        return float(slipped_price(float(self.data.open[1]), side, ctx.slip))
+        if len(self.data) - 1 + 1 < self._ctx.data.n_bars:
+            return float(self.data.open[1])
+        return self._fill_price(side)
+
+    def _snap_price(self, price: float) -> float:
+        """Snap a float price to the instrument's price grid (§4.5 / nautilus parity).
+
+        The nautilus reference rounds every bar price to ``price_precision`` when it
+        ingests the feed (``adapt_data.py``), so its recorded fills carry clean decimals;
+        backtrader would otherwise fold raw float64 bar values whose repr is burdened with
+        arithmetic noise (``59995.100000000006``). Snapping bar-close fill prices to the
+        same grid keeps the recorded trades byte-equal to the reference.
+        """
+        return float(f"{price:.{self._ctx.inst.price_precision}f}")
+
+    def _fill_price(self, side: int) -> float:
+        """Actual fill price for a market order: the current bar's close (§9.4 parity).
+
+        The adapter's folded ledger fills at raw bar closes (or a *touched* exit's own
+        level) regardless of the broker's internal next-open execution, so the price used
+        for sizing and realized PnL is always available within the decision bar's
+        ``next()``.
+        """
+        return float(
+            slipped_price(self._snap_price(float(self.data.close[0])), side, self._ctx.slip)
+        )
 
     def _target_quantity(self, side: int) -> float:
         """Core-sized entry quantity for one direction (§6.3), floored to the lot increment."""
         ctx = self._ctx
-        if len(self.data) - 1 + 1 >= ctx.data.n_bars and not ctx.carry_final_exit:
-            return 0.0  # no next bar to fill on — entry cannot execute
         price = self._fill_price(side)
         # §6.3 capital base: the *unleveraged* net cash balance scaled by the account
         # leverage (the reference ``capital = balance × leverage``), tracked per fill in
@@ -240,16 +253,21 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             return 0.0
         cash = float(self.broker.getcash())
         # §8: mirrored reference ``NotionalSizer`` — size against the actual fill price
-        # (next-bar open), not the decision close, and reserve the entry commission, so the
-        # bookable notional *plus* fees can never exceed cash/leverage and the venue cannot
-        # spuriously reject a sized-for order. The sizing capital is already leveraged
-        # (``cash_balance × eff_leverage``, see ``_cash_balance``) — the sizer's own
-        # ``leverage`` knob is not re-applied here. Cash-like classes book the full
-        # notional; futures-like book margin = notional/lev via automargin ``1/lev``.
+        # and reserve the entry commission, so the bookable notional *plus* fees can
+        # never exceed cash/leverage and the venue cannot spuriously reject a sized-for
+        # order. backtrader's broker still executes a market order at the *next* bar's
+        # open (the ``+1`` line index, already loaded) even though the folded ledger
+        # re-stamps the fill at the submit bar's close, so the capacity hurdle is priced
+        # at that next open — sizing against the close under-prices the venue and trips
+        # its Margin check on a tight-cash round trip. The sizing capital is already
+        # leveraged (``cash_balance × eff_leverage``, see ``_cash_balance``) — the
+        # sizer's own ``leverage`` knob is not re-applied here. Cash-like classes book
+        # the full notional; futures-like book margin = notional/lev via automargin
+        # ``1/lev``.
         fee_rate = (
             _entry_fee_rate(ctx.cost_model) if ctx.cost_model is not None else 0.0
         )
-        unit_cost = price * (1.0 + fee_rate)
+        unit_cost = self._venue_price(side) * (1.0 + fee_rate)
         if ctx.margin_account is not None:
             lev = max(ctx.margin_account, 1.0)
             max_qty = cash * lev / (unit_cost * ctx.margin_account)
@@ -269,8 +287,13 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             and ctx.sizing.kind != "volatility_target"
             and _entry_fee_rate(ctx.cost_model) > 0.0
         ):
-            price = self._fill_price(side)
-            notional = qty * price
+            # Priced at the recorded fill (the submit bar's close), so the shortfall
+            # check mirrors what the folded ledger actually books. The sizing capacity
+            # in ``_target_quantity`` is the venue-side guard priced at the broker's
+            # next-bar-open execution; re-pricing the *purchasing power* here at that
+            # open as well would phantom-reject a same-bar flip whose exit is credited
+            # at the close while the entry executes at the next open.
+            notional = qty * self._fill_price(side)
             required = notional + float(fill_cost(ctx.cost_model, notional=notional))
             capacity = self._cash_balance * ctx.eff_leverage
             if required > capacity * (1.0 + 1e-9):
@@ -297,10 +320,10 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
 
         ``level_price`` is a *touched* risk exit's own level. §9.4 parity: the reference
         fills a touched stop/target **at its level**, slipped like every other fill, not at
-        the venue's next-bar open — so the level is what has to be priced here, or the
-        realized PnL (and therefore the running balance) drifts from the reference. Pass
-        ``None`` to keep next-bar-open pricing, which is correct for signal closes, flips,
-        and level-less exits (``TimeExit`` / ``trigger="close"``).
+        the bar close — so the level is what has to be priced here, or the realized PnL (and
+        therefore the running balance) drifts from the reference. Pass ``None`` to keep
+        bar-close pricing, which is correct for signal closes, flips, and level-less exits
+        (``TimeExit`` / ``trigger="close"``).
         """
         ctx = self._ctx
         if self._pos is None or qty <= _FLAT_EPS or ctx.cost_model is None:
@@ -375,8 +398,6 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
     def next(self) -> None:
         i = len(self.data) - 1
         ctx = self._ctx
-        if ctx.data.n_bars < 2:
-            return  # no room for a next-bar fill
 
         # --- Exits: risk plan first, then signal exit / flip -------------
         if (
@@ -423,9 +444,9 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                 if exit_qty > _FLAT_EPS:
                     exit_side = -self._pos.side
                     # A *touched* risk exit fills at its own level (§9.4 parity with the
-                    # reference), not at the venue's next-bar open. ``level`` is None for
-                    # level-less exits (TimeExit / trigger="close") and for signal closes,
-                    # which correctly keep next-bar-open pricing.
+                    # reference), not at the bar close. ``level`` is None for level-less
+                    # exits (TimeExit / trigger="close") and for signal closes, which
+                    # correctly book bar-close pricing.
                     level_price = (
                         None
                         if isinstance(fired, _SignalExit) or fired.level is None
@@ -528,10 +549,14 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             return
         ctx = self._ctx
         submit_bar = int(meta["submit_bar"])
-        fill_bar = submit_bar + 1
+        fill_bar = submit_bar  # same-bar close fills (§9.4 parity with the references)
         side = int(meta["side"])
         qty = abs(float(order.executed.size))
-        price = float(order.executed.price)
+        # Bar-synchronous pricing: the folded ledger fills a market order at the *submit*
+        # bar's close (the reference's same-bar fill), not at the broker's internal
+        # next-bar-open execution, so re-stamp the executed price here (snapped to the
+        # instrument's price grid like the reference's ingested bars).
+        price = self._snap_price(float(ctx.data.close[submit_bar]))
         if meta["kind"] == "entry":
             self.order_records.append(
                 BtOrderRecord(submit_bar, fill_bar, side, qty, price, None)
@@ -553,8 +578,8 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             self._pending_entry = None
         else:
             # A touched risk exit is booked at its own level (slipped like every other
-            # fill), not at backtrader's next-bar market fill — §9.4 parity with the
-            # reference. Signal closes and level-less exits keep ``order.executed.price``.
+            # fill), not at the submit bar's close — §9.4 parity with the reference. Signal
+            # closes and level-less exits keep the bar-close ``price`` stamped above.
             level_price = meta.get("level_price")
             if level_price is not None:
                 price = float(slipped_price(float(level_price), side, ctx.slip))
@@ -573,66 +598,50 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                 self._pos = None
 
     def stop(self) -> None:
-        """Realize an exit still in flight on the final bar; otherwise hold the position open.
+        """Realize an order still in flight on the final bar; otherwise hold the position open.
 
-        A market order submitted on the very last bar has no next bar to fill at, so its
-        exit would otherwise be silently lost. Mirror the reference (Nautilus) adapter,
-        which fills the final bar's exit at the bar close: an exit already in flight is
+        backtrader's broker executes a market order at the *next* bar's open, so an order
+        submitted on the very last bar cannot fill through the broker within the run. The
+        reference fills it at the same bar's close, so an exit or entry still in flight is
         booked here at the raw final close (the fold applies slippage like every other
-        fill) and keeps its reason. Any remaining open quantity is *not* force-closed —
-        the references leave a position with no exit signal open (realized PnL 0), so the
+        fill); an exit keeps its reason and any remaining open quantity is held (partial
+        scale-outs). This holds for both a standalone backtest and a paper seam window —
+        the carried position continues into the next window from the fill bar, exactly as
+        the reference backends carry it, so the windowed ledger is identical to a single
+        full-window run.
+
+        Any remaining open quantity with no exit signal is *not* force-closed — the
+        references leave a position with no exit signal open (realized PnL 0), so the
         fold's running net stays non-zero and the ledger reproduces an open mark-to-market
         row.
-
-        A paper window is different (:attr:`BtRunContext.carry_final_exit`): the session
-        continues in the next window, so an exit still in flight here must stay open — the
-        next window re-derives the signal from the recomputed bars and fills it at its genuine
-        next-bar open, exactly as a single full-window run would. Force-realizing it at the
-        final close would book a close price/timestamp the full run never had and drop the
-        position from ``open_position``. The submission itself *did* happen in this window,
-        though — record it as a submit-only :class:`BtOrderRecord` so the ledger books the
-        ``order_submitted`` row at the signal bar, matching the full run (the next window's
-        copy of the order falls at the same timestamp and is deduplicated away).
         """
-        if self._ctx.carry_final_exit:
-            pending_exit = self._pending_exit
-            if pending_exit is not None:
-                self.order_records.append(
-                    BtOrderRecord(
-                        int(pending_exit["submit_bar"]),
-                        None,
-                        int(pending_exit["side"]),
-                        float(pending_exit["size"]),
-                        None,
-                        pending_exit.get("reason"),
-                    )
-                )
-            pending_entry = self._pending_entry
-            if pending_entry is not None:
-                self.order_records.append(
-                    BtOrderRecord(
-                        int(pending_entry["submit_bar"]),
-                        None,
-                        int(pending_entry["side"]),
-                        float(pending_entry["size"]),
-                        None,
-                        None,
-                    )
-                )
-            return
-        if self._pos is None or abs(self.position.size) <= _FLAT_EPS:
-            return
-        pending = self._pending_exit
-        if pending is None:
-            return
         last = self._ctx.data.n_bars - 1
-        close_price = float(self.data.close[0])
-        total = abs(self.position.size)
-        side = int(pending["side"])
-        qty = float(pending["size"])
-        self.order_records.append(
-            BtOrderRecord(last, last, side, qty, close_price, pending.get("reason"))
-        )
-        self._pending_exit = None
-        if total - qty <= _FLAT_EPS:
-            self._pos = None
+        close_price = self._snap_price(float(self.data.close[0]))
+        pending = self._pending_exit
+        if pending is not None:
+            self.order_records.append(
+                BtOrderRecord(
+                    last,
+                    last,
+                    int(pending["side"]),
+                    float(pending["size"]),
+                    close_price,
+                    pending.get("reason"),
+                )
+            )
+            self._pending_exit = None
+            if abs(self.position.size) - float(pending["size"]) <= _FLAT_EPS:
+                self._pos = None
+        pending_entry = self._pending_entry
+        if pending_entry is not None:
+            self.order_records.append(
+                BtOrderRecord(
+                    last,
+                    last,
+                    int(pending_entry["side"]),
+                    float(pending_entry["size"]),
+                    close_price,
+                    None,
+                )
+            )
+            self._pending_entry = None

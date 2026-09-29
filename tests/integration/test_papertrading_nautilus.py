@@ -234,6 +234,95 @@ def test_resume_with_non_trailing_atr_seeds_atr_warmup_only() -> None:
     assert len(fills2) == 1
 
 
+def test_atr_stop_aligns_when_aux_index_is_us_resolution() -> None:
+    """Regression: an aux ``MarketData`` whose index pandas stores at ``datetime64[us]``
+    must still align bar-for-bar with the strategy's rebuilt (ns-int64) grid.
+
+    ``_atr_from_aux`` keyed its ffill ``reindex`` on ``_ts_ns_int``, which returned the
+    *natively stored* ints — microseconds for a ``datetime64[us]`` index versus the
+    strategy's nanosecond hist timestamps. The two grids never overlapped, so ``reindex``
+    forward-filled every bar from the aux's *trailing* ATR value: the stop level became a
+    constant ``entry - mult * atr[-1]`` and fired on the wrong bar at the wrong price.
+    Before the fix this scenario exited at bar 3 @ 96.544 instead of bar 2 @ 98.25.
+    """
+    md = MarketData.from_records(
+        [
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 100.5,
+                "low": 99.0,
+                "close": 99.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T01:00:00Z",
+            },
+            {
+                "open": 99.5,
+                "high": 99.8,
+                "low": 96.9,
+                "close": 97.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 97.0,
+                "high": 97.5,
+                "low": 95.0,
+                "close": 95.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T03:00:00Z",
+            },
+            {
+                "open": 95.5,
+                "high": 96.0,
+                "low": 91.5,
+                "close": 93.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T04:00:00Z",
+            },
+        ]
+    )
+    # Force the aux index to the coarse unit pandas may pick for real feeds — the paper
+    # strategy's own grid is rebuilt as ns-int64, so the two must be unit-normalized.
+    aux = MarketData(
+        open=md.open,
+        high=md.high,
+        low=md.low,
+        close=md.close,
+        volume=md.volume,
+        index=md.timestamps.as_unit("us"),
+    )
+    assert str(aux.timestamps.dtype) == "datetime64[us, UTC]"
+    signals = from_target(np.array([1, 1, 1, 1, 1]))
+    cfg = _exit_cfg(ATRStop(mult=1.0, period=2, atr="atr_1m"))
+    state = init(cfg)
+
+    _, events = step(md, signals, state, cfg, aux_data={"atr_1m": aux})
+
+    instr = cfg.base.instrument
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "atr_stop"
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert len(fills) == 2
+    # Wilder ATR (period 2) over the aux: [2, 1.75, 2.325, ...]; shifted one bar and
+    # primed, atr[2] = 1.75 → level = 100 - 1.0*1.75 = 98.25. Bar 2's low (96.9) touches
+    # it; bar 2's low is *above* the trailing-collapse level (100 - atr[-1] ≈ 96.54), so
+    # the pre-fix engine skipped it and exited a bar later at the wrong price.
+    assert fills[1].exit_reason == "atr_stop"
+    assert abs(fills[1].price - 98.25) < 1e-6
+    assert abs(closed[0].exit_price - 98.25) < 1e-6
+    assert fills[1].timestamp == int(md.timestamps.as_unit("ns").asi8[2])
+    assert closed[0].exit_timestamp == int(md.timestamps.as_unit("ns").asi8[2])
+
+
 def test_duplicate_bar_raises() -> None:
     """T8 — DuplicateBarError on stale bar (idempotency §9.6)."""
     from ube.core.errors import DuplicateBarError
@@ -371,13 +460,19 @@ def test_account_currency_follows_instrument_currency() -> None:
     from ube.papertrading.nautilus.backend import _instrument_currency
 
     usd_instrument = Instrument(
-        "XAUUSD", "commodities", tick_size=0.01, contract_multiplier=1.0,
+        "XAUUSD",
+        "commodities",
+        tick_size=0.01,
+        contract_multiplier=1.0,
         settlement_currency="USD",
     )
     assert _instrument_currency(build_instrument(usd_instrument, overrides={}).instrument) == "USD"
 
     usdt_instrument = Instrument(
-        "BITCOIN", "crypto_perp", tick_size=0.01, contract_multiplier=1.0,
+        "BITCOIN",
+        "crypto_perp",
+        tick_size=0.01,
+        contract_multiplier=1.0,
         settlement_currency="USDT",
     )
     built = build_instrument(usdt_instrument, overrides={}).instrument
@@ -418,7 +513,6 @@ def test_backtest_usd_settlement_with_synthetic_usdt_rate() -> None:
     assert len(result_explicit.trades) == 1
 
 
-
 def _leveraged_cfg() -> PaperConfig:
     from ube.core.config import RiskConfig
     from ube.core.risk.sizing import SizeModel
@@ -454,16 +548,46 @@ def test_crypto_perp_touched_take_profit_fills_at_level() -> None:
     """
     md = MarketData.from_records(
         [
-            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T00:00:00Z"},
-            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0,
-             "timestamp": "2024-01-01T01:00:00Z"},
-            {"open": 100.5, "high": 106.0, "low": 100.0, "close": 100.5, "volume": 1000.0,
-             "timestamp": "2024-01-01T02:00:00Z"},
-            {"open": 100.5, "high": 101.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T03:00:00Z"},
-            {"open": 100.0, "high": 100.0, "low": 99.0, "close": 99.5, "volume": 1000.0,
-             "timestamp": "2024-01-01T04:00:00Z"},
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T01:00:00Z",
+            },
+            {
+                "open": 100.5,
+                "high": 106.0,
+                "low": 100.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 100.5,
+                "high": 101.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T03:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 99.0,
+                "close": 99.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T04:00:00Z",
+            },
         ]
     )
     signals = from_target(np.array([1, 1, 0, 0, 0]))
@@ -493,16 +617,46 @@ def test_crypto_perp_touched_stop_loss_fills_at_level() -> None:
     """
     md = MarketData.from_records(
         [
-            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T00:00:00Z"},
-            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0,
-             "timestamp": "2024-01-01T01:00:00Z"},
-            {"open": 100.5, "high": 100.5, "low": 97.0, "close": 99.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T02:00:00Z"},
-            {"open": 99.0, "high": 99.5, "low": 98.0, "close": 98.5, "volume": 1000.0,
-             "timestamp": "2024-01-01T03:00:00Z"},
-            {"open": 98.5, "high": 99.0, "low": 97.5, "close": 98.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T04:00:00Z"},
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T01:00:00Z",
+            },
+            {
+                "open": 100.5,
+                "high": 100.5,
+                "low": 97.0,
+                "close": 99.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 99.0,
+                "high": 99.5,
+                "low": 98.0,
+                "close": 98.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T03:00:00Z",
+            },
+            {
+                "open": 98.5,
+                "high": 99.0,
+                "low": 97.5,
+                "close": 98.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T04:00:00Z",
+            },
         ]
     )
     signals = from_target(np.array([1, 1, 0, 0, 0]))
@@ -548,19 +702,49 @@ def test_crypto_perp_risk_exit_before_entry_fill_books_on_triggering_bar() -> No
     md = MarketData.from_records(
         [
             # Bar 0 — the open order is submitted here, so its fill is still in flight.
-            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T00:00:00Z"},
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
             # Bar 1 — the entry fill arrives *after* this on_bar, and the bar dips through
             # the 98.0 stop: the fill-lag window where the exit has no quantity to close.
-            {"open": 100.0, "high": 100.0, "low": 97.0, "close": 99.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T01:00:00Z"},
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 97.0,
+                "close": 99.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T01:00:00Z",
+            },
             # Bar 2 sweeps the 105.0 target — a later bar must not re-fire the exit.
-            {"open": 99.0, "high": 106.0, "low": 98.5, "close": 105.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T02:00:00Z"},
-            {"open": 105.0, "high": 105.5, "low": 104.0, "close": 105.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T03:00:00Z"},
-            {"open": 105.0, "high": 105.5, "low": 104.0, "close": 105.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T04:00:00Z"},
+            {
+                "open": 99.0,
+                "high": 106.0,
+                "low": 98.5,
+                "close": 105.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 105.0,
+                "high": 105.5,
+                "low": 104.0,
+                "close": 105.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T03:00:00Z",
+            },
+            {
+                "open": 105.0,
+                "high": 105.5,
+                "low": 104.0,
+                "close": 105.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T04:00:00Z",
+            },
         ]
     )
     signals = from_target(np.array([1, 1, 1, 1, 0]))
@@ -572,8 +756,16 @@ def test_crypto_perp_risk_exit_before_entry_fill_books_on_triggering_bar() -> No
     assert closed.exit_reason == "stop_loss", "the stop on bar 1 must own the exit"
     assert abs(closed.exit_price - 98.0) < 1e-6, "and it must fill at the stop level"
     # The target on bar 3 must not produce a second, later exit.
-    assert len([e for e in state.ledger.events
-                if e.event_type == EventType.FILL and e.exit_reason is not None]) == 1
+    assert (
+        len(
+            [
+                e
+                for e in state.ledger.events
+                if e.event_type == EventType.FILL and e.exit_reason is not None
+            ]
+        )
+        == 1
+    )
 
 
 def test_crypto_perp_partial_risk_exit_before_entry_fill_scales_out_and_keeps_remainder() -> None:
@@ -588,21 +780,37 @@ def test_crypto_perp_partial_risk_exit_before_entry_fill_scales_out_and_keeps_re
     bc = BacktestConfig(
         instrument=instr,
         signal=SignalConfig(on_opposite_signal="reverse"),
-        risk=RiskConfig(
-            exit=(StopLoss(percent=0.02), TakeProfit(percent=0.05, scale_out=0.5))
-        ),
+        risk=RiskConfig(exit=(StopLoss(percent=0.02), TakeProfit(percent=0.05, scale_out=0.5))),
     )
     cfg = PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
     md = MarketData.from_records(
         [
-            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T00:00:00Z"},
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
             # Bar 1 sweeps the 105.0 target while the entry fill is still in flight.
-            {"open": 100.0, "high": 106.0, "low": 100.0, "close": 105.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T01:00:00Z"},
+            {
+                "open": 100.0,
+                "high": 106.0,
+                "low": 100.0,
+                "close": 105.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T01:00:00Z",
+            },
             # Bar 2 stays below the target, so only the signal exit closes the remainder.
-            {"open": 104.5, "high": 104.5, "low": 104.0, "close": 104.5, "volume": 1000.0,
-             "timestamp": "2024-01-01T02:00:00Z"},
+            {
+                "open": 104.5,
+                "high": 104.5,
+                "low": 104.0,
+                "close": 104.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T02:00:00Z",
+            },
         ]
     )
     signals = from_target(np.array([1, 1, 0]))
@@ -611,10 +819,8 @@ def test_crypto_perp_partial_risk_exit_before_entry_fill_scales_out_and_keeps_re
     _, _events = step(md, signals, state, cfg)
 
     events = state.ledger.events
-    opens = [e for e in events
-             if e.event_type == EventType.FILL and e.exit_reason is None]
-    fills = [e for e in events
-             if e.event_type == EventType.FILL and e.exit_reason is not None]
+    opens = [e for e in events if e.event_type == EventType.FILL and e.exit_reason is None]
+    fills = [e for e in events if e.event_type == EventType.FILL and e.exit_reason is not None]
     assert fills, "the pending scale-out must book once the entry fill lands"
     first = fills[0]
     assert first.exit_reason == "take_profit", "and it must keep the real exit reason"
@@ -632,7 +838,7 @@ def test_crypto_perp_partial_risk_exit_before_entry_fill_scales_out_and_keeps_re
 
     # A scale-out leaves a live position, so the POSITION_CHANGE that follows it must
     # report the *remainder*, not the old hardcoded flat 0.0.
-    after = events[events.index(first) + 1:]
+    after = events[events.index(first) + 1 :]
     (change,) = [e for e in after if e.event_type == EventType.POSITION_CHANGE][:1]
     assert change.position_after > 0, "remainder must be reported, not flat"
     assert abs(change.position_after - 0.5 * opens[0].quantity) < 1e-6
@@ -661,19 +867,49 @@ def test_crypto_perp_swept_bar_exits_at_the_level_reached_first() -> None:
     def _run(sweep_open: float) -> tuple[float, str]:
         md = MarketData.from_records(
             [
-                {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
-                 "timestamp": "2024-01-01T00:00:00Z"},
+                {
+                    "open": 100.0,
+                    "high": 100.0,
+                    "low": 100.0,
+                    "close": 100.0,
+                    "volume": 1000.0,
+                    "timestamp": "2024-01-01T00:00:00Z",
+                },
                 # Quiet hold so the entry fill (one-bar sandbox fill lag) has landed.
-                {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0,
-                 "timestamp": "2024-01-01T01:00:00Z"},
+                {
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1000.0,
+                    "timestamp": "2024-01-01T01:00:00Z",
+                },
                 # Sweep bar: reaches the 105.0 target *and* dips through the 98.0 stop.
-                {"open": sweep_open, "high": 106.0, "low": 97.0, "close": sweep_open,
-                 "volume": 1000.0, "timestamp": "2024-01-01T02:00:00Z"},
+                {
+                    "open": sweep_open,
+                    "high": 106.0,
+                    "low": 97.0,
+                    "close": sweep_open,
+                    "volume": 1000.0,
+                    "timestamp": "2024-01-01T02:00:00Z",
+                },
                 # Quiet bars after the exit (the position is already flat).
-                {"open": sweep_open, "high": sweep_open + 1.0, "low": sweep_open - 1.0,
-                 "close": sweep_open, "volume": 1000.0, "timestamp": "2024-01-01T03:00:00Z"},
-                {"open": sweep_open, "high": sweep_open + 1.0, "low": sweep_open - 1.0,
-                 "close": sweep_open, "volume": 1000.0, "timestamp": "2024-01-01T04:00:00Z"},
+                {
+                    "open": sweep_open,
+                    "high": sweep_open + 1.0,
+                    "low": sweep_open - 1.0,
+                    "close": sweep_open,
+                    "volume": 1000.0,
+                    "timestamp": "2024-01-01T03:00:00Z",
+                },
+                {
+                    "open": sweep_open,
+                    "high": sweep_open + 1.0,
+                    "low": sweep_open - 1.0,
+                    "close": sweep_open,
+                    "volume": 1000.0,
+                    "timestamp": "2024-01-01T04:00:00Z",
+                },
             ]
         )
         signals = from_target(np.array([1, 1, 0, 0, 0]))
@@ -705,14 +941,38 @@ def test_crypto_perp_close_trigger_exit_fills_at_bar_close() -> None:
     """
     md = MarketData.from_records(
         [
-            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T00:00:00Z"},
-            {"open": 100.0, "high": 101.0, "low": 97.0, "close": 100.5, "volume": 1000.0,
-             "timestamp": "2024-01-01T01:00:00Z"},
-            {"open": 100.5, "high": 101.0, "low": 96.5, "close": 97.5, "volume": 1000.0,
-             "timestamp": "2024-01-01T02:00:00Z"},
-            {"open": 97.5, "high": 98.0, "low": 96.5, "close": 97.0, "volume": 1000.0,
-             "timestamp": "2024-01-01T03:00:00Z"},
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 97.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T01:00:00Z",
+            },
+            {
+                "open": 100.5,
+                "high": 101.0,
+                "low": 96.5,
+                "close": 97.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 97.5,
+                "high": 98.0,
+                "low": 96.5,
+                "close": 97.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T03:00:00Z",
+            },
         ]
     )
     signals = from_target(np.array([1, 1, 1, 0]))

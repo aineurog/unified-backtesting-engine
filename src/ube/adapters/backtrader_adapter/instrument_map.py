@@ -32,9 +32,21 @@ from ube.core.instrument import Instrument, resolve_funding_interval_hours
 __all__ = [
     "BtInstrument",
     "build_instrument",
+    "resolve_price_precision",
     "round_to_increment",
     "floor_to_increment",
 ]
+
+#: Default price precision per asset class when ``tick_size`` cannot be used
+#: (mirrors the nautilus/vectorbt ``instrument_map`` tables).
+_DEFAULT_PRICE_PRECISION: dict[str, int] = {
+    "crypto_perp": 2,
+    "crypto_spot": 2,
+    "futures": 2,
+    "commodities": 2,
+    "stocks": 2,
+    "forex": 5,
+}
 
 #: Default size precision (decimal places) per asset class.
 _DEFAULT_SIZE_PRECISION: dict[str, int] = {
@@ -66,6 +78,7 @@ class BtInstrument:
     """The backtrader-relevant parameters derived from a canonical instrument (§4.5)."""
 
     asset_class: str
+    price_precision: int
     size_precision: int
     size_increment: float
     contract_multiplier: float
@@ -95,6 +108,33 @@ def floor_to_increment(qty: float, increment: float) -> float:
         return float(qty)
     inc = float(increment)
     return math.floor(float(qty) / inc + 1e-9) * inc
+
+
+def _decimal_places(value: float) -> int:
+    """Number of decimal places in ``value`` (e.g. ``0.25 -> 2``, ``0.1 -> 1``)."""
+    text = f"{value:.10f}".rstrip("0").rstrip(".")
+    return len(text.split(".")[1]) if "." in text else 0
+
+
+def resolve_price_precision(
+    canonical: Instrument, overrides: Mapping[str, Any] | None = None
+) -> int:
+    """Resolve the ``price_precision`` (decimal places) for booked fill prices.
+
+    Mirrors the nautilus ``instrument_map``: the precision defaults to the decimal places
+    of the canonical ``tick_size`` (e.g. EURUSD 5, ES 2, GC 1) with an asset-class default
+    when the instrument omits the tick, and an explicit ``price_precision`` override wins.
+    The folded ledger snaps bar-close fill prices to this grid so floating-point artifacts
+    in the raw bars (59995.100000000006 vs 59995.1) never leak into recorded fills and the
+    backtrader trades hash matches the nautilus reference byte-for-byte.
+    """
+    overrides = overrides if overrides is not None else {}
+    tick = canonical.tick_size
+    if tick is not None:
+        default_precision = _decimal_places(tick)
+    else:
+        default_precision = _DEFAULT_PRICE_PRECISION[canonical.asset_class]
+    return int(overrides.get("price_precision", default_precision))
 
 
 def build_instrument(
@@ -142,6 +182,7 @@ def build_instrument(
         funding_interval_hours = resolve_funding_interval_hours(canonical)
     return BtInstrument(
         asset_class=asset_class,
+        price_precision=resolve_price_precision(canonical, overrides),
         size_precision=size_precision,
         size_increment=size_increment,
         contract_multiplier=contract_multiplier,

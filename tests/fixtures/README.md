@@ -60,6 +60,8 @@ exercised. A baseline is a real, manually-reviewed run, never a hand-invented nu
 asserts the engine reproduces it within the stated tolerance (see
 ``tests/parity/test_nautilus_parity.py`` and ``tests/parity/test_backtrader_parity.py``).
 
-Backtrader fills market orders at the *next* bar's open, so its locked values are its own (e.g. a
-final-bar exit is realized at the final bar's close, `stop()` in ``strategy.py``); a per-engine
-trades_hash therefore differs from Nautilus' even where ``final_equity`` coincides.
+Backtrader fills market orders at the *same* bar's close (§9.4 parity with the reference),
+so its locked values reproduce the Nautilus baseline exactly — the ``backtrader`` block's
+``trades_hash`` now equals the ``nautilus`` block's for every asset class. The lock is
+still per-engine: the two blocks remain independent files in case a fill-timing divergence
+is ever reintroduced.
