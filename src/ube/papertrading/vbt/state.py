@@ -60,7 +60,18 @@ __all__ = [
 #: Persisted engine marker written into ``PaperState.aux_data["vbt"]`` (see §4/§5).
 VBT_ENGINE_TAG: dict[str, Any] = {"engine": "vectorbt", "schema": 1}
 
-_EPS = 1e-12
+# Scale-relative "flat" tolerance for the fill scan (mirrors ``ube.core.ledger`` and
+# ``ube.papertrading.core``). A cover fill can settle a position one float-ulp off the
+# size it opened — e.g. a 75382.2076-unit forex short covered at 75382.2076 leaves a
+# 1.46e-11 residue, orders of magnitude above an absolute 1e-12 floor. Classifying that
+# residue as a live position makes ``last_close_ns`` skip the real close bar and shifts the
+# replay window and checkpoint bound onto the wrong bars.
+_FLAT_REL_TOL = 1e-9
+
+
+def _flat_tol(*scales: float) -> float:
+    """Scale-relative "is flat" tolerance: ``~1e-9`` of the largest quantity involved."""
+    return max(max(abs(float(s)) for s in scales), 1.0) * _FLAT_REL_TOL
 
 
 def _raw_events(ledger: EventLedger) -> list[Any]:
@@ -88,10 +99,12 @@ def last_close_ns(ledger: EventLedger, instrument_id: str) -> int | None:
             continue
         if event.side is None or event.quantity is None:
             continue
-        new = pos + float(event.side) * float(event.quantity)
-        if abs(pos) > _EPS and (abs(new) < _EPS or (new > 0.0) != (pos > 0.0)):
+        q = float(event.side) * float(event.quantity)
+        new = pos + q
+        tol = _flat_tol(q, pos)
+        if abs(pos) > tol and (abs(new) <= tol or (new > 0.0) != (pos > 0.0)):
             last_close = int(event.timestamp)
-        pos = new
+        pos = new if abs(new) > tol else 0.0
     return last_close
 
 
@@ -235,9 +248,11 @@ class VbtPaperState(PaperState):
             if event.side is None or event.quantity is None:
                 continue
             new = pos + float(event.side) * float(event.quantity)
-            if abs(pos) > _EPS and (abs(new) < _EPS or (new > 0.0) != (pos > 0.0)):
+            q = new - pos
+            tol = _flat_tol(q, pos)
+            if abs(pos) > tol and (abs(new) <= tol or (new > 0.0) != (pos > 0.0)):
                 last_close = int(event.timestamp)
-            pos = new
+            pos = new if abs(new) > tol else 0.0
         self._scan_n = i
         self._scan_pos = pos
         self._scan_last_close = last_close

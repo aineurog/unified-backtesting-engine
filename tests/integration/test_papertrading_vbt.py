@@ -9,25 +9,29 @@ positions), because every window re-derives its start and checkpoint balance fro
 
 from __future__ import annotations
 
+from math import inf, nextafter
+
 import numpy as np
 import pytest
 
 from ube.core.config import BacktestConfig, SignalConfig
 from ube.core.data import MarketData
 from ube.core.errors import EngineError
-from ube.core.ledger import trades
+from ube.core.ledger import EventLedger, EventType, LedgerEvent, trades
 from ube.core.risk import RiskConfig
 from ube.core.risk.exits import ATRStop, TakeProfit
+from ube.core.risk.sizing import SizeModel
 from ube.core.signals import Signals, from_target
 from ube.papertrading import get_paper_engine, get_state_class, init, run
 from ube.papertrading.config import PaperConfig
+from ube.papertrading.core import _open_position_from_ledger, step
 from ube.papertrading.vbt.backend import (
     VbtPaperEngine,
     _apply_policy,
     _max_atr_period,
     _zero_at_or_before,
 )
-from ube.papertrading.vbt.state import VbtPaperState
+from ube.papertrading.vbt.state import VbtPaperState, checkpoint_balance
 from ube.testing.synthetic import PRESETS, synthetic_bars
 
 AC = "crypto_perp"
@@ -414,7 +418,116 @@ def test_atr_exit_survives_windowed_resume_with_aux() -> None:
             _slice_sig(signals, slice(0, 24)),
             cfg,
             db_path=db,
-            aux_data={"atr_1m": data},
-        )
+aux_data={"atr_1m": data},
+            )
 
     assert state.open_position is None
+
+
+# ---------------------------------------------------------------------------
+# float-residue close (live GBPUSD: stuck open trade)
+# ---------------------------------------------------------------------------
+
+
+def test_ulp_residue_close_does_not_resurrect_a_closed_trade() -> None:
+    # Live GBPUSD regression. A cover fill settled a 75382.2076-unit short one float-ulp
+    # short of exact, leaving a 1.46e-11 residue. The paper layer judged flatness with an
+    # *absolute* 1e-12 floor, so the residue was folded as a live long and the trade read
+    # as still open. The next warm window then force-reopened that closed long at its old
+    # entry bar; that entry's fill was cut by the ``ts <= cursor`` filter while the trade's
+    # already-committed exit survived, so an orphan sell was committed against a position
+    # the ledger did not have. The orphan credited phantom cash, inflating the next
+    # checkpoint ~21x, which oversized every following entry until the ATR stop could no
+    # longer settle the position flat -- the run was stuck holding a trade that no fill
+    # stream supported.
+    instr = PRESETS["forex"].instrument
+    iid = instr.symbol
+    n = 12
+    data = synthetic_bars(PRESETS["forex"], n_bars=n)
+    ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)
+
+    # Bar 2 opens a short, bar 4 closes it, and bar 6 carries the live pattern: the MT5
+    # signal function is stateful and emitted ``long_exit + short_entry`` on one bar while
+    # the ledger was flat -- exactly the bar the orphan sell was mis-executed against. A
+    # `long_exit` while flat must book nothing; only the short entry may be booked.
+    z = np.zeros(n, dtype=bool)
+    le, lx, se, sx = z.copy(), z.copy(), z.copy(), z.copy()
+    lx[6] = True
+    se[6] = True
+    signals = Signals(long_entry=le, long_exit=lx, short_entry=se, short_exit=sx)
+
+    short = 75_382.2076
+    cover = nextafter(short, inf)
+    assert cover - short > 1e-12  # the fixture must leave an above-floor residue
+
+    def _fill(at: int, side: int, qty: float, px: float) -> LedgerEvent:
+        return LedgerEvent(
+            EventType.FILL, int(ts[at]), iid, side=side, quantity=qty, price=px
+        )
+
+    prefix = EventLedger(
+        [
+            LedgerEvent(
+                EventType.CASH_MOVEMENT,
+                int(ts[0]),
+                iid,
+                amount=10_000.0,
+                currency="USD",
+            ),
+            _fill(0, 1, 75_275.1306, float(data.close[0])),
+            _fill(2, -1, 75_275.1306, float(data.close[2])),
+            _fill(2, -1, short, float(data.open[2])),
+            _fill(4, 1, cover, float(data.close[4])),
+        ]
+    )
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        risk=RiskConfig(
+            sizing=SizeModel(kind="fixed_fraction", value=0.10, leverage=100.0)
+        ),
+    )
+    cfg = PaperConfig(base=bc, engine="vectorbt", starting_balance=10_000.0)
+    multiplier = (
+        1.0 if instr.contract_multiplier is None else float(instr.contract_multiplier)
+    )
+    before = checkpoint_balance(prefix, iid, None, 10_000.0, multiplier=multiplier)
+
+    # The persisted state after that window: cursor at the close bar, and the open position
+    # folded from the ledger exactly as ``core.step`` persists it.
+    state = VbtPaperState(
+        instrument_id=iid,
+        ledger=prefix,
+        last_processed_ns=int(ts[4]),
+        last_price=float(data.close[4]),
+        open_position=_open_position_from_ledger(prefix, iid),
+    )
+    assert state.open_position is None, (
+        "a 1-ulp residue on the close bar was folded as a live position: "
+        f"{state.open_position}"
+    )
+
+    state, new_events = step(
+        _slice_md(data, slice(4, n)),
+        _slice_sig(signals, slice(4, n)),
+        state,
+        cfg,
+    )
+
+    fills = [e for e in new_events if e.event_type is EventType.FILL]
+    # Only the genuine bar-6 short entry may be booked: no exit fill without its entry.
+    booked = [
+        (int(e.timestamp), int(e.side or 0), round(float(e.quantity or 0.0), 5), e.exit_reason)
+        for e in fills
+    ]
+    assert len(fills) == 1, (
+        f"orphan fill committed against a position the ledger did not hold: {booked}"
+    )
+    assert (int(fills[0].timestamp), int(fills[0].side or 0)) == (int(ts[6]), -1)
+    assert state.open_position is not None and state.open_position.side == -1
+
+    # The phantom cash is gone: equity moved by the trade's own PnL, not by ~100k.
+    after = checkpoint_balance(
+        state.ledger, iid, state.open_position, 10_000.0, multiplier=multiplier
+    )
+    assert after < 2.0 * before, f"checkpoint inflated {before:.2f} -> {after:.2f}"

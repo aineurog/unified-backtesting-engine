@@ -7,6 +7,8 @@ engine-tag guard on ``VbtPaperState.load``.
 
 from __future__ import annotations
 
+from math import inf, nextafter
+
 import pytest
 
 from ube.core.cost import CostModel, fill_cost
@@ -68,6 +70,26 @@ def test_last_close_on_flip() -> None:
             _fill(10, 1, 1.0, 100.0),
             _fill(20, -1, 1.0, 110.0),
             _fill(20, -1, 1.0, 110.0),
+        ]
+    )
+    assert last_close_ns(ledger, IID) == 20
+
+
+def test_last_close_ignores_a_ulp_residue_on_the_close_bar() -> None:
+    # A cover fill can settle a position one float-ulp off the size it opened. A live
+    # GBPUSD poll closed a 75382.2076-unit short with a cover exactly 1 ulp larger, leaving
+    # a 1.46e-11 residue -- ~1e4x an absolute 1e-12 floor. The residue was folded as a live
+    # long, so the real close bar was skipped and the *next* fill was misread as the close,
+    # which shifted the replay window and checkpoint bound onto the wrong bars. Judging
+    # flatness relative to the size being settled keeps the real close bar.
+    short = 75_382.2076
+    cover = nextafter(short, inf)
+    assert cover - short > 1e-12  # guard: the fixture must leave an above-floor residue
+    ledger = EventLedger(
+        [
+            _fill(10, -1, short, 1.32867),
+            _fill(20, 1, cover, 1.32897915),
+            _fill(30, -1, 75_191.531, 1.32943),
         ]
     )
     assert last_close_ns(ledger, IID) == 20

@@ -60,8 +60,24 @@ __all__ = [
     "step",
 ]
 
-# A tiny epsilon for open-position folds.
-_EPS = 1e-12
+# Scale-relative tolerance for "the position is flat" (mirrors ``ube.core.ledger``'s
+# per-fill fold tolerance, which is relative for the same reason). Engine adapters can
+# settle a position with a quantity one float-ulp off the position they opened — e.g. a
+# 75382.2076-unit forex short covered at 75382.2076 leaves a 1.46e-11 residue, ~1e4x an
+# absolute 1e-12 floor. Folding that residue as a live position makes the next warm window
+# treat a *closed* trade as carried: the vectorbt backend force-reopens it at the old entry
+# bar, that entry's fill is then cut by the ``ts <= cursor`` filter, and the trade's
+# already-committed exit survives as an orphan fill. The orphan credits phantom cash,
+# inflating the next checkpoint and every subsequent size, so one ulp of float noise
+# cascades into an oversized position that can never settle flat. Quantities are in
+# instrument units (~1e5 for FX), so flatness must be judged relative to the size being
+# settled.
+_FLAT_REL_TOL = 1e-9
+
+
+def _flat_tol(*scales: float) -> float:
+    """Scale-relative "is flat" tolerance: ``~1e-9`` of the largest quantity involved."""
+    return max(max(abs(float(s)) for s in scales), 1.0) * _FLAT_REL_TOL
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +349,10 @@ def _open_position_from_ledger(
         q = float(e.side) * float(e.quantity)
         px = float(e.price)
         oid = e.order_id or ""
-        if abs(position) < _EPS:
+        # Same-bar reversals and near-exact covers settle to within float noise; the
+        # tolerance is relative to the quantities in play, never the absolute _EPS.
+        tol = 1e-12
+        if abs(position) <= tol:
             entry_px, entry_ns, trade_id = px, int(e.timestamp), oid
             position = q
         elif (q > 0) == (position > 0):
@@ -341,15 +360,15 @@ def _open_position_from_ledger(
             entry_px = (entry_px * abs(position) + px * abs(q)) / abs(new_pos)
             position = new_pos
         else:
-            if abs(q) >= abs(position):
+            if abs(q) >= abs(position) - tol:
                 flip = q + position
-                if abs(flip) < _EPS:
+                if abs(flip) <= tol:
                     position, entry_px, entry_ns, trade_id = 0.0, 0.0, 0, ""
                 else:
                     position, entry_px, entry_ns, trade_id = flip, px, int(e.timestamp), oid
             else:
                 position += q
-    if abs(position) < _EPS:
+    if abs(position) <= _flat_tol(position):
         return None
     return OpenPosition(
         side=1 if position > 0 else -1,
