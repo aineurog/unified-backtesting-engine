@@ -36,7 +36,7 @@ that mirrors the other adapters' semantics on that loop:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC
 from datetime import datetime as _py_dt
 from typing import Any, cast
@@ -384,6 +384,25 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             entry_bar=0,
             atr_map=ctx.atr_map,
         )
+        # Arm the carried plan from the bar *after* its fill bar. The carried leg filled at
+        # ``data[0]``'s close (same-bar close fill, §8), so a level touched during bar 0 was
+        # reached *before* the position existed and must not fire it. That is exactly how a
+        # plan this strategy builds for its own entry behaves: ``notify_order`` builds it on
+        # the fill bar and ``next()`` first consults it on the next one, so an entry-bar touch
+        # is structurally unreachable in a full run. Without masking bar 0 here a warm window
+        # exits the carried trade on its own entry bar (a phantom stop-out at the wrong bar),
+        # which books the wrong realized PnL and desynchronizes every later size from the full
+        # run — the windowed ledger then drifts from a single full-window run.
+        plan = tuple(
+            replace(
+                line,
+                triggered=np.asarray(
+                    [False, *np.asarray(line.triggered, dtype=np.bool_)[1:]],
+                    dtype=np.bool_,
+                ),
+            )
+            for line in plan
+        )
         self._pos = _OpenPosition(
             side=int(carried.side),
             entry_bar=0,
@@ -473,6 +492,7 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                         "size": exit_qty,
                         "reason": fired.reason,
                         "close_all": isinstance(fired, _SignalExit),
+                        "level_price": level_price,
                     }
                     self._ube_orders[order.ref] = {
                         "kind": "exit",
@@ -616,16 +636,28 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         row.
         """
         last = self._ctx.data.n_bars - 1
+        ctx = self._ctx
         close_price = self._snap_price(float(self.data.close[0]))
         pending = self._pending_exit
         if pending is not None:
+            # Book an in-flight exit at the price ``notify_order`` would have used: a touched
+            # risk exit at its own slipped level (so a seam-bar touch keeps §9.4 parity with
+            # the full run), a signal close or level-less exit at the snapped final close.
+            level_price = pending.get("level_price")
+            exit_price = (
+                close_price
+                if level_price is None
+                else float(
+                    slipped_price(float(level_price), int(pending["side"]), ctx.slip)
+                )
+            )
             self.order_records.append(
                 BtOrderRecord(
                     last,
                     last,
                     int(pending["side"]),
                     float(pending["size"]),
-                    close_price,
+                    exit_price,
                     pending.get("reason"),
                 )
             )

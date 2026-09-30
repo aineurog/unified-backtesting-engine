@@ -443,6 +443,123 @@ def test_final_bar_exit_in_flight_fills_at_the_final_close() -> None:
     assert state.open_position == full_open
 
 
+def _dip_on_entry_bar_md(lows: list[float]) -> MarketData:
+    """Flat 100s with a caller-chosen low per bar, on gold's session timestamps.
+
+    The long the tests below carry in is filled at the *close* of bar 0 (a same-bar close
+    fill, §8), so a low that dips through the 95 stop was reached *before* the position
+    existed and must not fire it - exactly as in a full run, where ``notify_order`` builds
+    the plan on the fill bar and ``next()`` first consults it on the NEXT one.
+    """
+    n = len(lows)
+    return MarketData(
+        open=np.full(n, 100.0),
+        high=np.full(n, 101.0),
+        low=np.array(lows, dtype=float),
+        close=np.full(n, 100.0),
+        volume=np.full(n, 100.0),
+        index=synthetic_bars(PRESETS["commodities"], n_bars=n).index,
+    )
+
+
+def _touched_stop_config(starting_balance: float = 10_000.0) -> PaperConfig:
+    """A ``commodities`` (gold-shaped) config with a touched 5% stop - the live path.
+
+    The leveraged sizing matches ``test_leveraged_multi_window_resume_never_doubles_first_quantity``
+    so the venue funds a held leg and its replacement on the same bar; a cash-only CFD balance
+    would run the broker dry on the cover and silently drop the flip's entry leg instead.
+    Free of the funding accrual a perp pays at a window seam, too.
+    """
+    return PaperConfig(
+        base=BacktestConfig(
+            instrument=PRESETS["commodities"].instrument,
+            risk=RiskConfig(
+                sizing=SizeModel(kind="fixed_fraction", value=0.10, leverage=100.0),
+                exit=(StopLoss(percent=0.05),),
+            ),
+            signal=SignalConfig(on_opposite_signal="reverse"),
+        ),
+        engine="backtrader",
+        starting_balance=starting_balance,
+    )
+
+
+def _run_md_windows(
+    data: MarketData,
+    signals: Signals,
+    cfg: PaperConfig,
+    bounds: list[tuple[int, int]],
+) -> BacktraderPaperState:
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        state: BacktraderPaperState | None = None
+        for a, b in bounds:
+            state, _ = run(
+                "x",
+                _slice_md(data, slice(a, b)),
+                _slice_sig(signals, slice(a, b)),
+                cfg,
+                db_path=db,
+            )
+    assert state is not None
+    return state
+
+
+def test_carried_position_ignores_stop_touched_on_its_own_entry_bar() -> None:
+    # A warm window restarts AT the carried position's fill bar (that is the resume
+    # contract), so bar 0 of the window IS the entry bar, low and all. If the carried plan is
+    # armed from bar 0 the window stops the carried long out on the very bar it was entered
+    # - a phantom exit whose events fall at or before the cursor and are dropped, so the
+    # fold keeps a long the strategy already considers flat. The next flip then opens the
+    # short WITHOUT covering it, and the realized cash drifts, so every later size diverges
+    # from a single full-window run. Bar 0's dip to 90 is below the 95 stop; bars 1+ are
+    # clear of it, so the stop must never fire at all.
+    data = _dip_on_entry_bar_md([90.0, 99.0, 99.0, 99.0])
+    signals = from_target(np.array([1, -1, -1, -1]))
+    cfg = _touched_stop_config()
+
+    full = _run_md_windows(data, signals, cfg, [(0, 4)])
+    # Window 1 fills the long at bar 0 and leaves it carried; window 2 replays from its entry
+    # bar, where bar 0's dip would otherwise stop the carried trade out.
+    got = _run_md_windows(data, signals, cfg, [(0, 1), (0, 4)])
+
+    assert _ledger_tokens(got) == _ledger_tokens(full)
+    assert got.open_position == full.open_position
+    # Sanity: no stop ever fired, the long covered into the short exactly once, and the
+    # short is what is left open.
+    assert not [t for t in got.ledger.events if t.exit_reason == "stop_loss"]
+    assert _summary(got, cfg) == _summary(full, cfg)
+    assert [t[0] for t in _summary(got, cfg)] == [1]
+    assert got.open_position is not None and got.open_position.side == -1
+
+
+def test_seam_bar_touched_exit_fills_at_the_exit_level() -> None:
+    # A touched risk exit submitted on a window's LAST bar cannot fill through backtrader's
+    # broker (market orders fill at the next bar's open), so ``stop()`` books it - and it must
+    # book it at the exit LEVEL, exactly as ``notify_order`` would have, not at that bar's
+    # close. Here the level is 95 while the bar closes at 100, so a close-fill would inflate
+    # the realized PnL and diverge from the single full-window run that books it at 95.
+    data = _dip_on_entry_bar_md([90.0, 99.0, 99.0, 94.0])
+    signals = from_target(np.ones(4, dtype=int))
+    cfg = _touched_stop_config()
+
+    full = _run_md_windows(data, signals, cfg, [(0, 4)])
+    # Window 1 stops on bar 2 with the long open; window 2 replays from the entry bar and the
+    # stop fires on its final bar (bar 3) in flight.
+    got = _run_md_windows(data, signals, cfg, [(0, 3), (0, 4)])
+
+    assert _ledger_tokens(got) == _ledger_tokens(full)
+    assert got.open_position == full.open_position
+    exits = [t for t in got.ledger.events if t.exit_reason == "stop_loss"]
+    assert exits and _r(exits[0].price) == pytest.approx(95.0)
+    assert _summary(got, cfg) == _summary(full, cfg)
+
+
+
 def test_resume_requires_entry_bar_in_window() -> None:
     # After window 1 (bars 0..9) the long signalled at bar 4 was filled at bar 5 and is
     # still open. A window that starts after bar 5 (i.e. omits the carried entry's fill
