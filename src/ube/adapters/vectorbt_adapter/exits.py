@@ -453,17 +453,21 @@ def core_stop_override(
     bars, and at different prices, for the same bars/signals/config — the live divergence
     where vectorbt stayed in a trade backtrader/nautilus had stopped on the same bar.
 
-    This scans ``entry_bar..exit_bar`` for the first bar where *any* exit fires under the
+    This scans ``entry_bar+1..exit_bar`` for the first bar where *any* exit fires under the
     core rule and returns that bar, the winning exit's fill price there (its own level for
     ``trigger="touched"``, the bar close for ``"close"``/``TimeExit`` — §9.4), and its
     reason. Bars strictly after ``exit_bar`` are ignored so a legitimate earlier
-    signal/time exit is never re-timed backwards. Returns ``None`` when no exit fires on or
-    before ``exit_bar`` — vectorbt's own bar/price stands.
+    signal/time exit is never re-timed backwards. The scan starts **after** the entry bar
+    because the reference engines book a same-bar entry at the bar close and cannot exit
+    before the next bar — re-locating a stop onto the entry bar would manufacture a
+    same-bar close+open that backtrader/nautilus never produce (and corrupt the sized
+    pass). Returns ``None`` when no exit fires on or before ``exit_bar`` — vectorbt's own
+    bar/price stands.
     """
     n = data.n_bars
     if not (0 <= entry_bar < n) or not (0 <= exit_bar < n) or entry_bar > exit_bar:
         return None
-    for bar in range(entry_bar, exit_bar + 1):
+    for bar in range(entry_bar + 1, exit_bar + 1):
         fired = _exits_fired_at(exits, data, side, entry_price, entry_bar, bar, aux_data)
         if not fired:
             continue

@@ -10,9 +10,10 @@ and the ``engine_overrides`` namespace, so every asset class (futures, commoditi
 crypto_spot, stocks, forex) is handled consistently rather than by ad-hoc field reads in the
 adapter.
 
-Commodities (spot gold/XAUUSD etc.) trade whole 1.0 lots, matching the paper reference
-ledger (whole-lot XAUUSD) — the 0-dp / 1.0 lot grid keeps the same config producing the
-same lot-quantized size as the broker. Futures/stocks remain whole-unit.
+Commodities (spot gold/XAUUSD etc.) trade fractional 0.01 lots, mirroring the nautilus/
+vectorbt reference (a Cfd in nautilus — ``size_precision=2`` / ``0.01`` lot), so the same
+config produces the same lot-quantized size on every engine. Futures/stocks remain
+whole-unit.
 
 The tables mirror Nautilus's ``instrument_map`` defaults; precision/increment fall back to
 the canonical ``tick_size`` / ``contract_multiplier`` where present (§4.5). This module never
@@ -53,7 +54,7 @@ _DEFAULT_SIZE_PRECISION: dict[str, int] = {
     "crypto_perp": 3,
     "crypto_spot": 3,
     "futures": 0,
-    "commodities": 0,
+    "commodities": 2,
     "stocks": 0,
     "forex": 5,
 }
@@ -63,7 +64,7 @@ _DEFAULT_SIZE_INCREMENT: dict[str, float] = {
     "crypto_perp": 0.001,
     "crypto_spot": 0.001,
     "futures": 1.0,
-    "commodities": 1.0,
+    "commodities": 0.01,
     "stocks": 1.0,
     "forex": 0.00001,
 }

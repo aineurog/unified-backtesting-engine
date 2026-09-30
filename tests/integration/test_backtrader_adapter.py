@@ -859,3 +859,14 @@ def test_handles_all_asset_classes_with_lot_quantization():
                     f"{key}: qty {f.quantity} not a multiple of increment {inc}"
                 )
             assert f.quantity > 0
+
+
+def test_build_instrument_commodities_defaults_to_fractional_lots():
+    # Live POC parity: the backtrader adapter must default commodities to the same
+    # fractional 0.01-lot grid as the nautilus Cfd / vectorbt reference, or the same
+    # config books whole 1.0-lot quantities (gold 23.0) where the references book 23.8.
+    from ube.adapters.backtrader_adapter.instrument_map import build_instrument
+
+    inst = build_instrument(PRESETS["commodities"].instrument)
+    assert inst.size_precision == 2
+    assert inst.size_increment == pytest.approx(0.01)

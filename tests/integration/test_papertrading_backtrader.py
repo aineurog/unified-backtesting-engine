@@ -21,7 +21,8 @@ from ube.core.data import MarketData
 from ube.core.errors import EngineError
 from ube.core.ledger import EventType, trades
 from ube.core.risk import RiskConfig
-from ube.core.risk.exits import ATRStop, TakeProfit
+from ube.core.risk.exits import ATRStop, StopLoss, TakeProfit
+from ube.core.risk.sizing import SizeModel
 from ube.core.signals import Signals, from_target
 from ube.papertrading import get_paper_engine, get_state_class, init, run
 from ube.papertrading.backtrader.backend import (
@@ -342,6 +343,73 @@ def test_carried_entry_is_not_double_booked() -> None:
     full = _run_windows([(0, 24)], target=target)
     assert got == full
     assert [t[0] for t in got[0]] == [1]  # the long closes once at bar-11; no ghost short
+
+
+@pytest.mark.parametrize("ac", ["forex", "commodities"])
+def test_leveraged_multi_window_resume_never_doubles_first_quantity(ac: str) -> None:
+    # Live POC regression: the stale build resumed an open leg over overlapping windows and
+    # re-booked the carried entry, so the first trade printed 2x (gold 46.0 vs ~23.8 units;
+    # GBPUSD 150,773.29 vs ~75,388 base). With fixed_fraction 0.10 + leverage 100, a seed
+    # window followed by overlapping resume windows must produce exactly the full-window
+    # ledger — same rows, same quantities (the carried entry is seeded, never re-executed).
+    preset = PRESETS[ac]
+    data = synthetic_bars(preset, n_bars=24)
+    target = np.zeros(24, dtype=int)
+    target[4:10] = 1
+    target[10:18] = -1
+    signals = from_target(target)
+    risk = RiskConfig(
+        sizing=SizeModel(kind="fixed_fraction", value=0.10, leverage=100.0),
+        exit=(
+            StopLoss(percent=0.02, trigger="touched"),
+            TakeProfit(percent=0.02, trigger="touched"),
+            ATRStop(atr="atr_1m", period=14, mult=1.5, trailing=False, trigger="touched"),
+        ),
+    )
+    cfg = PaperConfig(
+        base=BacktestConfig(
+            instrument=preset.instrument,
+            risk=risk,
+            signal=SignalConfig(on_opposite_signal="reverse"),
+        ),
+        engine="backtrader",
+        starting_balance=10_000.0,
+    )
+    aux = {"atr_1m": data}
+
+    def quantities(bounds: list[tuple[int, int]]) -> list[tuple[int, float]]:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            db = str(Path(td) / "s.db")
+            init(cfg, run_id="x", db_path=db)
+            state: BacktraderPaperState | None = None
+            for a, b in bounds:
+                state, _ = run(
+                    "x",
+                    _slice_md(data, slice(a, b)),
+                    _slice_sig(signals, slice(a, b)),
+                    cfg,
+                    db_path=db,
+                    aux_data=aux,
+                )
+        assert state is not None
+        instr = cfg.base.instrument
+        return [
+            (int(t.side), round(float(t.quantity), 6))
+            for t in trades(state.ledger, instruments={instr.symbol: instr})
+        ]
+
+    full = quantities([(0, 24)])
+    windows = quantities([(0, 6), (4, 18), (4, 24)])
+    assert windows == full, f"{ac}: windowed resume doubled a quantity ({windows} vs {full})"
+    assert full, f"{ac}: expected at least one booked trade"
+    first_qty = abs(full[0][1])
+    expected = 0.10 * 10_000.0 * 100.0 / float(data.close[4])
+    assert first_qty < 2.0 * expected + 1e-6, (
+        f"{ac}: first quantity {first_qty:.4f} looks doubled (expected ~{expected:.4f})"
+    )
 
 
 def test_final_bar_exit_in_flight_fills_at_the_final_close() -> None:

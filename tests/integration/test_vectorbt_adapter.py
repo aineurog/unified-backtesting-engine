@@ -728,9 +728,10 @@ def test_run_end_to_end_via_ube_run_with_vectorbt(tmp_path):
 def test_vbt_handles_all_asset_classes_with_lot_quantization():
     """The vbt adapter resolves asset-class params via build_instrument and quantizes sizes.
 
-    Stocks / futures / commodities trade whole contracts or shares; forex keeps its fine
-    precision; crypto_perp keeps fractional lots. This mirrors Nautilus' instrument_map so the
-    same config produces the same lot-quantized quantity on either engine.
+    Stocks / futures trade whole contracts or shares; commodities trade fractional 0.01
+    lots (mirroring nautilus' Cfd); forex keeps its fine precision; crypto_perp keeps
+    fractional lots. This mirrors Nautilus' instrument_map so the same config produces
+    the same lot-quantized quantity on either engine.
     """
     from ube.adapters.vectorbt_adapter.instrument_map import build_instrument
 
