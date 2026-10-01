@@ -13,6 +13,7 @@ It never touches the Nautilus adapter or its tests — every assertion here runs
 from dataclasses import replace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import ube
@@ -53,7 +54,7 @@ from ube.core.risk.exits import (
     TimeExit,
     TrailingStop,
 )
-from ube.core.signals import from_target
+from ube.core.signals import Signals, from_target
 from ube.testing.synthetic import PRESETS, synthetic_bars
 
 
@@ -757,4 +758,118 @@ def test_vbt_handles_all_asset_classes_with_lot_quantization():
                     f"{key}: qty {f.quantity} not a multiple of increment {inc}"
                 )
             assert f.quantity > 0
+
+
+# ---------------------------------------------------------------------------
+# Entry-anchored native stops vs the core per-bar ATR level (§4.7/§8).
+#
+# vectorbt's sl_stop is an entry-anchored FRACTION (mult*atr[entry_bar]/close,
+# frozen at the entry bar) while the core atr_stop_level recomputes
+# entry -/+ mult*atr[i] on every bar. When ATR widens after the entry the core
+# level moves away from entry but the frozen fraction does not, so vectorbt
+# closes the trade a bar BEFORE the core rule fires. core_stop_override only
+# scans entry_bar+1..exit_bar and cannot see the core's real trigger, so the
+# fold labelled the close "end_of_run" -- a stop reported as a run-end close,
+# which is what diverged the live paper balance from backtrader/nautilus.
+# ---------------------------------------------------------------------------
+
+
+def _widening_atr_bars(atr: np.ndarray, low: np.ndarray):
+    """Bars where a long entered at 100 has a frozen vbt stop and a moving core level.
+
+    Entry is bar 0 at close 100; later bars close at 110 so the frozen fraction
+    ``100 * (1 - 2*atr[0]/100)`` sits *above* the per-bar core level
+    ``100 - 2*atr[i]`` whenever ATR widens. ``low`` then selects which side of
+    each level the bar actually reached.
+    """
+    n = atr.shape[0]
+    close = np.array([100.0] + [110.0] * (n - 1))
+    open_ = close.copy()
+    high = np.maximum(open_, close) + 0.5
+    volume = np.full(n, 1000.0)
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC").as_unit("ns")
+    return (
+        MarketData(open=open_, high=high, low=low, close=close, volume=volume, index=index),
+        {"atr_1h": atr},
+    )
+
+
+def test_vectorbt_early_atr_stop_is_retimed_to_the_core_trigger_bar():
+    """vbt's frozen stop closes at bar 1; the core rule fires at bar 2 (98.0).
+
+    ATR widens at bar 1 so the core level drops to 96.0 and ``low[1]=97.0`` never
+    reaches it; ATR returns at bar 2 so the core level is back to 98.0 and
+    ``low[2]=97.5`` triggers it. backtrader/nautilus hold through bar 1 and exit
+    at the core level on bar 2 -- the fold must re-time vectorbt's early close
+    there instead of stamping a phantom ``end_of_run``.
+    """
+    atr = np.array([1.0, 2.0, 1.0, 1.0, 1.0, 1.0])
+    low = np.array([99.0, 97.0, 97.5, 103.0, 103.0, 103.0])
+    md, aux = _widening_atr_bars(atr, low)
+    n = md.n_bars
+    signals = Signals(
+        long_entry=np.array([True] + [False] * (n - 1)),
+        long_exit=np.zeros(n, dtype=bool),
+        short_entry=np.zeros(n, dtype=bool),
+        short_exit=np.zeros(n, dtype=bool),
+    )
+    result = VectorbtAdapter().run(
+        md,
+        signals,
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(ATRStop(atr="atr_1h", mult=2.0),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+        aux_data=aux,
+    )
+    fills = _fills(result)
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "atr_stop")]
+    entry_ts, exit_ts = int(fills[0].timestamp), int(fills[1].timestamp)
+    stamps = md.timestamps.as_unit("ns").asi8
+    assert entry_ts == int(stamps[0])
+    # Bar 2 (the core trigger), NOT bar 1 (vectorbt's frozen fraction).
+    assert exit_ts == int(stamps[2])
+    # Filled at the core level 100 - 2*1.0, not vectorbt's frozen 98.0-from-bar-1.
+    assert fills[1].price == pytest.approx(98.0)
+
+
+def test_vectorbt_early_atr_stop_keeps_the_trade_open_when_the_core_never_fires():
+    """When no core exit exists in the window the trade must stay held, not be closed.
+
+    ``core_stop_exit_window`` returns ``None`` here (the core level sits at 96.0
+    for every bar after the entry and the lows never reach it), so the early
+    vectorbt close cannot be re-timed anywhere. Bookkeeping that phantom
+    ``end_of_run`` fill would flatten a position backtrader/nautilus still hold,
+    corrupting the carried-entry book and the run balance -- the fold must
+    restore the held state and emit the entry leg only.
+    """
+    atr = np.array([1.0, 2.0, 2.0, 2.0, 2.0, 2.0])
+    low = np.array([99.0, 97.0, 103.0, 103.0, 103.0, 103.0])
+    md, aux = _widening_atr_bars(atr, low)
+    n = md.n_bars
+    signals = Signals(
+        long_entry=np.array([True] + [False] * (n - 1)),
+        long_exit=np.zeros(n, dtype=bool),
+        short_entry=np.zeros(n, dtype=bool),
+        short_exit=np.zeros(n, dtype=bool),
+    )
+    result = VectorbtAdapter().run(
+        md,
+        signals,
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(ATRStop(atr="atr_1h", mult=2.0),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+        aux_data=aux,
+    )
+    fills = _fills(result)
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None)]
+    # Still held at the end of the window: no exit cash leg, no exit position_change.
+    assert not [
+        e
+        for e in result.ledger
+        if e.event_type is EventType.POSITION_CHANGE and float(e.position_after) == 0.0
+    ]
 

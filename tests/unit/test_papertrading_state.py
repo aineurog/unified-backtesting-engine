@@ -10,6 +10,9 @@ from ube.papertrading.state import OpenPosition, PaperState
 
 
 def _sample_state() -> PaperState:
+    # The ledger must be consistent with open_position: load re-derives the position from
+    # the fill stream (the ledger is the single source of truth, never the persisted blob),
+    # so a fixture whose fills net flat cannot declare an open trade.
     ledger = EventLedger(
         [
             LedgerEvent(EventType.FILL, 1_000, "BTC-USDT", side=1, quantity=1.0, price=100.0),
@@ -23,6 +26,15 @@ def _sample_state() -> PaperState:
                 exit_reason="signal",
             ),
             LedgerEvent(EventType.COMMISSION, 1_000, "BTC-USDT", amount=0.05, currency="USDT"),
+            LedgerEvent(
+                EventType.FILL,
+                3_000,
+                "BTC-USDT",
+                side=1,
+                quantity=2.0,
+                price=120.0,
+                order_id="t1",
+            ),
         ]
     )
     return PaperState(
@@ -30,7 +42,7 @@ def _sample_state() -> PaperState:
         ledger=ledger,
         last_processed_ns=2_000,
         open_position=OpenPosition(
-            side=1, quantity=1.0, entry_price=100.0, entry_ns=1_000, trade_id="t1"
+            side=1, quantity=2.0, entry_price=120.0, entry_ns=3_000, trade_id="t1"
         ),
         pending_levels={"t1": {"tp": 120.0}},
         signal_fn_state={"targets": [1, 1, 0]},
@@ -51,11 +63,11 @@ def test_save_load_round_trip(tmp_path) -> None:
     assert loaded.signal_fn_state == {"targets": [1, 1, 0]}
     assert loaded.open_position == state.open_position
     events = loaded.ledger.events
-    assert len(events) == 3
+    assert len(events) == 4
     # The persisted ledger recorded the commission out of order (ts 1000 after the
     # ts 2000 close); the load path reorders entries chronologically, so append
     # order equals timestamp order after a round trip.
-    assert [e.timestamp for e in events] == [1_000, 1_000, 2_000]
+    assert [e.timestamp for e in events] == [1_000, 1_000, 2_000, 3_000]
     assert events[0].event_type is EventType.FILL
     assert events[0].price == 100.0
     assert events[1].amount == 0.05

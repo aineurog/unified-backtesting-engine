@@ -43,6 +43,7 @@ __all__ = [
     "exit_stop_params",
     "classify_exit_reason",
     "core_stop_override",
+    "core_stop_exit_window",
 ]
 
 
@@ -473,6 +474,50 @@ def core_stop_override(
             continue
         # §4.7: a bar that sweeps several levels is ambiguous; the one nearest the open was
         # reached first (same rule as the nautilus actor and classify_exit_reason).
+        pick = first_reached_exit([lvl for _, lvl in fired], open_price=float(data.open[bar]))
+        reason, level = fired[0 if pick is None else pick]
+        return bar, float(level), reason
+    return None
+
+
+def core_stop_exit_window(
+    exits: tuple[Any, ...],
+    data: MarketData,
+    *,
+    side: int,
+    entry_price: float,
+    entry_bar: int,
+    exit_bar: int,
+    aux_data: Mapping[str, Any] | None,
+) -> tuple[int, float, str] | None:
+    """Re-time a vectorbt native-stop close that fired **before** the core rule would.
+
+    The mirror image of :func:`core_stop_override`. vectorbt's ``sl_stop``/``tp_stop`` are
+    **entry-anchored fractions** — ``mult * atr[entry_bar] / close[entry_bar]`` applied to
+    the entry price — so the level is frozen at the entry bar, whereas the core
+    :func:`~ube.core.risk.exits.atr_stop_level` recomputes ``entry -/+ mult * atr[i]`` on
+    every bar. When ATR *widens* after the entry, the core level moves away from entry while
+    the frozen fraction does not, so vectorbt closes the trade on a bar where the core rule
+    has not fired yet. :func:`core_stop_override` cannot repair that by construction: it only
+    scans ``entry_bar+1..exit_bar`` and the core's real trigger lies one or more bars later,
+    past the bound. The fold then labelled the close with the ``end_of_run`` fallback from
+    :func:`classify_exit_reason` — a stop exit reported as a run-end close, which corrupted
+    the ledger reason and left the run's balance diverging from backtrader/nautilus (which
+    held the position and took it out at the core stop one bar later).
+
+    This scans ``exit_bar+1..n-1`` for the first bar the core rule fires and returns that
+    ``(bar, level, reason)``, so the fold can book the fill backtrader/nautilus book. Returns
+    ``None`` when the core rule does not fire later in the window either — the caller keeps
+    vectorbt's own close (the legitimate early-exit case), which is only correct when
+    something else really did close the trade.
+    """
+    n = data.n_bars
+    if not (0 <= entry_bar < n) or not (0 <= exit_bar < n) or entry_bar > exit_bar:
+        return None
+    for bar in range(exit_bar + 1, n):
+        fired = _exits_fired_at(exits, data, side, entry_price, entry_bar, bar, aux_data)
+        if not fired:
+            continue
         pick = first_reached_exit([lvl for _, lvl in fired], open_price=float(data.open[bar]))
         reason, level = fired[0 if pick is None else pick]
         return bar, float(level), reason

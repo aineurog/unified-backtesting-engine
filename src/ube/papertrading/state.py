@@ -606,6 +606,19 @@ class PaperState:
             run_id=run_id,
             db_path=path,
         )
+        # The ledger -- not the persisted blob -- is the source of truth for the open
+        # position. Re-derive it so a blob written before a float-residue fix cannot pin a
+        # carried entry to a bar the ledger never booked (the vbt checkpoint_balance fold
+        # bound depends on entry_ns and would double-subtract the entry notional).
+        # Only when the ledger actually holds fills for this instrument, so a state that
+        # legitimately carries a position with no fills yet keeps its blob.
+        if any(
+            e.event_type is EventType.FILL and e.instrument_id == instrument_id
+            for e in ledger.events
+        ):
+            from ube.papertrading.core import _open_position_from_ledger
+
+            obj.open_position = _open_position_from_ledger(ledger, instrument_id)
         return obj
 
     def trade_table(self, db_path: str) -> Any:

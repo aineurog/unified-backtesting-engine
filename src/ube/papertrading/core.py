@@ -351,7 +351,13 @@ def _open_position_from_ledger(
         oid = e.order_id or ""
         # Same-bar reversals and near-exact covers settle to within float noise; the
         # tolerance is relative to the quantities in play, never the absolute _EPS.
-        tol = 1e-12
+        # An absolute floor here leaves a ~1e-8 residue on a same-bar cover of a ~1e5
+        # quantity (FX units), so the position never reads flat: the *next* entry is
+        # folded into that phantom residue instead of opening fresh, inheriting the
+        # stop bar's entry_ns/entry_px. That stale entry_ns makes the vectorbt
+        # checkpoint_balance fold bound include a carry it has not booked yet,
+        # double-subtracting the entry notional and aborting the worker.
+        tol = _flat_tol(q, position)
         if abs(position) <= tol:
             entry_px, entry_ns, trade_id = px, int(e.timestamp), oid
             position = q

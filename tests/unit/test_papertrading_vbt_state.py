@@ -14,7 +14,7 @@ import pytest
 from ube.core.cost import CostModel, fill_cost
 from ube.core.errors import StateCorruptionError
 from ube.core.ledger import EventLedger, EventType, LedgerEvent
-from ube.papertrading.core import get_state_class
+from ube.papertrading.core import _open_position_from_ledger, get_state_class
 from ube.papertrading.state import OpenPosition, PaperState
 from ube.papertrading.vbt.state import (
     VbtPaperState,
@@ -93,6 +93,59 @@ def test_last_close_ignores_a_ulp_residue_on_the_close_bar() -> None:
         ]
     )
     assert last_close_ns(ledger, IID) == 20
+
+
+def test_open_position_entry_ns_is_not_inherited_from_a_residue_cover() -> None:
+    # Same residue, but the *open position* derivation must agree with last_close_ns.
+    # It judged flatness with a hardcoded absolute 1e-12, so a 1-ulp over-cover left a
+    # phantom position and the next entry was folded into it, inheriting the stop bar's
+    # entry_ns/entry_price. A carried vbt short therefore reported its entry bar as the
+    # 08:03 stop instead of the real 08:05 entry.
+    long_qty = 75_924.78287
+    stop = nextafter(long_qty, inf)
+    assert stop - long_qty > 1e-12  # guard: the fixture must leave an above-floor residue
+    ledger = EventLedger(
+        [
+            _fill(1780841600, 1, long_qty, 1.32354),          # long entry 08:00
+            _fill(1780841780, -1, stop, 1.323033878384278),   # ATR stop cover 08:03
+            _fill(1780841900, -1, 75_643.59094, 1.32338),     # short entry 08:05
+        ]
+    )
+    pos = _open_position_from_ledger(ledger, IID)
+    assert pos is not None
+    assert pos.side == -1
+    assert pos.entry_ns == 1780841900  # the 08:05 entry, not the 08:03 stop bar
+    assert pos.entry_price == pytest.approx(1.32338)
+
+
+def test_checkpoint_survives_a_carried_short_after_a_residue_close() -> None:
+    # The live GBPUSD stall: the phantom carry made entry_ns (08:03) <= the checkpoint
+    # fold bound (08:03), so checkpoint_balance added _entry_legs for an entry the fold
+    # had not booked yet and aborted the worker with "balance must be > 0 ... got
+    # -90094.69". The realized balance (10010.52) must survive as the seed instead.
+    long_qty = 75_924.78287
+    stop = nextafter(long_qty, inf)
+    ledger = EventLedger(
+        [
+            _cash(0, START),
+            _cash(1780841600, -long_qty * 1.32354),  # long entry debit
+            _cash(1780841780, +long_qty * 1.323033878384278),  # stop credit
+            _cash(1780841900, +75_643.59094 * 1.32338),  # short entry credit
+            _fill(1780841600, 1, long_qty, 1.32354),
+            _fill(1780841780, -1, stop, 1.323033878384278),
+            _fill(1780841900, -1, 75_643.59094, 1.32338),
+        ]
+    )
+    pos = _open_position_from_ledger(ledger, IID)
+    assert pos is not None
+    bound = last_close_ns(ledger, IID)
+    assert bound == 1780841780
+    assert bound < pos.entry_ns  # the carry is *after* the bound
+    # realized = everything folded through the close; the 08:05 entry leg is not in it
+    realized = START - long_qty * 1.32354 + long_qty * 1.323033878384278
+    seed = checkpoint_balance(ledger, IID, pos, START, multiplier=MULT, cost_model=None)
+    assert seed == pytest.approx(realized, abs=1e-6)
+    assert seed > 0.0  # the guard the vbt backend asserts on
 
 
 def test_last_close_only_when_position_is_flattened() -> None:

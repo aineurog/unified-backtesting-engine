@@ -40,6 +40,7 @@ from ube.adapters.vectorbt_adapter.engine import build_portfolio, vbt
 from ube.adapters.vectorbt_adapter.exits import (
     apply_time_exits,
     classify_exit_reason,
+    core_stop_exit_window,
     core_stop_override,
     exit_stop_params,
     resolve_vol_for_sizing,
@@ -290,6 +291,11 @@ def _neutralize_shorts(signals: Signals) -> Signals:
     ``long_exit``) is preserved so an open long still closes when its exit bar comes.
     """
     return neutralize_shorts(signals)
+
+
+def _exit_is_run_end_window(data: MarketData, exit_bar: int) -> bool:
+    """Whether ``exit_bar`` is the final bar of the window (a genuine run-end mark)."""
+    return exit_bar == data.n_bars - 1
 
 
 class VectorbtAdapter(EngineAdapter):
@@ -566,6 +572,31 @@ class VectorbtAdapter(EngineAdapter):
                 exit_reason = classify_exit_reason(
                     exits, data, side, entry_price, entry_bar, exit_bar, aux_data, signals
                 )
+                # An ``end_of_run`` label on a closed record means no core exit and no signal
+                # fired on vectorbt's own exit bar: its frozen entry-anchored fraction stop
+                # closed early, while backtrader/nautilus were still holding. Re-time the
+                # fill to the core rule's real trigger bar further in the window.
+                if not is_open and exit_reason == "end_of_run":
+                    late_exit = core_stop_exit_window(
+                        exits,
+                        data,
+                        side=side,
+                        entry_price=entry_price,
+                        entry_bar=entry_bar,
+                        exit_bar=exit_bar,
+                        aux_data=aux_data,
+                    )
+                    if late_exit is not None:
+                        exit_bar, raw_exit, exit_reason = late_exit
+                        exit_price = float(slipped_price(raw_exit, -side, slip))
+                    elif not _exit_is_run_end_window(data, exit_bar):
+                        # The core rule does not fire anywhere in this window, so
+                        # backtrader/nautilus still hold the position here: vectorbt's frozen
+                        # entry-anchored fraction stop closed a trade the reference engines
+                        # never exited. Restore the held state rather than booking a phantom
+                        # close — an ``end_of_run`` fill mid-run would flatten the position,
+                        # corrupt the carried-entry book and diverge the balance.
+                        is_open = True
 
             # Signal evaluation recorded at the entry bar (§6.1): holds are never
             # emitted, and only real entries reach the ledger — matching the Nautilus fold.
