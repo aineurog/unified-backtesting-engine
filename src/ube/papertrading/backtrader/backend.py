@@ -110,6 +110,31 @@ def _zero_at_or_before(signals: Signals, ts: np.ndarray, bound_ns: int) -> Signa
     )
 
 
+def _zero_entries_at_or_before(
+    signals: Signals, ts: np.ndarray, bound_ns: int
+) -> Signals:
+    """Drop every *entry* signal at a bar ``ts <= bound_ns`` while the ledger is flat.
+
+    The window replay re-executes bars the persisted ledger has already folded, to warm up
+    the indicators. When the ledger is flat at the cursor it holds no position for those
+    bars, so an entry there opens a leg the ledger never booked; the strategy later closes
+    (or flips) that phantom leg on a bar strictly after the cursor, where the close survives
+    the ``> cursor`` event filter and is folded as a *second* entry — silently doubling the
+    fill and every quantity/balance derived from it.
+
+    Only valid while flat: a resumed window must re-create its committed history from the
+    carried entry so the replay matches the single full-window run. Exits are left untouched
+    either way, so a carried position's level/ATR exits still fire inside the window.
+    """
+    keep = ts > int(bound_ns)
+    return Signals(
+        long_entry=signals.long_entry & keep,
+        long_exit=signals.long_exit,
+        short_entry=signals.short_entry & keep,
+        short_exit=signals.short_exit,
+    )
+
+
 def _apply_policy(
     signals: Signals, *, allow_short: bool, policy: str, initial_side: int = 0
 ) -> Signals:
@@ -249,6 +274,12 @@ class BacktraderPaperEngine(PaperEngine):
         )
         if open_pos is None and last_close is not None:
             win_sig = _zero_at_or_before(win_sig, win_ts, last_close)
+        if open_pos is None and cursor is not None:
+            # Flat at the cursor: the committed region holds no position, so the replay
+            # must not open one there (see _zero_entries_at_or_before). A resumed window
+            # re-creates its history from the carried entry instead, so this only guards
+            # the flat case.
+            win_sig = _zero_entries_at_or_before(win_sig, win_ts, cursor)
 
         policy = config.base.signal.on_opposite_signal
         if policy is None:

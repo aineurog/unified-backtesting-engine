@@ -28,8 +28,8 @@ from ube.papertrading import get_paper_engine, get_state_class, init, run
 from ube.papertrading.backtrader.backend import (
     BacktraderPaperEngine,
     _apply_policy,
-    _max_atr_period,
     _zero_at_or_before,
+    _zero_entries_at_or_before,
 )
 from ube.papertrading.backtrader.state import BacktraderPaperState
 from ube.papertrading.config import PaperConfig
@@ -269,12 +269,115 @@ def test_zero_at_or_before_drops_bound_bar() -> None:
     assert list(out.long_entry) == [False, False, True]
 
 
-def test_max_atr_period() -> None:
-    class Risk:
-        exit = (ATRStop(14, period=14), TakeProfit(percent=0.05))
+def test_zero_entries_at_or_before_keeps_exits() -> None:
+    ts = np.array([10, 20, 30])
+    ones = np.ones(3, dtype=bool)
+    # long side: an entry and an exit column, checked independently (Signals rejects the
+    # contradictory pairings, so each side is exercised in its own Signals object).
+    long_sig = Signals(
+        long_entry=np.array([True, True, True]),
+        long_exit=ones,
+        short_entry=np.zeros(3, dtype=bool),
+        short_exit=np.zeros(3, dtype=bool),
+    )
+    long_out = _zero_entries_at_or_before(long_sig, ts, 20)
+    assert list(long_out.long_entry) == [False, False, True]
+    assert list(long_out.long_exit) == [True, True, True]
 
-    assert _max_atr_period(Risk()) == 14
-    assert _max_atr_period(None) == 0
+    short_sig = Signals(
+        long_entry=np.zeros(3, dtype=bool),
+        long_exit=np.zeros(3, dtype=bool),
+        short_entry=np.array([True, True, True]),
+        short_exit=ones,
+    )
+    short_out = _zero_entries_at_or_before(short_sig, ts, 20)
+    assert list(short_out.short_entry) == [False, False, True]
+    assert list(short_out.short_exit) == [True, True, True]
+
+
+def test_flat_window_replay_does_not_double_the_first_entry() -> None:
+    # Live GBPUSD regression: the worker resumed a *flat* ledger over a window that started
+    # before the cursor, so the replay opened an entry the persisted ledger never booked.
+    # The strategy then flipped that phantom leg on the next committed bar, where its close
+    # survived the `> cursor` event filter and was folded as a second entry — the first trade
+    # printed ~2x (151,908.92 vs 75,673.30 units) and every later quantity/balance drifted
+    # with it. A flat ledger must replay flat through the committed region.
+    preset = PRESETS[AC]
+    n = 48
+    data = synthetic_bars(preset, n_bars=n)
+    # The ATR stop supplies the pre-cursor warmup the replay reaches back through (period 3);
+    # its stop distance is made unreachable so the phantom leg survives to the flip bar.
+    cfg = PaperConfig(
+        base=BacktestConfig(
+            instrument=preset.instrument,
+            signal=SignalConfig(on_opposite_signal="reverse"),
+            risk=RiskConfig(exit=(ATRStop(mult=1e9, period=3, atr="atr_1m"),)),
+        ),
+        engine="backtrader",
+        starting_balance=10_000.0,
+    )
+    aux = {"atr_1m": data}
+    cursor_bar = 24
+
+    import tempfile
+    from pathlib import Path
+
+    # The live worker recomputes the signal frame from a growing fetch window every poll, so
+    # a stateful (ATR/wall-clock driven) signal function legitimately returns *different*
+    # values for bars it has already passed — that is what let the replay open a leg the
+    # ledger never booked. Model it directly: window 1 sees a flat frame, window 2's frame
+    # carries a phantom entry at bar 10 (pre-cursor) and a real flip at bar 30.
+    window1 = np.zeros(n, dtype=int)
+    phantom = np.zeros(n, dtype=int)
+    phantom[10 : cursor_bar + 1] = -1  # phantom short, wholly inside the committed region
+    phantom[cursor_bar + 1 :] = 1  # long after the cursor: reverses the phantom short
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        # Window 1 is flat, so the ledger holds no position at the bar-24 cursor.
+        state, _ = run(
+            "x",
+            _slice_md(data, slice(0, cursor_bar + 1)),
+            _slice_sig(from_target(window1), slice(0, cursor_bar + 1)),
+            cfg,
+            db_path=db,
+            aux_data=aux,
+        )
+        assert state.open_position is None
+        # Window 2 replays from bar 0 (the ATR warmup reaches back past the phantom at bar 10).
+        state, _ = run(
+            "x",
+            _slice_md(data, slice(0, n)),
+            _slice_sig(from_target(phantom), slice(0, n)),
+            cfg,
+            db_path=db,
+            aux_data=aux,
+        )
+
+    assert state is not None
+    all_ts = [int(t) for t in np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)]
+    flip_bar = cursor_bar + 1
+    # Exactly one long entry on the flip bar. Without the guard the replay also opens the
+    # phantom short inside the committed region, so the strategy's *close* of it lands on the
+    # flip bar too — where the `> cursor` filter keeps it — and the fold books a second buy
+    # (the GBPUSD 151,908.92-unit first trade).
+    long_entries = [
+        e
+        for e in state.ledger.events
+        if e.event_type is EventType.FILL
+        and int(e.side) == 1
+        and int(e.timestamp) == all_ts[flip_bar]
+    ]
+    assert len(long_entries) == 1, (
+        f"expected one long entry at bar {flip_bar}, got {len(long_entries)} "
+        "(the phantom close was folded as a second entry)"
+    )
+    expected = 0.10 * 10_000.0 * 100.0 / float(data.close[flip_bar])
+    booked_qty = abs(float(long_entries[0].quantity))
+    assert booked_qty < 1.5 * expected, (
+        f"long quantity {booked_qty:.4f} is doubled (expected ~{expected:.4f})"
+    )
 
 
 # ---------------------------------------------------------------------------
