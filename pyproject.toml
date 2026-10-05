@@ -35,6 +35,7 @@ vectorbt = ["vectorbt"]
 backtrader = ["backtrader"]
 nautilus = ["nautilus-trader"]
 all = ["vectorbt", "backtrader", "nautilus-trader"]
+docs = ["mkdocs"]
 dev = [
     "pytest",
     "pytest-cov",

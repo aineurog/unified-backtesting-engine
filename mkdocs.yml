@@ -5,3 +5,20 @@ theme:
   name: readthedocs
 nav:
   - Home: index.md
+  - Getting started: getting-started.md
+  - Concepts: core-concepts.md
+  - Data and signals: data-and-signals.md
+  - Configuration: configuration.md
+  - Risk and costs: risk-and-costs.md
+  - Engines:
+      - Overview: engines/overview.md
+      - VectorBT: engines/vectorbt.md
+      - Backtrader: engines/backtrader.md
+      - NautilusTrader: engines/nautilus.md
+  - Paper trading: paper-trading.md
+  - Results and ledger: results-ledger.md
+  - Troubleshooting: troubleshooting.md
+  - API reference: api-reference.md
+  - Tutorials: tutorials.md
+  - Testing: testing.md
+  - Contributing: contributing.md
