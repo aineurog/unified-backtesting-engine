@@ -293,11 +293,6 @@ def _neutralize_shorts(signals: Signals) -> Signals:
     return neutralize_shorts(signals)
 
 
-def _exit_is_run_end_window(data: MarketData, exit_bar: int) -> bool:
-    """Whether ``exit_bar`` is the final bar of the window (a genuine run-end mark)."""
-    return exit_bar == data.n_bars - 1
-
-
 class VectorbtAdapter(EngineAdapter):
     """Adapter for the vectorbt backtesting engine (§4.1, §4.2)."""
 
@@ -589,13 +584,16 @@ class VectorbtAdapter(EngineAdapter):
                     if late_exit is not None:
                         exit_bar, raw_exit, exit_reason = late_exit
                         exit_price = float(slipped_price(raw_exit, -side, slip))
-                    elif not _exit_is_run_end_window(data, exit_bar):
+                    else:
                         # The core rule does not fire anywhere in this window, so
                         # backtrader/nautilus still hold the position here: vectorbt's frozen
                         # entry-anchored fraction stop closed a trade the reference engines
                         # never exited. Restore the held state rather than booking a phantom
-                        # close — an ``end_of_run`` fill mid-run would flatten the position,
-                        # corrupt the carried-entry book and diverge the balance.
+                        # close — an ``end_of_run`` fill would flatten the position, corrupt
+                        # the carried-entry book and diverge the balance. This holds at the
+                        # window's final bar too: the worker polls a growing window, so the
+                        # close belongs to the *next* run's data, not to this one. Leaving the
+                        # leg open lets that run resume the trade instead of re-opening it.
                         is_open = True
 
             # Signal evaluation recorded at the entry bar (§6.1): holds are never

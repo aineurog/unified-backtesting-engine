@@ -873,3 +873,52 @@ def test_vectorbt_early_atr_stop_keeps_the_trade_open_when_the_core_never_fires(
         if e.event_type is EventType.POSITION_CHANGE and float(e.position_after) == 0.0
     ]
 
+
+def test_vectorbt_stop_on_the_final_bar_keeps_the_position_open() -> None:
+    """A stop that only reaches on the window's last bar must not close the trade.
+
+    Live XAUUSD regression: the worker polls a growing window, and on the poll whose final
+    bar the frozen entry-anchored stop first touched, the fold booked an ``end_of_run``
+    close. The next poll then re-opened the same leg one bar later, so the ledger showed a
+    spurious round-trip (15:55 short -> 15:57 ``end_of_run`` -> 16:00 re-open) instead of
+    one continuous trade. The core rule never fires in the window, so backtrader/nautilus
+    still hold the position: the close belongs to the *next* run's data. The leg must stay
+    open so that run resumes it.
+    """
+    n = 6
+    close = np.full(n, 100.0)
+    open_ = close.copy()
+    high = close + 0.5
+    # The frozen entry-anchored stop (98.0) is only touched on the final bar.
+    low = np.array([99.0, 99.0, 99.0, 99.0, 99.0, 97.0])
+    volume = np.full(n, 1000.0)
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC").as_unit("ns")
+    md = MarketData(open=open_, high=high, low=low, close=close, volume=volume, index=index)
+    # ATR widens on the final bar: the core level drops to 96.0 there, so ``low=97.0``
+    # reaches vectorbt's frozen 98.0 stop but never the core rule.
+    aux = {"atr_1h": np.array([1.0, 1.0, 1.0, 1.0, 1.0, 2.0])}
+    signals = Signals(
+        long_entry=np.array([True] + [False] * (n - 1)),
+        long_exit=np.zeros(n, dtype=bool),
+        short_entry=np.zeros(n, dtype=bool),
+        short_exit=np.zeros(n, dtype=bool),
+    )
+    result = VectorbtAdapter().run(
+        md,
+        signals,
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(ATRStop(atr="atr_1h", mult=2.0),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+        aux_data=aux,
+    )
+    fills = _fills(result)
+    # Entry only: the position is still held at the end of the window.
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None)]
+    assert not [
+        e
+        for e in result.ledger
+        if e.event_type is EventType.POSITION_CHANGE and float(e.position_after) == 0.0
+    ]
+
