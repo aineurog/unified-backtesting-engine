@@ -154,7 +154,19 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._funding_rate = float(getattr(config, "funding_rate", 0.0) or 0.0)
         self._borrow_rate = float(getattr(config, "borrow_rate", 0.0) or 0.0)
         self._funding_interval_ns = int(getattr(config, "funding_interval_ns", 0) or 0)
-        self._pending_credit: float = 0.0
+        # In-flight close cash legs (§4.6). A close order submitted against bar *N*
+        # fills on bar *N+1* (one-bar sandbox fill lag), so between submission and fill
+        # the journal still carries the closed position's ENTRY cash leg (e.g.
+        # ``+notional`` for an opened short). Sizing an opposite entry in that window
+        # against ``_current_balance`` would double-count the notional — the observed
+        # ~11x-sized positions on a risk-exit flip (and the "capital must be
+        # non-negative" crash for a long->short flip). The anticipated close cash leg is
+        # reserved here (keyed by order id) so ``_current_balance`` reflects post-close
+        # equity, and released the moment the close fill books the real leg in
+        # ``on_order_filled``. Covers same-bar signal reversals *and* cross-bar flips
+        # following a risk exit (a unified replacement for the old same-bar-only
+        # ``_pending_credit``).
+        self._inflight_close_legs: dict[Any, float] = {}
         # A risk exit that triggered before its entry fill landed (the sandbox delivers
         # the open fill one bar after submission). Stashed as
         # ``(exit_reason, fraction, level_price)`` and applied the moment that fill
@@ -212,7 +224,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 and e.amount is not None
             ):
                 balance -= float(e.amount)
-        return balance + self._pending_credit
+        return balance + sum(self._inflight_close_legs.values())
 
     def _max_atr_period(self) -> int:
         """Largest ``period`` among configured ATR-style exits; 0 if none."""
@@ -629,18 +641,12 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # next bar. The fill handler only uses the order-id sets to tag open vs close
         # fills (and to set ``_sim_qty`` to the *actual* filled quantity).
 
-        # Optimistic close-credit for same-bar reverse sizing.
-        _close_credit = 0.0
-        if close_first and self._sim_qty > 0:
-            _close_ref = self._slipped(self._last_close or 0.0, -self._sim_side)
-            _close_notional = self._sim_qty * _close_ref * self._multiplier
-            _close_comm = (
-                float(fill_cost(self.config.cost_model, notional=_close_notional))
-                if self.config.cost_model
-                else 0.0
-            )
-            _close_credit = float(self._sim_side) * _close_notional - _close_comm
-            self._pending_credit = _close_credit
+        # Optimistic close-credit for same-bar reverse sizing. The close order is
+        # submitted below (``_submit_close``) and its anticipated cash leg is reserved in
+        # ``_inflight_close_legs`` until the fill lands, so ``_current_balance`` at the
+        # ``_submit_open`` sizing point already reflects post-close equity. This is the
+        # same anticipation regardless of whether the close was a same-bar signal
+        # reversal or a risk exit from the previous bar.
 
         if close_first:
             if self._sim_qty > 0:
@@ -668,10 +674,6 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self._entry_price = self._slipped(self._last_close, desired)
             # Funding: reset last funding timestamp on new entry.
             self._last_funding_ns = self._hist_ts
-
-        # Clear optimistic credit after sizing decision
-        if self._pending_credit != 0.0:
-            self._pending_credit = 0.0
 
     # -- fills ------------------------------------------------------------- #
     def on_order_filled(self, event: Any) -> None:
@@ -751,9 +753,10 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                     self._sim_qty -= partial
         elif is_close:
             exit_reason = close_reason or "signal"
-            # Clear pending credit if this close fill matches the pending credit
-            if self._pending_credit != 0.0:
-                self._pending_credit = 0.0
+            # Release the in-flight close-leg reserve: the fill below books the real
+            # cash leg and commission, so the anticipatory amount must drop exactly then
+            # (never double-counting the same close's notional in the journal).
+            self._inflight_close_legs.pop(coid, None)
 
             # For a reverse, the opening order is already in flight; let its fill set the
             # new side/qty, and only flatten here when the close is a true exit.
@@ -962,12 +965,15 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             return instr.make_qty(0.0) if instr is not None else None
         # Mirror backtest's account.balance_total() * leverage. ``_current_balance``
         # tracks the *cash book* only — each fill books a ±notional cash leg (§4.6).
-        # Sizing from cash equals sizing from equity because ``_submit_open`` only
-        # runs from flat: a reversal zeroes _sim_side/_sim_qty and applies the
-        # optimistic close-credit first, so at this exact point cash ≈ post-close
-        # equity. Seeding the open-position mark into the balance (or adding it here)
-        # would double-count the notional on a resumed same-bar reversal (~-90k on a
-        # 10k account, "capital must be non-negative" live crash).
+        # Sizing from cash equals sizing from equity only while truly flat: an exit
+        # submitted on this or the previous bar has its fill still in flight, so
+        # ``_submit_close`` reserves the anticipated close cash leg in
+        # ``_inflight_close_legs`` (added back into ``_current_balance``) and releases it
+        # when the fill lands. That keeps the sizing capital equal to post-close equity on
+        # a same-bar reversal *and* on a next-bar flip after a risk exit — the two live
+        # defects being, respectively, a ~-90k "capital must be non-negative" crash and
+        # ~11x oversized flips. Seeding the open-position mark into the balance (or adding
+        # it here) would double-count the notional on a resumed same-bar reversal.
         capital = self._current_balance * self._leverage
         raw = size_position(
             self.config.sizing,
@@ -1045,6 +1051,18 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             if not hasattr(self, "_close_prices"):
                 self._close_prices: dict[Any, float] = {}
             self._close_prices[order.client_order_id] = float(price)
+        # Reserve the anticipated close cash leg (§4.6). This close fills on the *next*
+        # bar's synthetic ticks; until then the journal still holds the position's entry
+        # cash leg, so a same- or next-bar opposite entry would otherwise be sized against
+        # a double-counted notional (the ~11x risk-exit flip bug). Mirrors the exact
+        # ``-close_side * notional`` leg ``on_order_filled`` books at the same fill price:
+        # touched exits use the stashed level, bar-close exits the current close (the fill
+        # bar's close differs by <0.1% and is corrected when the real leg books).
+        close_side = -self._sim_side
+        _fill_base = price if price is not None else (self._last_close or 0.0)
+        _slipped_px = self._slipped(_fill_base, close_side)
+        _close_notional = float(qty.as_double()) * _slipped_px * self._multiplier
+        self._inflight_close_legs[order.client_order_id] = -close_side * _close_notional
         self._close_order_ids.add(order.client_order_id)
         self._events.append(
             LedgerEvent(

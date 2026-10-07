@@ -48,6 +48,12 @@ def _funding(ts: int, amount: float) -> LedgerEvent:
     return LedgerEvent(EventType.FUNDING_PAYMENT, ts, IID, amount=amount, currency="USDT")
 
 
+def _close(ts: int, side: int, qty: float, price: float, reason: str = "atr_stop") -> LedgerEvent:
+    return LedgerEvent(
+        EventType.FILL, ts, IID, side=side, quantity=qty, price=price, exit_reason=reason
+    )
+
+
 # ---------------------------------------------------------------------------
 # last_close_ns
 # ---------------------------------------------------------------------------
@@ -146,6 +152,78 @@ def test_checkpoint_survives_a_carried_short_after_a_residue_close() -> None:
     seed = checkpoint_balance(ledger, IID, pos, START, multiplier=MULT, cost_model=None)
     assert seed == pytest.approx(realized, abs=1e-6)
     assert seed > 0.0  # the guard the vbt backend asserts on
+
+
+def test_residue_flip_ledger_recovers_true_carried_short_and_positive_checkpoint() -> None:
+    # The live crypto-perp crash: the adapters' end-of-run restore kept the 07:45 short
+    # "held", suppressing its buyback fill, so the stream is --1.187, +1.194, --1.194
+    # (marked close), --1.188. The flip's two legs are sized off *different* equity
+    # (1.187 vs 1.194), so a residue-only fold read a phantom "short 2.375 @ 07:56",
+    # entry_ns <= checkpoint bound bent the old fold to -89,684.34 and the worker aborted
+    # with "vectorbt paper checkpoint balance must be > 0". The reason-marked fold must
+    # recover the true carried short (1.188 @ 08:09) and a positive realized seed.
+    t45, t54, t56, t809 = (1_745_000_000_000_000_000, 1_745_000_540_000_000_000,
+                           1_745_000_660_000_000_000, 1_745_000_940_000_000_000)
+    p45, p54, p56, p809 = 84_226.19, 84_101.04, 84_040.90, 84_034.15
+    ledger = EventLedger(
+        [
+            _cash(0, START),
+            _fill(t45, -1, 1.187, p45),        # short open 07:45 (buyback suppressed)
+            _fill(t54, 1, 1.194, p54),         # flip open long 07:54 (unmarked)
+            _close(t56, -1, 1.194, p56),       # atr stop closes the long 07:56 (marked)
+            _fill(t809, -1, 1.188, p809),      # short open 08:09 (the carried trade)
+        ]
+    )
+    pos = _open_position_from_ledger(ledger, IID)
+    assert pos is not None
+    assert pos.side == -1
+    assert pos.quantity == pytest.approx(1.188, abs=1e-6)
+    assert pos.entry_ns == t809  # the 08:09 entry, NOT the phantom 07:56 flip bar
+    assert pos.entry_price == pytest.approx(p809)
+
+    bound = last_close_ns(ledger, IID)
+    assert bound == t56  # the marked close, not the flip bar
+    assert bound < pos.entry_ns
+
+    # Realized equity: the short matured by the 07:54 flip (+), the long by the 07:56
+    # close (-); the 08:09 short is carried and excluded. That is ~10k, not the ~110k the
+    # un-returned short credit would leave in a margin-cash fold, and positive (no crash).
+    expected = START + (p45 - p54) * 1.187 + (p56 - p54) * 1.194
+    seed = checkpoint_balance(ledger, IID, pos, START, multiplier=MULT, cost_model=None)
+    assert seed == pytest.approx(expected, abs=1e-6)
+    assert seed > 0.0
+    assert seed < 2.0 * START  # ~10k, not the ~110k inflated fold
+
+
+def test_checkpoint_seed_is_the_realized_equity_not_twice_inflated_cash() -> None:
+    # Sizing-basis regression: a carried trade's seed must be the equity the adapter's
+    # sizing fold uses. With the short's opening credit stuck in cash (its buyback
+    # suppressed), the margin-cash fold reads ~109,922 and the warm window re-sizes the
+    # carried short at ~11x. The realized-fill seed stays ~10k.
+    t45, t54, t56, t809 = (1_745_000_000_000_000_000, 1_745_000_540_000_000_000,
+                           1_745_000_660_000_000_000, 1_745_000_940_000_000_000)
+    p45, p54, p56, p809 = 84_226.19, 84_101.04, 84_040.90, 84_034.15
+    ledger = EventLedger(
+        [
+            _cash(0, START),
+            _cash(t45, +1.187 * p45),      # short open credit (buyback never booked)
+            _cash(t54, -1.194 * p54),      # long open debit (flip)
+            _cash(t56, +1.194 * p56),      # long close credit
+            _cash(t809, +1.188 * p809),    # short open credit (carried)
+            _fill(t45, -1, 1.187, p45),
+            _fill(t54, 1, 1.194, p54),
+            _close(t56, -1, 1.194, p56),
+            _fill(t809, -1, 1.188, p809),
+        ]
+    )
+    pos = _open_position_from_ledger(ledger, IID)
+    assert pos is not None and pos.side == -1
+    seed = checkpoint_balance(ledger, IID, pos, START, multiplier=MULT, cost_model=None)
+    assert seed > 0.0
+    assert seed < 2.0 * START  # ~10k, not ~110k
+    # Rough equity sanity: START plus the two realized legs, minus nothing for the carry.
+    realized = (p45 - p54) * 1.187 + (p56 - p54) * 1.194
+    assert seed == pytest.approx(START + realized, abs=1e-6)
 
 
 def test_last_close_only_when_position_is_flattened() -> None:

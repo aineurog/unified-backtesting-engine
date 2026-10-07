@@ -37,6 +37,7 @@ __all__ = [
     "save_equity",
     "load_trades",
     "load_equity",
+    "step_position_after_fill",
 ]
 
 
@@ -78,6 +79,77 @@ class OpenPosition:
     entry_price: float
     entry_ns: int
     trade_id: str
+
+
+#: Scale-relative "is flat" tolerance for the fill-position scans (mirrors
+#: ``ube.papertrading.core._flat_tol``). Engine adapters settle a position with a cover one
+#: float-ulp off the size they opened — e.g. a 75382.2076-unit forex short covered at
+#: 75382.2076 leaves a 1.46e-11 residue, ~1e4x an absolute 1e-12 floor — so flatness must be
+#: judged relative to the quantity being settled.
+_POSITION_REL_TOL = 1e-9
+
+
+def _position_flat_tol(*scales: float) -> float:
+    """Scale-relative "is flat" tolerance: ``~1e-9`` of the largest quantity involved."""
+    return max(max(abs(float(s)) for s in scales), 1.0) * _POSITION_REL_TOL
+
+
+def step_position_after_fill(
+    position: float,
+    entry_px: float,
+    entry_ns: int,
+    order_id: str,
+    event: Any,
+) -> tuple[float, float, int, str, bool]:
+    """Fold one ``FILL`` event into a running open-position scan.
+
+    Shared by the engine-agnostic :func:`~ube.papertrading.core._open_position_from_ledger`
+    and the vectorbt/backtrader ``last_close_ns`` scans so all position derivations agree
+    (there is a single source of truth, the ledger, §4.6 — never a duplicated fold).
+
+    Args:
+        position: The signed running position (positive long / negative short).
+        entry_px / entry_ns / order_id: The carried side's volume-weighted entry.
+        event: The ``FILL`` event (``side``, ``quantity``, ``price``, ``timestamp``,
+            ``order_id``, ``exit_reason``).
+
+    Returns the updated ``(position, entry_px, entry_ns, order_id, closed)`` tuple, where
+    ``closed`` is ``True`` when the fill flattened (or flipped) the carried side — the
+    signal the ``last_close_ns`` scans record a close bar on.
+
+    A fill whose ``exit_reason`` is set is a close and never opens a side: an at/over-size
+    close flattens, a smaller one partially reduces. Unmarked fills open: fresh when flat,
+    accumulate on the same side. An opposite-side fill that fully covers the position
+    *replaces* it at the new fill's own size/price — a same-bar flip, whose two legs the
+    adapters size from slightly different equity. Replacing (instead of folding the residue
+    forward) is what keeps a suppressed buyback leg from phantoming a carried position.
+    """
+    q = float(event.side) * float(event.quantity)
+    px = float(event.price)
+    ts = int(event.timestamp)
+    oid = event.order_id or ""
+    tol = _position_flat_tol(q, position)
+    if event.exit_reason is not None:
+        # A close fill never opens a new side.
+        if abs(position) <= tol:
+            return position, entry_px, entry_ns, order_id, False
+        if abs(q) >= abs(position) - tol:
+            return 0.0, 0.0, 0, "", True
+        position += q
+        return position, entry_px, entry_ns, order_id, False
+    if abs(position) <= tol:
+        return q, px, ts, oid, False
+    if (q > 0) == (position > 0):
+        new_pos = position + q
+        entry_px = (entry_px * abs(position) + px * abs(q)) / abs(new_pos)
+        return new_pos, entry_px, entry_ns, order_id, False
+    if abs(q) >= abs(position) - tol:
+        flip = q + position
+        if abs(flip) <= tol:
+            return 0.0, 0.0, 0, "", True
+        return q, px, ts, oid, True
+    position += q
+    return position, entry_px, entry_ns, order_id, False
 
 
 _SCHEMA_SQL = """

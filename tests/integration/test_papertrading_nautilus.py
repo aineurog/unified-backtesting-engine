@@ -1023,3 +1023,62 @@ def test_resume_reverse_from_open_short_does_not_double_count_notional() -> None
     fills2 = [e for e in ev2 if e.event_type == EventType.FILL]
     assert len(fills2) == 2, "close-then-open fills expected on the reversal"
     assert fills2[0].exit_reason == "signal" and fills2[1].exit_reason is None
+
+
+def test_next_bar_flip_after_risk_exit_does_not_oversize() -> None:
+    """Regression: an opposite entry on the bar *after* a risk exit must not oversize.
+
+    Live paper trading produced ~11x oversized flips (qty 13.28 vs ~1.19) at the first
+    long entry immediately following an ATR-stop short close. Fills land one bar after
+    submission, so when the risk exit closes the short on bar *N*, its +notional entry
+    cash leg is still sitting in the journal on bar *N+1* — the bar the long signal fires
+    on. ``_inflight_close_legs`` reserves the pending close's anticipated cash leg (the
+    buy-back debit) from the moment ``_submit_close`` runs, so ``_current_balance`` sees
+    post-close equity and the flip sizes ~``balance/price`` instead of
+    ~``(balance + short_open_notional)/price``.
+    """
+    md = MarketData.from_records(
+        [
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0, "timestamp": "2024-01-01T00:00:00Z"},
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0, "timestamp": "2024-01-01T01:00:00Z"},
+            {"open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "volume": 1000.0, "timestamp": "2024-01-01T02:00:00Z"},
+            {"open": 100.5, "high": 103.5, "low": 100.5, "close": 103.0, "volume": 1000.0, "timestamp": "2024-01-01T03:00:00Z"},
+            {"open": 103.0, "high": 104.0, "low": 103.0, "close": 103.5, "volume": 1000.0, "timestamp": "2024-01-01T04:00:00Z"},
+            {"open": 103.5, "high": 104.0, "low": 103.0, "close": 103.5, "volume": 1000.0, "timestamp": "2024-01-01T05:00:00Z"},
+        ]
+    )
+    # short on bars 1-3 (stop exits bar 3 at 103.0), long signal on bar 4 = the flip bar.
+    signals = from_target(np.array([0, -1, -1, -1, 1, 1]))
+    from ube.core.config import RiskConfig
+    from ube.core.risk.sizing import SizeModel
+
+    instr = PRESETS["crypto_perp"].instrument
+    bc = BacktestConfig(
+        instrument=instr,
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        risk=RiskConfig(
+            sizing=SizeModel(kind="fixed_fraction", value=0.10, leverage=100.0),
+            exit=(StopLoss(percent=0.02, trigger="close"),),
+        ),
+    )
+    cfg = PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
+    state = init(cfg)
+
+    _, events = step(md, signals, state, cfg)
+
+    # The short must have been stopped on bar 3 (exit reason + one FLAT CHANGE).
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    stopped = [t for t in closed if t.exit_reason == "stop_loss"]
+    assert len(stopped) == 1, [t.exit_reason for t in closed]
+
+    # The flip long opened off the post-stopped equity (~7k after the ~-3k stop loss),
+    # not the compromised journal (~110k). qty = 0.10 * balance * 100 / 103.5 ~= 676;
+    # pre-fix the stale +100k short-open leg floated balance to ~110k -> qty ~= 10.6k.
+    assert state.open_position is not None
+    assert state.open_position.side == 1
+    qty = state.open_position.quantity
+    assert qty > 600, f"flip long undersized: {qty}"
+    assert qty < 900, f"flip long oversized ({qty}) - stale entry cash leg counted in sizing"
+    # 3 fills: short open, stop close, flip open.
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert len(fills) == 3, [getattr(f, "exit_reason", None) for f in fills]

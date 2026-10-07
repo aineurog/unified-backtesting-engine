@@ -16,27 +16,25 @@ This module carries the derivation logic as free functions (usable with any
 add an incremental fill-scan cache and a checkpoint fold memo.
 
 The checkpoint formula
----------------------
+----------------------
 
-This is *not* the naive ``starting_capital + Σ(cash) − Σ(commission) − Σ(funding)`` over
-``ts < window_start``. That formula was falsified against the adapter's own sizing fold
-(``backtrader_adapter._fold``): it double-counts the ledger's opening ``cash_movement``,
-drifts by the funding it subtracts (the sizing fold excludes funding), and goes negative on
-a same-bar flip because the prior close and the carried entry share a bar. The validated
-formula is::
+The checkpoint is the **realized equity** the adapter's own sizing fold bases the carried
+entry on — ``starting_capital + Σ net PnL`` of the round trips that actually *completed* in
+the fill stream (a close fill or a flip), at the fills' already-slipped prices, with both
+legs' commissions via ``fill_cost``::
 
-    bound = last_close_ns()                       # exit ts of the most recent close
-    total = Σ(cash_movement) − Σ(commission)      # over events with ts <= bound, NO funding
-    if no cash/commission event:
-        total = starting_capital
-    if open_position and (bound is None or entry_ns <= bound):
-        enot = quantity * entry_price * multiplier
-        total += side * enot + fill_cost(cost_model, notional=enot)   # remove carried legs
+    completed = any fill that flattens or flips the carried side (see
+                :func:`~ube.papertrading.state.step_position_after_fill`)
+    net_pnl   = side * (exit_px − entry_px) * qty * multiplier
+                − fill_cost(entry notional) − fill_cost(exit notional)      [fees]
+    equity    = starting_capital + Σ net_pnl(completed)
 
-The correction is applied only when the carried entry's legs fall *within* the fold — i.e.
-on a same-bar flip (``entry_ns == bound``) or before any close (``bound is None``). For an
-ordinary carry (entry strictly after the last close) the entry legs are already outside the
-fold, so the balance before the entry is simply the balance after the prior close.
+This equals the older ``Σ(cash_movement) − Σ(commission)`` fold over ``ts <= last_close``
+whenever every closed position's legs are booked. It stays correct when a short's *buyback
+leg is suppressed* (the adapters' end-of-run restore can leave a stopped short "held",
+skipping its cover fill), so the short's opening credit never leaves the margin-cash fold
+and inflates it — the realized-equity seed the sizing feed requires ignores carried legs
+entirely. Funding is ignored, matching the sizing fold.
 """
 
 from __future__ import annotations
@@ -46,7 +44,11 @@ from typing import Any, cast
 from ube.core.cost import fill_cost
 from ube.core.errors import StateCorruptionError
 from ube.core.ledger import EventLedger, EventType
-from ube.papertrading.state import OpenPosition, PaperState
+from ube.papertrading.state import (
+    OpenPosition,
+    PaperState,
+    step_position_after_fill,
+)
 
 __all__ = [
     "BACKTRADER_ENGINE_TAG",
@@ -58,8 +60,6 @@ __all__ = [
 
 #: Persisted engine marker written into ``PaperState.aux_data`` (see §4/§5).
 BACKTRADER_ENGINE_TAG: dict[str, Any] = {"engine": "backtrader", "schema": 1}
-
-_EPS = 1e-12
 
 
 def _raw_events(ledger: EventLedger) -> list[Any]:
@@ -73,24 +73,35 @@ def _raw_events(ledger: EventLedger) -> list[Any]:
     return raw if isinstance(raw, list) else list(ledger.events)
 
 
+def _flat_tol(*scales: float) -> float:
+    """Scale-relative "is flat" tolerance: ``~1e-9`` of the largest quantity involved."""
+    return max(max(abs(float(s)) for s in scales), 1.0) * 1e-9
+
+
 def last_close_ns(ledger: EventLedger, instrument_id: str) -> int | None:
     """Bar ts of the most recent fill that flattened or flipped the position.
 
-    Derived from the ``fill`` stream (not stored): a fill closes the current trade when it
-    returns the running signed position to zero or crosses through zero (a flip). Returns
-    ``None`` when no fill has closed a position.
+    Derived from the ``fill`` stream (not stored) with the same fold as
+    :func:`~ube.papertrading.core._open_position_from_ledger` (see
+    :func:`~ube.papertrading.state.step_position_after_fill`): a close fill (``exit_reason``
+    set) or an opposite-side fill that fully covers the carried side records a close bar.
+    Returns ``None`` when no fill has closed a position.
     """
     pos = 0.0
+    entry_px = 0.0
+    entry_ns = 0
+    order_id = ""
     last_close: int | None = None
     for event in _raw_events(ledger):
         if event.event_type is not EventType.FILL or event.instrument_id != instrument_id:
             continue
-        if event.side is None or event.quantity is None:
+        if event.side is None or event.quantity is None or event.price is None:
             continue
-        new = pos + float(event.side) * float(event.quantity)
-        if abs(pos) > _EPS and (abs(new) < _EPS or (new > 0.0) != (pos > 0.0)):
+        pos, entry_px, entry_ns, order_id, closed = step_position_after_fill(
+            pos, entry_px, entry_ns, order_id, event
+        )
+        if closed:
             last_close = int(event.timestamp)
-        pos = new
     return last_close
 
 
@@ -119,21 +130,87 @@ def fold_cash_commission(
     return total, saw_any
 
 
-def _entry_legs(
-    open_position: OpenPosition, multiplier: float, cost_model: Any
+def _realized_pnl(
+    side: int,
+    qty: float,
+    entry: float,
+    exit_px: float,
+    *,
+    multiplier: float,
+    cost_model: Any,
 ) -> float:
-    """``side*entry_notional + fill_cost(entry_notional)`` for the carried entry.
+    """Net PnL of a matured round trip at the fills' already-slipped prices."""
+    pnl = float(side) * (exit_px - entry) * qty * multiplier
+    if cost_model is not None:
+        pnl -= float(fill_cost(cost_model, notional=qty * entry * multiplier))
+        pnl -= float(fill_cost(cost_model, notional=qty * exit_px * multiplier))
+    return pnl
 
-    Subtracting this from a fold that already contains the carried entry's legs yields the
-    balance *before* the entry — the quantity to seed window sizing with.
+
+def _realized_round_trips(
+    events: list[Any],
+    instrument_id: str,
+    *,
+    multiplier: float,
+    cost_model: Any,
+) -> float:
+    """``Σ net PnL`` of the *completed* round trips in an event list (§5).
+
+    Folds the fill stream exactly like
+    :func:`~ube.papertrading.state.step_position_after_fill` — a close fill (``exit_reason``
+    set) or a fully-covering opposite-side fill matures the carried side — and adds each
+    matured side's net PnL at the fills' already-slipped prices. A carried (still-open)
+    entry is never matured, so it is automatically excluded from the equity. Funding is
+    ignored, matching the adapters' sizing fold.
     """
-    enot = (
-        float(open_position.quantity)
-        * float(open_position.entry_price)
-        * float(multiplier)
-    )
-    entry_fee = float(fill_cost(cost_model, notional=enot)) if cost_model is not None else 0.0
-    return float(open_position.side) * enot + entry_fee
+    total = 0.0
+    side = 0
+    qty = 0.0
+    entry = 0.0
+    for event in events:
+        if event.event_type is not EventType.FILL or event.instrument_id != instrument_id:
+            continue
+        if event.side is None or event.quantity is None or event.price is None:
+            continue
+        q = float(event.side) * float(event.quantity)
+        px = float(event.price)
+        tol = _flat_tol(q, qty)
+        if abs(qty) <= tol:
+            if event.exit_reason is not None:
+                continue
+            side = 1 if q > 0 else -1
+            qty, entry = abs(q), px
+        elif event.exit_reason is not None:
+            # A close fill never opens a side: full/over-size closes mature the round trip,
+            # smaller ones partially reduce it.
+            if abs(q) >= qty - tol:
+                total += _realized_pnl(
+                    side, qty, entry, px, multiplier=multiplier, cost_model=cost_model
+                )
+                side, qty, entry = 0, 0.0, 0.0
+            else:
+                qty -= abs(q)
+        elif (q > 0) == (side > 0):
+            new_qty = qty + abs(q)
+            entry = (entry * qty + px * abs(q)) / new_qty
+            qty = new_qty
+        else:
+            if abs(q) >= qty - tol:
+                total += _realized_pnl(
+                    side, qty, entry, px, multiplier=multiplier, cost_model=cost_model
+                )
+                flip = q + float(side) * qty
+                if abs(flip) <= tol:
+                    # Exact (ulp-level) cover: the round trip matured flat.
+                    side, qty, entry = 0, 0.0, 0.0
+                else:
+                    # Full opposite replacement (same-bar flip): the fill's own size is the
+                    # new carried side, opened at its own (already-slipped) price.
+                    side = 1 if q > 0 else -1
+                    qty, entry = abs(q), px
+            else:
+                qty -= abs(q)
+    return float(total)
 
 
 def checkpoint_balance(
@@ -145,37 +222,36 @@ def checkpoint_balance(
     multiplier: float = 1.0,
     cost_model: Any = None,
 ) -> float:
-    """The validated pre-window account balance (§5) — see the module docstring.
+    """The realized-equity pre-window account balance (§5) — see the module docstring.
 
     Args:
         ledger: The persisted event ledger.
         instrument_id: The single traded instrument.
-        open_position: The carried open position, or ``None`` when flat.
+        open_position: Informational — the carried open position, or ``None`` when flat.
+            The derived balance is independent of it: only completed round trips are
+            matured, so a carried entry is automatically excluded.
         starting_capital: The session starting balance (substituted when the ledger holds
-            no cash/commission events yet).
+            no completed round trips yet).
         multiplier: The instrument's contract multiplier.
-        cost_model: The resolved cost model (for the carried entry's commission leg).
+        cost_model: The resolved cost model (commission legs on the realized notional).
 
     Returns:
         The balance to seed the window's sizing with.
 
     .. note::
-        This formula mirrors the vectorbt-derived Section 5 methodology (starting-balance
-        double-count check, funding-inclusion check, same-bar-flip inclusive-bound check).
-        **It must be empirically validated against backtrader's own broker/sizer internals**
-        (trace the `running` accumulator in ``backtrader_adapter.strategy`` / ``core.risk.sizing``)
-        before relying on production data. The structural pattern is identical to vbt's because
-        backtrader's ``_fold`` also seeds the ledger with ``CASH_MOVEMENT += starting_balance`` at
-        ``bar_ts[0]``, but commission timing, funding handling, and slippage application may
-        differ and require correction.
+        This realized-fill basis mirrors the vectorbt-derived Section 5 methodology but is
+        engine-agnostic: it equals the old margin-cash fold whenever every closed position's
+        legs are booked, and stays correct when a short's buyback leg is suppressed. It
+        should be empirically validated against backtrader's own broker/sizer internals
+        (trace the sizing ``running`` accumulator) on production data.
     """
-    bound = last_close_ns(ledger, instrument_id)
-    total, saw_any = fold_cash_commission(ledger, bound)
-    if not saw_any:
-        total = float(starting_capital)
-    if open_position is not None and (bound is None or int(open_position.entry_ns) <= bound):
-        total += _entry_legs(open_position, multiplier, cost_model)
-    return float(total)
+    realized = _realized_round_trips(
+        _raw_events(ledger),
+        instrument_id,
+        multiplier=multiplier,
+        cost_model=cost_model,
+    )
+    return float(starting_capital) + realized
 
 
 def window_start_ns(
@@ -210,9 +286,9 @@ class BacktraderPaperState(PaperState):
     """A :class:`PaperState` with the backtrader derivation caches (§4/§5).
 
     Adds an incremental, append-only fill scan for :meth:`last_close_ns` and a checkpoint
-    fold :meth:`checkpoint_balance` memoized on the last close (the fold over ``ts <= bound``
-    is fixed once the close is known; only a new close invalidates it). Both are transient —
-    never persisted.
+    :meth:`checkpoint_balance` memoized on the fill count (the realized-equity fold is fixed
+    once the fill stream stops moving; funding/cash appends can't change it). Both are
+    transient — never persisted.
 
     Engine marker persistence: ``aux_data['backtrader']`` is written on ``save()`` and
     verified on ``load()`` so the row is not resumed across engines (e.g. nautilus).
@@ -223,6 +299,9 @@ class BacktraderPaperState(PaperState):
         self._scan_events: list[Any] | None = None
         self._scan_n = 0
         self._scan_pos = 0.0
+        self._scan_entry_px = 0.0
+        self._scan_entry_ns = 0
+        self._scan_order_id = ""
         self._scan_last_close: int | None = None
         self._ckpt_memo: tuple[int, float] | None = None
 
@@ -233,8 +312,14 @@ class BacktraderPaperState(PaperState):
             self._scan_events = events
             self._scan_n = 0
             self._scan_pos = 0.0
+            self._scan_entry_px = 0.0
+            self._scan_entry_ns = 0
+            self._scan_order_id = ""
             self._scan_last_close = None
         pos = self._scan_pos
+        entry_px = self._scan_entry_px
+        entry_ns = self._scan_entry_ns
+        order_id = self._scan_order_id
         last_close = self._scan_last_close
         i = self._scan_n
         n = len(events)
@@ -244,14 +329,18 @@ class BacktraderPaperState(PaperState):
             i += 1
             if event.event_type is not EventType.FILL or event.instrument_id != iid:
                 continue
-            if event.side is None or event.quantity is None:
+            if event.side is None or event.quantity is None or event.price is None:
                 continue
-            new = pos + float(event.side) * float(event.quantity)
-            if abs(pos) > _EPS and (abs(new) < _EPS or (new > 0.0) != (pos > 0.0)):
+            pos, entry_px, entry_ns, order_id, closed = step_position_after_fill(
+                pos, entry_px, entry_ns, order_id, event
+            )
+            if closed:
                 last_close = int(event.timestamp)
-            pos = new
         self._scan_n = i
         self._scan_pos = pos
+        self._scan_entry_px = entry_px
+        self._scan_entry_ns = entry_ns
+        self._scan_order_id = order_id
         self._scan_last_close = last_close
         return last_close
 
@@ -262,23 +351,26 @@ class BacktraderPaperState(PaperState):
         multiplier: float = 1.0,
         cost_model: Any = None,
     ) -> float:
-        """:func:`checkpoint_balance` with a fold memo keyed on the last close."""
-        bound = self.last_close_ns()
-        if bound is None:
-            total, saw_any = fold_cash_commission(self.ledger, None)
-            if not saw_any:
-                total = float(starting_capital)
-        elif self._ckpt_memo is not None and self._ckpt_memo[0] == bound:
-            total = self._ckpt_memo[1]
-        else:
-            total, saw_any = fold_cash_commission(self.ledger, bound)
-            if not saw_any:
-                total = float(starting_capital)
-            self._ckpt_memo = (bound, total)
-        pos = self.open_position
-        if pos is not None and (bound is None or int(pos.entry_ns) <= bound):
-            total += _entry_legs(pos, multiplier, cost_model)
-        return float(total)
+        """:func:`checkpoint_balance` with a memo keyed on the state's fill count.
+
+        Equity only moves when a fill matures a round trip, so while the fill stream is
+        stable the realized fold is served from the memo (appended funding/cash events skip
+        the fold entirely).
+        """
+        raw = _raw_events(self.ledger)
+        iid = self.instrument_id
+        fill_n = sum(
+            1
+            for e in raw
+            if e.event_type is EventType.FILL and e.instrument_id == iid
+        )
+        if self._ckpt_memo is not None and self._ckpt_memo[0] == fill_n:
+            return float(starting_capital) + self._ckpt_memo[1]
+        realized = _realized_round_trips(
+            raw, iid, multiplier=multiplier, cost_model=cost_model
+        )
+        self._ckpt_memo = (fill_n, realized)
+        return float(starting_capital) + realized
 
     def window_start_ns(self, *, warmup_ns: int = 0) -> int:
         """:func:`window_start_ns` for this state — the fetch window's first bar.

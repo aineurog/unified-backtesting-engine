@@ -45,7 +45,7 @@ from ube.core.ledger import EventLedger, EventType, LedgerEvent
 from ube.core.signals import Signals, from_target, neutralize_shorts, validate_long_only
 
 from .config import PaperConfig
-from .state import OpenPosition, PaperState
+from .state import OpenPosition, PaperState, step_position_after_fill
 
 __all__ = [
     "PaperEngine",
@@ -346,35 +346,10 @@ def _open_position_from_ledger(
             continue
         if e.side is None or e.quantity is None or e.price is None:
             continue
-        q = float(e.side) * float(e.quantity)
-        px = float(e.price)
-        oid = e.order_id or ""
-        # Same-bar reversals and near-exact covers settle to within float noise; the
-        # tolerance is relative to the quantities in play, never the absolute _EPS.
-        # An absolute floor here leaves a ~1e-8 residue on a same-bar cover of a ~1e5
-        # quantity (FX units), so the position never reads flat: the *next* entry is
-        # folded into that phantom residue instead of opening fresh, inheriting the
-        # stop bar's entry_ns/entry_px. That stale entry_ns makes the vectorbt
-        # checkpoint_balance fold bound include a carry it has not booked yet,
-        # double-subtracting the entry notional and aborting the worker.
-        tol = _flat_tol(q, position)
-        if abs(position) <= tol:
-            entry_px, entry_ns, trade_id = px, int(e.timestamp), oid
-            position = q
-        elif (q > 0) == (position > 0):
-            new_pos = position + q
-            entry_px = (entry_px * abs(position) + px * abs(q)) / abs(new_pos)
-            position = new_pos
-        else:
-            if abs(q) >= abs(position) - tol:
-                flip = q + position
-                if abs(flip) <= tol:
-                    position, entry_px, entry_ns, trade_id = 0.0, 0.0, 0, ""
-                else:
-                    position, entry_px, entry_ns, trade_id = flip, px, int(e.timestamp), oid
-            else:
-                position += q
-    if abs(position) <= _flat_tol(position):
+        position, entry_px, entry_ns, trade_id, _ = step_position_after_fill(
+            position, entry_px, entry_ns, trade_id, e
+        )
+    if abs(position) <= _flat_tol(position, 0.0):
         return None
     return OpenPosition(
         side=1 if position > 0 else -1,
