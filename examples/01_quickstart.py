@@ -31,7 +31,7 @@ def make_bars() -> pd.DataFrame:
 def resolve_engine() -> str:
     ube.ensure_builtin_engines_registered()
     for name in ("vectorbt", "backtrader", "nautilus"):
-        if name in ube.registered_engines:
+        if name in ube.registered_engines():
             return name
     raise RuntimeError("No supported backtesting engine is installed.")
 
@@ -39,6 +39,7 @@ def resolve_engine() -> str:
 def main() -> None:
     bars = make_bars()
     signals = ube.from_target(np.array([0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0], dtype=int))
+    market_data = ube.MarketData.from_dataframe(bars, timestamp_col="timestamp")
 
     config = ube.BacktestConfig(
         instrument=ube.Instrument(symbol="DEMO", asset_class="stocks", settlement_currency="USD"),
@@ -47,7 +48,7 @@ def main() -> None:
         engine_overrides={"starting_balance": 10_000.0},
     )
 
-    result = ube.run(bars, signals, config)
+    result = ube.run(market_data, signals, config)
     print(f"Engine: {config.engine}")
     print(f"Final equity: {result.equity_curve.equity[-1]:.2f}")
     print(result.trade_table[["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]].head())

@@ -43,7 +43,7 @@ def compute_atr_14(md: ube.MarketData) -> np.ndarray:
 def resolve_engine() -> str:
     ube.ensure_builtin_engines_registered()
     for name in ("backtrader", "vectorbt", "nautilus"):
-        if name in ube.registered_engines:
+        if name in ube.registered_engines():
             return name
     raise RuntimeError("No supported backtesting engine is installed.")
 
@@ -82,12 +82,15 @@ def run_engine_computed_atr() -> None:
         engine=resolve_engine(),
         risk=ube.RiskConfig(
             sizing=ube.SizeModel(kind="fixed_fraction", value=0.10),
-            exit=(ube.ATRStop(mult=2.0, period=14),),
+            exit=(ube.ATRStop(mult=2.0, period=14, atr="atr_14h"),),
         ),
         engine_overrides={"starting_balance": 10_000.0},
     )
 
-    result = ube.run(md, signals, config)
+    # Engine-computed mode: hand the engine a signal-timeframe OHLCV MarketData as the
+    # aux series and it derives the ATR internally (no look-ahead), rather than reading a
+    # precomputed array. §5.2 never computes ATR from the signal data bars themselves.
+    result = ube.run(md, signals, config, aux_data={"atr_14h": md})
     print("Engine-computed ATR example:")
     print(f"Final equity: {result.equity_curve.equity[-1]:.2f}")
     print(result.trade_table[["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]].head())

@@ -69,7 +69,9 @@ def run_example() -> None:
     md = ube.MarketData.from_dataframe(bars, timestamp_col="timestamp")
     signals = ube.from_target(np.array([0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0], dtype=int))
     config = build_paper_config(use_precomputed_atr=False)
-    db_path = str(Path(tempfile.gettempdir()) / "ube_example_paper_run.sqlite")
+    # A fresh database per invocation: ``run`` resumes from a persisted state, so a fixed
+    # path would make a second example run replay already-processed bars (DuplicateBarError).
+    db_path = str(Path(tempfile.mkdtemp(prefix="ube_example_paper_")) / "run.sqlite")
     state, events = ube.paper.run("demo-run", md, signals, config, db_path=db_path)
     print("run() example:")
     print(f"Open position: {state.open_position}")

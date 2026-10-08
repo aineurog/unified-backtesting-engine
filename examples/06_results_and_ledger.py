@@ -31,15 +31,16 @@ def make_bars() -> pd.DataFrame:
 def main() -> None:
     bars = make_bars()
     signals = ube.from_target(np.array([0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]))
+    market_data = ube.MarketData.from_dataframe(bars, timestamp_col="timestamp")
 
     config = ube.BacktestConfig(
         instrument=ube.Instrument(symbol="DEMO", asset_class="stocks", settlement_currency="USD"),
-        engine="backtrader" if "backtrader" in ube.registered_engines else "vectorbt",
+        engine="backtrader" if "backtrader" in ube.registered_engines() else "vectorbt",
         risk=ube.RiskConfig(sizing=ube.SizeModel(kind="fixed_units", value=1.0)),
         engine_overrides={"starting_balance": 10_000.0},
     )
 
-    result = ube.run(bars, signals, config)
+    result = ube.run(market_data, signals, config)
     print("First rows of trade table:")
     print(result.trade_table[["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]].head())
     print("Final equity curve value:", result.equity_curve.equity[-1])

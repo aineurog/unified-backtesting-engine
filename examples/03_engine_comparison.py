@@ -30,12 +30,13 @@ def make_bars() -> pd.DataFrame:
 
 def main() -> None:
     ube.ensure_builtin_engines_registered()
-    engines = [name for name in ("backtrader", "vectorbt", "nautilus") if name in ube.registered_engines]
+    engines = [name for name in ("backtrader", "vectorbt", "nautilus") if name in ube.registered_engines()]
     if not engines:
         raise RuntimeError("At least one engine must be installed to compare results.")
 
     bars = make_bars()
     signals = ube.from_target(np.array([0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0]))
+    market_data = ube.MarketData.from_dataframe(bars, timestamp_col="timestamp")
 
     print("Comparing engines:", engines)
     for engine in engines:
@@ -45,7 +46,7 @@ def main() -> None:
             risk=ube.RiskConfig(sizing=ube.SizeModel(kind="fixed_units", value=1.0)),
             engine_overrides={"starting_balance": 10_000.0},
         )
-        result = ube.run(bars, signals, config)
+        result = ube.run(market_data, signals, config)
         print(f"{engine:>10}: final_equity={result.equity_curve.equity[-1]:.2f}, trades={len(result.trade_table)}")
 
 
