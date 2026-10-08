@@ -21,8 +21,8 @@ import numpy as np
 from ube.adapters.nautilus_adapter.adapt_data import build_bar_type
 from ube.adapters.nautilus_adapter.instrument_map import build_instrument
 from ube.core.cost import resolve_cost_model
-from ube.core.data import max_price_decimals
-from ube.core.errors import CalendarMismatchError, EngineError
+from ube.core.data import MarketData, max_price_decimals
+from ube.core.errors import CalendarMismatchError, DataShapeError, EngineError
 from ube.core.instrument import Instrument, allows_short
 from ube.core.ledger import EventType, LedgerEvent
 from ube.papertrading.core import PaperEngine, apply_calendar_policy, register_paper_engine
@@ -33,7 +33,6 @@ from .signals import SIGNAL_REGISTRY
 from .strategy import UbePaperConfig, UbePaperStrategy
 
 if TYPE_CHECKING:
-    from ube.core.data import MarketData
     from ube.core.signals import Signals
     from ube.papertrading.config import PaperConfig
     from ube.papertrading.state import PaperState
@@ -71,6 +70,7 @@ class NautilusPaperEngine(PaperEngine):
         data: MarketData,
         signals: Signals,
         config: PaperConfig,
+        start_from_ns: int | None = None,
     ) -> list[LedgerEvent]:
 
         canonical = config.base.instrument
@@ -140,6 +140,28 @@ class NautilusPaperEngine(PaperEngine):
             n = data.n_bars
             period_ns = int(np.median(np.diff(ts))) if n > 1 else 60_000_000_000
 
+            # §5.2 contract: a precomputed aux array carries one value per bar of *this*
+            # step's window (the MarketData passed to step), exactly as the vectorbt and
+            # backtrader adapters require. Validate it here, before the node starts: a
+            # violation raised inside the Nautilus ``on_bar`` callback is caught by the
+            # data engine, which logs and terminates the process in a "degraded state" —
+            # ``step`` never returns and the caller cannot handle the error. Raising up
+            # front makes the contract fail loudly and cleanly. ``MarketData`` aux is
+            # skipped: it is timestamp-aligned and may legitimately span more bars (the
+            # ATR-warmup pattern).
+            for _aux_name, _aux_val in (state.aux_data or {}).items():
+                if isinstance(_aux_val, MarketData):
+                    continue
+                if not isinstance(_aux_val, np.ndarray | list | tuple):
+                    continue
+                _aux_arr = np.asarray(_aux_val)
+                if _aux_arr.ndim != 1 or _aux_arr.shape[0] != n:
+                    raise DataShapeError(
+                        f"aux_data[{_aux_name!r}] has shape {_aux_arr.shape} but this "
+                        f"step's data window has {n} bars — precomputed aux arrays must "
+                        "align with the MarketData passed to step() (§5.2)"
+                    )
+
             # Volume scaling for full fills (paper/sandbox parity bug): the sandbox fills
             # MARKET orders against trade ticks synthesized from the bar's volume
             # (``SimulatedExchange._process_trade_ticks_from_bar`` — each tick size is
@@ -208,6 +230,15 @@ class NautilusPaperEngine(PaperEngine):
                     bool(signals.short_exit[i]),
                     t_hist,
                 )
+
+            # Fresh-session live anchor (§9.6): bars fetched for indicator warmup must not
+            # open trades — suppress every pre-anchor signal row so a live launch never
+            # books "past" fills from the backfill (mirrors the vectorbt/backtrader warmup
+            # suppression). Only meaningful while the session is still fresh.
+            if start_from_ns is not None and state.last_processed_ns is None:
+                for t_live, row in list(signal_map.items()):
+                    if row[4] < int(start_from_ns):
+                        signal_map[t_live] = (False, False, False, False, row[4])
 
             bar_type = build_bar_type(instrument_id, period_ns)
 
@@ -299,6 +330,7 @@ class NautilusPaperEngine(PaperEngine):
                 bar_period_ns=period_ns,
                 last_funding_ns=state.last_funding_ns,
                 aux_data=dict(state.aux_data or {}),
+                window_bars=n,
             )
             strategy = UbePaperStrategy(config=strat_cfg)
 
@@ -347,8 +379,9 @@ class NautilusPaperEngine(PaperEngine):
                     ),
                 )
             return events
-        except CalendarMismatchError:
-            # §4.4 strict mode: surface the calendar error unchanged (backtest parity).
+        except (CalendarMismatchError, DataShapeError):
+            # §4.4/§5.2 strict mode: surface the data-contract error unchanged
+            # (backtest parity) instead of wrapping it as an execution failure.
             raise
         except Exception as exc:  # pragma: no cover - defensive
             raise EngineError(

@@ -38,9 +38,10 @@ def _ns(ts):
     return int(ts)
 
 
-def _fill(ts, iid, side, qty, price, *, gap=False):
+def _fill(ts, iid, side, qty, price, *, gap=False, reason=None):
     return LedgerEvent(
-        EventType.FILL, _ns(ts), iid, side=side, quantity=qty, price=price, gap_fill=gap
+        EventType.FILL, _ns(ts), iid, side=side, quantity=qty, price=price,
+        gap_fill=gap, exit_reason=reason,
     )
 
 
@@ -656,12 +657,31 @@ def test_fill_exit_reason_must_be_nonempty():
         )
 
 
-def test_entry_fill_without_reason_is_fine():
+def test_closing_fill_without_reason_is_signal():
+    # An unmarked opposite-direction close was signal-driven (window-replay engines
+    # coalesce a reversal into one net fill carrying no exit_reason), so the fold
+    # stamps `signal` rather than leaving the round trip unexplained.
     ledger = EventLedger(
         [_fill(0, "A", 1, 1.0, 100.0), _fill(1, "A", -1, 1.0, 110.0)]
     )
     (t,) = trades(ledger)
-    assert t.exit_reason is None
+    assert t.exit_reason == "signal"
+
+
+def test_signal_flip_close_attributes_signal_to_the_outgoing_trade():
+    # vbt-style reversal: short 75,697 closed by a larger unmarked buy (+75,756).
+    # The old side's round trip must carry `signal`, not an unanswered None.
+    ledger = EventLedger(
+        [
+            _fill(0, "A", -1, 75697.0993, 1.32201),
+            _fill(1, "A", 1, 75756.25831, 1.32219),
+            _fill(2, "A", -1, 75756.25831, 1.3219052615128473, reason="atr_stop"),
+        ]
+    )
+    short, _ = trades(ledger)
+    assert short.exit_reason == "signal"
+    assert short.side == -1
+    assert short.quantity == pytest.approx(75697.0993)
 
 
 # ---------------------------------------------------------------------------

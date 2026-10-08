@@ -862,3 +862,42 @@ def test_atr_exit_survives_windowed_resume_with_aux() -> None:
         )
 
     assert state.open_position is None
+
+
+def test_fresh_start_from_ns_suppresses_pre_anchor_entries() -> None:
+    # Live-launch warmup suppression (see the vectorbt mirror): bars fetched for indicator
+    # warmup must not open trades on a fresh session, while the anchor bar and later stay
+    # tradable. Backtrader fills the bar after the signal, so entry timestamps are anchored
+    # one bar later than the vectorbt mirror � every folded entry must still be >= anchor.
+    import tempfile
+    from pathlib import Path
+
+    n, anchor_idx = 24, 12
+    target = np.zeros(n, dtype=int)
+    target[4:11] = 1    # pre-anchor long entry � must be suppressed on a fresh session
+    target[14:20] = -1  # post-anchor short entry (flips the phantom long if unfixed)
+    target[20:24] = 1   # post-anchor long entry (flips the short back to long)
+    data = synthetic_bars(PRESETS[AC], n_bars=n)
+    signals = from_target(target)
+    cfg = _config()
+    anchor_ns = int(np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)[anchor_idx])
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        state, _ = run("x", data, signals, cfg, db_path=db, start_from_ns=anchor_ns)
+        anchored = _summary(state, cfg)
+        anchored_pos = state.open_position
+
+    assert anchored, "expected at least the post-anchor short round trip"
+    assert all(entry_ts >= anchor_ns for _, _, entry_ts, _ in anchored), anchored
+    if anchored_pos is not None:
+        assert anchored_pos.entry_ns >= anchor_ns
+
+    # Control: the legacy fresh replay (no anchor) still books the pre-anchor long pair.
+    with tempfile.TemporaryDirectory() as td2:
+        db2 = str(Path(td2) / "s.db")
+        init(cfg, run_id="x", db_path=db2)
+        state2, _ = run("x", data, signals, cfg, db_path=db2)
+        legacy = _summary(state2, cfg)
+    assert any(entry_ts < anchor_ns for _, _, entry_ts, _ in legacy), legacy

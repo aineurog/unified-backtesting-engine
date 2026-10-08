@@ -323,6 +323,88 @@ def test_atr_stop_aligns_when_aux_index_is_us_resolution() -> None:
     assert closed[0].exit_timestamp == int(md.timestamps.as_unit("ns").asi8[2])
 
 
+def test_atr_stop_fires_with_precomputed_array_aux() -> None:
+    """Regression: a precomputed ATR ndarray aux must drive the paper ATR stop.
+
+    The strategy rebuilds its bar grid cumulatively (bars seen so far, preceded by any
+    resume-seed bars) while §5.2 gives a precomputed array exactly one value per window
+    bar — so the raw window-length array never matched ``md.n_bars`` except on the final
+    bar. ``_resolve_atr`` raised ``DataShapeError`` on every earlier bar, the per-exit
+    guard swallowed it, and the risk exit silently disabled itself (fail-open): the
+    trade then closed on a later signal instead of the stop (``atr_test.py`` case
+    2: ``exit_reason='signal'`` instead of ``'atr_stop'``).
+
+    Same bars/signals/level as the ``MarketData``-aux case above — aux as the §5.2
+    precomputed ndarray instead — so both must exit at bar 2 @ 98.25.
+    """
+    md = MarketData.from_records(
+        [
+            {
+                "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+                "volume": 1000.0, "timestamp": "2024-01-01T00:00:00Z",
+            },
+            {
+                "open": 100.0, "high": 100.5, "low": 99.0, "close": 99.5,
+                "volume": 1000.0, "timestamp": "2024-01-01T01:00:00Z",
+            },
+            {
+                "open": 99.5, "high": 99.8, "low": 96.9, "close": 97.0,
+                "volume": 1000.0, "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 97.0, "high": 97.5, "low": 95.0, "close": 95.5,
+                "volume": 1000.0, "timestamp": "2024-01-01T03:00:00Z",
+            },
+            {
+                "open": 95.5, "high": 96.0, "low": 91.5, "close": 93.5,
+                "volume": 1000.0, "timestamp": "2024-01-01T04:00:00Z",
+            },
+        ]
+    )
+    signals = from_target(np.array([1, 1, 1, 1, 1]))
+    cfg = _exit_cfg(ATRStop(mult=1.0, period=2, atr="atr_1m"))
+    state = init(cfg)
+    # Wilder ATR (period 2) over these bars, shifted one bar and primed: [2, 2, 1.75, ...]
+    # → level = 100 - 1.0 * 1.75 = 98.25 from bar 2 (bar 1's 100 - 2.0 = 98.0 is safe
+    # above its low of 99.0). One value per window bar, per the §5.2 array contract.
+    aux = np.array([2.0, 2.0, 1.75, 1.75, 1.75])
+
+    _, events = step(md, signals, state, cfg, aux_data={"atr_1m": aux})
+
+    instr = cfg.base.instrument
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "atr_stop"
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert len(fills) == 2
+    assert fills[1].exit_reason == "atr_stop"
+    assert abs(fills[1].price - 98.25) < 1e-6
+    assert abs(closed[0].exit_price - 98.25) < 1e-6
+    assert fills[1].timestamp == int(md.timestamps.as_unit("ns").asi8[2])
+    assert closed[0].exit_timestamp == int(md.timestamps.as_unit("ns").asi8[2])
+    assert state.open_position is None
+
+
+def test_misaligned_precomputed_aux_raises_data_shape_error() -> None:
+    """§5.2 contract: a precomputed aux array must align with the step's data window.
+
+    This is validated by the backend before the Nautilus node starts. It cannot be
+    raised from inside ``on_bar``: the Nautilus data engine catches a callback
+    exception, logs it, and terminates the process in a "degraded state" — ``step``
+    never returns and the caller cannot handle the error. Surfaced here as the
+    backtest-parity :class:`DataShapeError`, not an execution failure.
+    """
+    from ube.core.errors import DataShapeError
+
+    md = synthetic_bars(PRESETS["crypto_perp"], n_bars=5, seed=1)
+    signals = from_target(np.array([1, 1, 1, 1, 1]))
+    cfg = _exit_cfg(ATRStop(mult=1.0, period=2, atr="atr_1m"))
+    state = init(cfg)
+    # 3 values for a 5-bar window.
+    with pytest.raises(DataShapeError, match="align with the MarketData passed to step"):
+        step(md, signals, state, cfg, aux_data={"atr_1m": np.array([2.0, 2.0, 1.75])})
+
+
 def test_duplicate_bar_raises() -> None:
     """T8 — DuplicateBarError on stale bar (idempotency §9.6)."""
     from ube.core.errors import DuplicateBarError
@@ -1039,12 +1121,30 @@ def test_next_bar_flip_after_risk_exit_does_not_oversize() -> None:
     """
     md = MarketData.from_records(
         [
-            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0, "timestamp": "2024-01-01T00:00:00Z"},
-            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1000.0, "timestamp": "2024-01-01T01:00:00Z"},
-            {"open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "volume": 1000.0, "timestamp": "2024-01-01T02:00:00Z"},
-            {"open": 100.5, "high": 103.5, "low": 100.5, "close": 103.0, "volume": 1000.0, "timestamp": "2024-01-01T03:00:00Z"},
-            {"open": 103.0, "high": 104.0, "low": 103.0, "close": 103.5, "volume": 1000.0, "timestamp": "2024-01-01T04:00:00Z"},
-            {"open": 103.5, "high": 104.0, "low": 103.0, "close": 103.5, "volume": 1000.0, "timestamp": "2024-01-01T05:00:00Z"},
+            {
+                "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+                "volume": 1000.0, "timestamp": "2024-01-01T00:00:00Z",
+            },
+            {
+                "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+                "volume": 1000.0, "timestamp": "2024-01-01T01:00:00Z",
+            },
+            {
+                "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5,
+                "volume": 1000.0, "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 100.5, "high": 103.5, "low": 100.5, "close": 103.0,
+                "volume": 1000.0, "timestamp": "2024-01-01T03:00:00Z",
+            },
+            {
+                "open": 103.0, "high": 104.0, "low": 103.0, "close": 103.5,
+                "volume": 1000.0, "timestamp": "2024-01-01T04:00:00Z",
+            },
+            {
+                "open": 103.5, "high": 104.0, "low": 103.0, "close": 103.5,
+                "volume": 1000.0, "timestamp": "2024-01-01T05:00:00Z",
+            },
         ]
     )
     # short on bars 1-3 (stop exits bar 3 at 103.0), long signal on bar 4 = the flip bar.
@@ -1082,3 +1182,37 @@ def test_next_bar_flip_after_risk_exit_does_not_oversize() -> None:
     # 3 fills: short open, stop close, flip open.
     fills = [e for e in events if e.event_type == EventType.FILL]
     assert len(fills) == 3, [getattr(f, "exit_reason", None) for f in fills]
+
+
+def test_fresh_start_from_ns_suppresses_pre_anchor_entries() -> None:
+    # Live-launch warmup suppression (mirrors the vectorbt/backtrader tests): bars fetched
+    # for indicator warmup must not open trades on a fresh session, while the anchor bar
+    # and later stay tradable.
+    n, anchor_idx = 24, 12
+    target = np.zeros(n, dtype=int)
+    target[4:11] = 1    # pre-anchor long entry � must be suppressed on a fresh session
+    target[14:20] = -1  # post-anchor short entry (flips the phantom long if unfixed)
+    target[20:24] = 1   # post-anchor long entry (flips the short back to long)
+    data = synthetic_bars(PRESETS["crypto_perp"], n_bars=n)
+    signals = from_target(target)
+    cfg = _config()
+    anchor_ns = int(np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)[anchor_idx])
+
+    state = init(cfg)
+    _, _ev = step(data, signals, state, cfg, start_from_ns=anchor_ns)
+    instr = cfg.base.instrument
+    anchored = trades(state.ledger, instruments={instr.symbol: instr})
+    assert anchored, "expected at least the post-anchor short round trip"
+    assert all(int(t.entry_timestamp) >= anchor_ns for t in anchored), [
+        (int(t.entry_timestamp), int(t.exit_timestamp)) for t in anchored
+    ]
+    if state.open_position is not None:
+        assert state.open_position.entry_ns >= anchor_ns
+
+    # Control: the legacy fresh step (no anchor) still books the pre-anchor long pair.
+    state2 = init(cfg)
+    _, _ev2 = step(data, signals, state2, cfg)
+    legacy = trades(state2.ledger, instruments={instr.symbol: instr})
+    assert any(int(t.entry_timestamp) < anchor_ns for t in legacy), [
+        (int(t.entry_timestamp), int(t.exit_timestamp)) for t in legacy
+    ]

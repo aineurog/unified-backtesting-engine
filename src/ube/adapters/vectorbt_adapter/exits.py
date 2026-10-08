@@ -423,16 +423,22 @@ def classify_exit_reason(
     # (opposite-side entry) also closes the position: a long exited on the bar a short
     # opens, or a short exited where a long opens. Nautilus journals these as "signal";
     # without this branch they would be mislabeled "end_of_run".
-    if side == 1 and bool(signals.long_exit[exit_bar]):
-        return "signal"
-    if side == -1 and bool(signals.short_exit[exit_bar]):
-        return "signal"
-    if side == 1 and bool(signals.short_entry[exit_bar]):
-        return "signal"
-    if side == -1 and bool(signals.long_entry[exit_bar]):
+    if _signal_exit_fires_at(signals, side, exit_bar):
         return "signal"
 
     return "end_of_run"
+
+
+def _signal_exit_fires_at(signals: Signals, side: int, bar: int) -> bool:
+    """Whether the signal columns close a ``side`` position on ``bar`` (§4.6).
+
+    The same acceptance :func:`classify_exit_reason` applies at a native exit bar: the
+    side's own exit column, or the flip encoding's opposite-side entry (a long is closed
+    by ``long_exit`` or by the ``short_entry`` that opens the other leg, and vice versa).
+    """
+    if side == 1:
+        return bool(signals.long_exit[bar]) or bool(signals.short_entry[bar])
+    return bool(signals.short_exit[bar]) or bool(signals.long_entry[bar])
 
 
 def core_stop_override(
@@ -489,6 +495,7 @@ def core_stop_exit_window(
     entry_bar: int,
     exit_bar: int,
     aux_data: Mapping[str, Any] | None,
+    signals: Signals | None = None,
 ) -> tuple[int, float, str] | None:
     """Re-time a vectorbt native-stop close that fired **before** the core rule would.
 
@@ -506,19 +513,29 @@ def core_stop_exit_window(
     held the position and took it out at the core stop one bar later).
 
     This scans ``exit_bar+1..n-1`` for the first bar the core rule fires and returns that
-    ``(bar, level, reason)``, so the fold can book the fill backtrader/nautilus book. Returns
-    ``None`` when the core rule does not fire later in the window either — the caller keeps
-    vectorbt's own close (the legitimate early-exit case), which is only correct when
-    something else really did close the trade.
+    ``(bar, level, reason)``, so the fold can book the fill backtrader/nautilus book. The
+    core rule includes the **signal exits** when ``signals`` is supplied: vectorbt also
+    exits natively on the encoded ``long_exit``/``short_exit`` columns, but a native stop
+    that closed the trade *before* the flip bar leaves a carried record open (restored by
+    the fold) while the incoming opposite-side record enters on the flip bar — netting the
+    ledger to zero and killing the new leg on every cursor replay. Re-timing that close to
+    the flip bar with reason ``"signal"`` is what the reference engines book: the close and
+    the new entry then both stand. Risk exits win a coincident bar (§4.7/§8, the same
+    priority :func:`classify_exit_reason` applies), and the earliest bar wins overall.
+
+    Returns ``None`` when the core rule does not fire later in the window either — the
+    caller keeps vectorbt's own close (the legitimate early-exit case), which is only
+    correct when something else really did close the trade.
     """
     n = data.n_bars
     if not (0 <= entry_bar < n) or not (0 <= exit_bar < n) or entry_bar > exit_bar:
         return None
     for bar in range(exit_bar + 1, n):
         fired = _exits_fired_at(exits, data, side, entry_price, entry_bar, bar, aux_data)
-        if not fired:
-            continue
-        pick = first_reached_exit([lvl for _, lvl in fired], open_price=float(data.open[bar]))
-        reason, level = fired[0 if pick is None else pick]
-        return bar, float(level), reason
+        if fired:
+            pick = first_reached_exit([lvl for _, lvl in fired], open_price=float(data.open[bar]))
+            reason, level = fired[0 if pick is None else pick]
+            return bar, float(level), reason
+        if signals is not None and _signal_exit_fires_at(signals, side, bar):
+            return bar, float(data.close[bar]), "signal"
     return None

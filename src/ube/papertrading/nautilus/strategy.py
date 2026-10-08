@@ -29,6 +29,7 @@ from nautilus_trader.trading.strategy import Strategy
 
 from ube.core.cost import fill_cost, slipped_price
 from ube.core.data import MarketData
+from ube.core.errors import DataShapeError
 from ube.core.ledger import EventType, LedgerEvent
 from ube.core.risk.exits import (
     ATRStop,
@@ -113,6 +114,7 @@ class UbePaperConfig(StrategyConfig):  # type: ignore[misc]
     bar_period_ns: int = 0  # median bar period for seeding synthetic timestamps (issue 1)
     last_funding_ns: int | None = None  # persisted funding clock (issue 2)
     aux_data: dict[str, Any] | None = None  # PaperState.aux_data — ATR/vol series (§5.2)
+    window_bars: int = 0  # bars in this step's window; precomputed aux arrays align to it (§5.2)
 
 
 class UbePaperStrategy(Strategy):  # type: ignore[misc]
@@ -176,6 +178,9 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # Bar history for exit level computation (vectorized, §8). Stored as
         # raw Bar objects to rebuild MarketData for exit_triggered.
         self._bars: list[Bar] = []
+        # Synthetic resume-seed bars at the front of _bars (issue 1/issue C). Precomputed
+        # aux arrays align to the step window, not to these — _resolve_exit_atr pads them.
+        self._n_seed_bars: int = 0
         # For resumed positions, entry bar is 0 relative to the new slice's bar buffer;
         # trailing exits will be approximate until enough bars accumulate. For full
         # fidelity, PaperState would need to persist the bar history (Point 9).
@@ -190,6 +195,8 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # the same config/aux produces different ATR-stop levels per engine (cross-engine
         # ledger parity).
         self._aux_data: dict[str, Any] = dict(config.aux_data or {})
+        # Length of this step's data window — precomputed aux arrays must match it (§5.2).
+        self._window_bars: int = int(getattr(config, "window_bars", 0) or 0)
         # Funding: track last funding timestamp to avoid double-counting. Persisted in
         # PaperState.last_funding_ns so a resume continues from the exact saved point
         # (issue 2) — not from bar spacing, which would be contaminated by synthetic seed bars.
@@ -349,6 +356,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                     ts_init=h,
                 )
             self._bars.append(b)
+        self._n_seed_bars = n_seed
         self._entry_bar = 0
         self._seeded = True
 
@@ -394,6 +402,50 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # only need OHLC arrays, so we store a minimal stub.
         return md
 
+    def _resolve_exit_atr(self, name: str, raw: Any, md: MarketData, period: int) -> np.ndarray:
+        """Resolve ``aux_data[name]`` onto the strategy's bar grid for an ATR exit (§5.2).
+
+        A ``MarketData`` aux is timestamp-aligned onto the strategy grid via
+        :func:`_atr_from_aux` — it may span more bars than the step window (the
+        ATR-warmup pattern) and any resume seed bars fall into the aligned gaps.
+
+        A precomputed array aligns with the ``MarketData`` passed to ``step()``
+        for this window (``config.window_bars``). The strategy grid is those
+        window bars seen so far, preceded by any synthetic resume-seed bars, so
+        the array is seed-padded and sliced to the bars replayed so far. Contract
+        violations raise :class:`DataShapeError` so the step fails loudly instead
+        of the resolution being swallowed by the per-exit guard below — which
+        silently disabled the risk exit for the whole window (fail-open) whenever
+        a precomputed array did not match the cumulative grid.
+        """
+        if isinstance(raw, MarketData):
+            return _atr_from_aux(md, raw, period)
+        arr = np.asarray(raw, dtype=np.float64)
+        if arr.ndim != 1:
+            raise DataShapeError(
+                f"aux_data[{name!r}] precomputed ATR must be 1-D; got shape {arr.shape}"
+            )
+        if self._window_bars and arr.shape[0] != self._window_bars:
+            raise DataShapeError(
+                f"aux_data[{name!r}] has {arr.shape[0]} bars but this step's data window "
+                f"has {self._window_bars} — precomputed aux arrays must align with the "
+                "MarketData passed to step() (§5.2)"
+            )
+        n_window_seen = md.n_bars - self._n_seed_bars
+        if arr.shape[0] < n_window_seen:
+            raise DataShapeError(
+                f"aux_data[{name!r}] has {arr.shape[0]} bars but the strategy has replayed "
+                f"{n_window_seen} window bars ({self._n_seed_bars} resume seed bars) — too "
+                "short to align with the strategy bar grid (§5.2)"
+            )
+        if self._n_seed_bars:
+            # Resume-seed bars precede the window: hold the first window ATR across them
+            # so the series is row-aligned with the strategy grid.
+            arr = np.concatenate(
+                [np.full(self._n_seed_bars, arr[0], dtype=np.float64), arr]
+            )
+        return arr[: md.n_bars]
+
     def _check_risk_exits(self) -> tuple[str, float, float | None] | None:
         """Return ``(exit_reason, fraction, level)`` for the first exit this bar reached.
 
@@ -425,21 +477,18 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             aux_atr = self._aux_data
         fired: list[tuple[str, float, float | None]] = []
         for cfg in self._exits:
+            # Resolved OUTSIDE the per-exit guard below: a §5.2 contract violation must
+            # fail the step loudly. The guard used to swallow the DataShapeError raised
+            # when a precomputed array did not match the strategy's cumulative bar grid
+            # (seed bars + window bars seen so far), silently disabling the risk exit for
+            # the whole window (fail-open — the trade then closed on a signal instead).
+            atr_series = None
+            atr_name = getattr(cfg, "atr", None)
+            if atr_name is not None and aux_atr is not None and atr_name in aux_atr:
+                atr_series = self._resolve_exit_atr(
+                    str(atr_name), aux_atr[atr_name], md, getattr(cfg, "period", 14)
+                )
             try:
-                # ATR-based exits need atr_series — resolve from aux_data if cfg.atr is set.
-                atr_series = None
-                atr_name = getattr(cfg, "atr", None)
-                if atr_name is not None and aux_atr is not None and atr_name in aux_atr:
-                    raw = aux_atr[atr_name]
-                    if isinstance(raw, np.ndarray):
-                        atr_series = raw
-                    elif isinstance(raw, MarketData):
-                        # ATR from the aux MarketData, aligned to the strategy's own bar
-                        # grid by timestamp — identical to the vectorbt/backtrader backends
-                        # (§5.2 parity), so a config's ATR-stop level is engine-invariant.
-                        atr_series = _atr_from_aux(md, raw, getattr(cfg, "period", 14))
-                    else:
-                        atr_series = np.asarray(raw, dtype=np.float64)
                 triggered = exit_triggered(
                     cfg,
                     market_data=md,

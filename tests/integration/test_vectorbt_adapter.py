@@ -24,14 +24,20 @@ from ube.adapters.vectorbt_adapter.adapt_data import (
     bar_timestamps_ns,
     to_vbt_inputs,
 )
-from ube.adapters.vectorbt_adapter.adapter import VectorbtAdapter
+from ube.adapters.vectorbt_adapter.adapter import (
+    VectorbtAdapter,
+    _net_pnl_per_unit,
+    _target_quantity,
+)
 from ube.adapters.vectorbt_adapter.engine import build_portfolio
 from ube.adapters.vectorbt_adapter.exits import (
     atr_from_aux,
     classify_exit_reason,
+    core_stop_exit_window,
     exit_stop_params,
     validate_aux,
 )
+from ube.adapters.vectorbt_adapter.instrument_map import build_instrument
 from ube.adapters.vectorbt_adapter.overrides import (
     DEFAULT_FUNDING_INTERVAL_HOURS,
     DEFAULT_STARTING_BALANCE,
@@ -39,7 +45,7 @@ from ube.adapters.vectorbt_adapter.overrides import (
     validate_overrides,
 )
 from ube.core.config import BacktestConfig
-from ube.core.cost import CostModel
+from ube.core.cost import CostModel, resolve_cost_model
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
 from ube.core.experiment_log import ExperimentLog
@@ -321,6 +327,114 @@ def test_classify_exit_reason_risk_exit_beats_coincident_signal(case: str):
         signals=sig,
     )
     assert reason == "stop_loss", f"the stop owns the exit (case={case})"
+
+
+def test_core_stop_exit_window_retimes_an_early_stop_to_the_later_signal_close():
+    """The forward scan must see signal exits, not just risk levels (live XAUUSD 06:09).
+
+    vectorbt's frozen fraction stopped the long before the flip bar while no core risk
+    level ever fired; ``from_target`` encodes the flip at bar 4 as ``long_exit`` +
+    ``short_entry``. The scan starts past vectorbt's native exit bar (2) and must re-time
+    the close to bar 4 with reason ``"signal"`` — with empty signals (the old levels-only
+    behaviour) it returns ``None``, which is exactly the gap that let the carried long net
+    against the incoming short and flatten the ledger.
+    """
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=8)
+    sig = from_target([0, 1, 1, 1, 0, 0, 0, 0])
+    flip_bar = int(np.argmax(sig.long_exit))
+    got = core_stop_exit_window(
+        (),
+        md,
+        side=1,
+        entry_price=100.0,
+        entry_bar=1,
+        exit_bar=2,
+        aux_data=None,
+        signals=sig,
+    )
+    assert got == (flip_bar, float(md.close[flip_bar]), "signal")
+    # The short side uses its own exit column the same way.
+    short_sig = from_target([0, -1, -1, -1, 0, 0, 0, 0])
+    short_flip = int(np.argmax(short_sig.short_exit))
+    got = core_stop_exit_window(
+        (),
+        md,
+        side=-1,
+        entry_price=100.0,
+        entry_bar=1,
+        exit_bar=2,
+        aux_data=None,
+        signals=short_sig,
+    )
+    assert got == (short_flip, float(md.close[short_flip]), "signal")
+    # No signals -> no core trigger anywhere in the window -> ``None`` (restore-open).
+    assert (
+        core_stop_exit_window(
+            (),
+            md,
+            side=1,
+            entry_price=100.0,
+            entry_bar=1,
+            exit_bar=2,
+            aux_data=None,
+            signals=Signals(
+                long_entry=np.zeros(8, dtype=bool),
+                long_exit=np.zeros(8, dtype=bool),
+                short_entry=np.zeros(8, dtype=bool),
+                short_exit=np.zeros(8, dtype=bool),
+            ),
+        )
+        is None
+    )
+
+
+def test_core_stop_exit_window_earliest_bar_wins_and_risk_owns_its_bar():
+    """Within the scan the earliest bar wins; on a shared bar the risk level wins (§4.7)."""
+    n = 6
+    close = np.full(n, 100.0)
+    open_ = close.copy()
+    high = close + 0.5
+    # StopLoss(2%) on a long entered at 100 sits at 98.0; only bar 5 reaches it.
+    low = np.array([99.0, 99.0, 99.0, 99.0, 99.0, 97.5])
+    volume = np.full(n, 1000.0)
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC").as_unit("ns")
+    md = MarketData(open=open_, high=high, low=low, close=close, volume=volume, index=index)
+    # Flip signal at bar 3: the signal bar precedes the level bar, so bar 3 wins.
+    early = Signals(
+        long_entry=np.array([True] + [False] * (n - 1)),
+        long_exit=np.array([False, False, False, True, False, False]),
+        short_entry=np.array([False, False, False, True, False, False]),
+        short_exit=np.zeros(n, dtype=bool),
+    )
+    got = core_stop_exit_window(
+        (StopLoss(percent=0.02),),
+        md,
+        side=1,
+        entry_price=100.0,
+        entry_bar=0,
+        exit_bar=2,
+        aux_data=None,
+        signals=early,
+    )
+    assert got == (3, 100.0, "signal")
+    # Signal and level on the SAME bar (5): the stop owns the bar (§4.6/§4.7/§8).
+    shared = Signals(
+        long_entry=np.array([True] + [False] * (n - 1)),
+        long_exit=np.array([False, False, False, False, False, True]),
+        short_entry=np.array([False, False, False, False, False, True]),
+        short_exit=np.zeros(n, dtype=bool),
+    )
+    got = core_stop_exit_window(
+        (StopLoss(percent=0.02),),
+        md,
+        side=1,
+        entry_price=100.0,
+        entry_bar=0,
+        exit_bar=2,
+        aux_data=None,
+        signals=shared,
+    )
+    assert got == (5, 98.0, "stop_loss")
 
 
 def test_atr_from_aux_has_no_lookahead_shift():
@@ -921,4 +1035,78 @@ def test_vectorbt_stop_on_the_final_bar_keeps_the_position_open() -> None:
         for e in result.ledger
         if e.event_type is EventType.POSITION_CHANGE and float(e.position_after) == 0.0
     ]
+
+
+def test_vectorbt_early_stop_before_the_flip_retimes_the_close_and_sizes_the_short():
+    """A carried long stopped early must close on the flip bar, not vanish under it.
+
+    Live XAUUSD divergence (vbt ledger flat 06:09-06:18 while backtrader/nautilus held the
+    short): vectorbt's frozen entry-anchored stop closed the long pre-cursor, the fold
+    restored it open (correct), but the flip's incoming short entry then netted the carried
+    long out of the ledger — ``open_position`` went flat, so the cursor replay's
+    ``_zero_entries_at_or_before`` zeroed the short entry on every subsequent window and
+    the short never re-opened. Re-timing the close onto the flip bar with reason
+    ``"signal"`` (the fill backtrader/nautilus book) keeps both legs standing, and the
+    short's size must be computed off the equity that realises that close — not off
+    vectorbt's early native-stop fill.
+    """
+    n = 6
+    atr = np.array([1.0, 2.0, 2.0, 2.0, 2.0, 2.0])
+    low = np.array([99.0, 97.0, 103.0, 103.0, 103.0, 103.0])
+    md, aux = _widening_atr_bars(atr, low)
+    signals = Signals(
+        long_entry=np.array([True] + [False] * (n - 1)),
+        long_exit=np.array([False, False, False, False, True, False]),
+        short_entry=np.array([False, False, False, False, True, False]),
+        short_exit=np.zeros(n, dtype=bool),
+    )
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        risk=RiskConfig(exit=(ATRStop(atr="atr_1h", mult=2.0),)),
+        engine_overrides={"starting_balance": 100000.0},
+    )
+    result = VectorbtAdapter().run(md, signals, config, aux_data=aux)
+    fills = _fills(result)
+    # entry, long close re-timed to the flip with reason "signal", open short entry
+    # (the close fill carries side -1 — it closes the long — as every exit fill does).
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "signal"), (-1, None)]
+    stamps = md.timestamps.as_unit("ns").asi8
+    assert int(fills[1].timestamp) == int(stamps[4])
+    # The flip bar journals both sides: the long's exit, then the short's entry — the
+    # close must not be swallowed as a phantom round-trip (end_of_run at the native bar).
+    assert [e.action for e in _ledger_events(result, EventType.SIGNAL_EVALUATED)] == [
+        "long_entry",
+        "long_exit",
+        "short_entry",
+    ]
+    # Ledger netting: +qty entry, 0.0 at the re-timed close, -qty for the carried short.
+    # The live bug netted entry+entry to 0.0 and then dropped the short too, flattening
+    # the position book entirely.
+    pcs = [
+        float(e.position_after)
+        for e in _ledger_events(result, EventType.POSITION_CHANGE)
+    ]
+    assert pcs == pytest.approx(
+        [float(fills[0].quantity), 0.0, -float(fills[2].quantity)]
+    )
+    # Sizing parity: the short is sized off equity including the long's realised PnL at
+    # the flip close (what backtrader/nautilus realise). Reproduce the sizing chain
+    # exactly: raw vbt entry prices are the bar closes (100.0 / 110.0 — slippage lives in
+    # the core helpers), and the running equity feeds the same core sizer the adapter used.
+    cost_model = resolve_cost_model(PRESETS["crypto_perp"].instrument)
+    vbt_inst = build_instrument(PRESETS["crypto_perp"].instrument, config.engine_overrides)
+    per_unit = _net_pnl_per_unit(
+        1, 100.0, float(md.close[4]), cost_model, vbt_inst.contract_multiplier
+    )
+    running = 100000.0 + per_unit * float(fills[0].quantity)
+    expected_short = _target_quantity(
+        config.risk.sizing, float(fills[2].price), running, None, cost_model, vbt_inst, 1.0
+    )
+    assert float(fills[2].quantity) == pytest.approx(expected_short)
+    # And it must exceed the size off untouched starting equity: sizing off vectorbt's
+    # early native-stop loss (the pre-fix behaviour) lands below that mark.
+    untouched = _target_quantity(
+        config.risk.sizing, float(fills[2].price), 100000.0, None, cost_model, vbt_inst, 1.0
+    )
+    assert float(fills[2].quantity) > untouched
 

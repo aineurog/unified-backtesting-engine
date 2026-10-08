@@ -6,9 +6,11 @@ Uses the dependency-free ``recording`` backend (plan T2) — no nautilus import.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from ube.core.config import BacktestConfig, SignalConfig
+from ube.core.data import MarketData
 from ube.core.instrument import Instrument
 from ube.core.ledger import trades
 from ube.core.signals import from_target
@@ -178,3 +180,44 @@ def test_open_position_recomputed_from_ledger() -> None:
     assert isinstance(state.open_position, OpenPosition)
     assert state.open_position.side == 1
     assert state.open_position.quantity == pytest.approx(1.0)
+
+
+def test_step_auto_anchors_fresh_near_now_live_window() -> None:
+    # A fresh session whose final bar is ~now is a live launch: the engine auto-derives
+    # the anchor from wall-clock time (§9.6) and must NOT trade the earlier warmup bars,
+    # even though no start_from_ns was passed. The same bars with historical timestamps
+    # keep the exact full-window replay the recomputability contract relies on.
+    now = pd.Timestamp.now(tz="UTC").floor("min")
+    n = 10
+    live_idx = pd.date_range(
+        now - pd.Timedelta(minutes=n - 1), periods=n, freq="min", tz="UTC"
+    )
+    o = np.full(n, 100.0)
+    h = np.full(n, 101.0)
+    lo = np.full(n, 99.0)
+    cl = np.full(n, 100.5)
+    vol = np.ones(n)
+    target = np.zeros(n, dtype=int)
+    target[3:] = 1  # stays long — opens at bar 3 (pre-anchor warmup) in the no-suppression case
+    signals = from_target(target)
+    cfg = _config()
+    live_state = init(cfg)
+    step(
+        MarketData(open=o, high=h, low=lo, close=cl, volume=vol, index=live_idx),
+        signals,
+        live_state,
+        cfg,
+    )
+    assert live_state.open_position is None, (
+        "live warmup pre-anchor entry must be suppressed automatically"
+    )
+
+    hist = init(cfg)
+    old_idx = pd.date_range("2024-01-01", periods=n, freq="min", tz="UTC")
+    step(
+        MarketData(open=o, high=h, low=lo, close=cl, volume=vol, index=old_idx),
+        signals,
+        hist,
+        cfg,
+    )
+    assert hist.open_position is not None, "historical fresh replay keeps the full window"

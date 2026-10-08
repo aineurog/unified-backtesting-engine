@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import time
 import warnings
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -36,6 +37,7 @@ from ube.core.data import MarketData
 from ube.core.errors import (
     CalendarMismatchError,
     ConfigError,
+    DataShapeError,
     DuplicateBarError,
     EngineError,
     InvalidSignalError,
@@ -46,6 +48,33 @@ from ube.core.signals import Signals, from_target, neutralize_shorts, validate_l
 
 from .config import PaperConfig
 from .state import OpenPosition, PaperState, step_position_after_fill
+
+#: A fresh session whose engine window ends within this wall-clock skew is a *live* launch
+#: (the last bar is the just-closed bar, seconds old), so bars before it are indicator
+#: warmup — suppress their entries automatically. Historical windows (backtests, reusable
+#: replays, the cross-engine parity harness) end days/week(s) earlier and stay untouched.
+_LIVE_ANCHOR_TOLERANCE_NS = 10 * 60 * 1_000_000_000
+
+
+def _auto_live_anchor_ns(data: MarketData) -> int | None:
+    """Auto-derive the fresh-session live anchor from wall-clock ``now`` (§9.6).
+
+    A live launch feeds the engine a warmup backfill whose final bar is the freshly closed
+    bar (seconds old). If that final bar sits within ``_LIVE_ANCHOR_TOLERANCE_NS`` of the
+    system clock, the session is unambiguously live: every earlier bar was fetched only to
+    converge indicators (ATR), so their entry signals are suppressed until the anchor — the
+    engine starts trading *after* it, with nothing threaded through the worker call sites.
+    A historical window ends far from ``now`` and keeps the exact full-window replay the
+    recomputability contract (and the parity harness) depends on. ``None`` when the window
+    is empty or not near ``now``.
+    """
+    if data.n_bars == 0:
+        return None
+    ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    last_ns = int(ts[data.n_bars - 1])
+    if time.time_ns() - last_ns <= _LIVE_ANCHOR_TOLERANCE_NS:
+        return last_ns
+    return None
 
 __all__ = [
     "PaperEngine",
@@ -203,8 +232,16 @@ class PaperEngine:
         data: MarketData,
         signals: Signals,
         config: PaperConfig,
+        start_from_ns: int | None = None,
     ) -> list[LedgerEvent]:
-        """Execute one slice of bars and return the new ledger events."""
+        """Execute one slice of bars and return the new ledger events.
+
+        ``start_from_ns`` is the first tradable bar (int64-ns) for a freshly-started
+        session: a live launch must not trade the bars fetched for indicator warmup (the
+        "past trades in the ledger" defect). Backends ignore it once ``last_processed_ns``
+        is set; ``None`` keeps the legacy full-window replay semantics (library tests and
+        the cross-engine parity/recomputability harness).
+        """
         raise NotImplementedError
 
     # Whether the backend re-reads context bars at-or-before the idempotency cursor on
@@ -404,6 +441,7 @@ def step(
     state: PaperState,
     config: PaperConfig,
     aux_data: Mapping[str, Any] | None = None,
+    start_from_ns: int | None = None,
 ) -> tuple[PaperState, list[LedgerEvent]]:
     """Process one slice of bars through the paper engine (§9.1 "I'll call you").
 
@@ -423,6 +461,15 @@ def step(
             exit configs reference. A precomputed array may be used for a full-window
             (non-window-replay) engine; window-replay engines re-align ``MarketData``
             values to their own sliced window by timestamp.
+        start_from_ns: Optional int64-ns timestamp of the first *tradable* bar for a
+            fresh session (the live anchor). The bars fetched before it are indicator
+            warmup only — their entry signals are suppressed until the anchor, so a live
+            launch never books "past" trades from the backfill. Ignored once a session
+            has processed bars (``state.last_processed_ns`` is set). When ``None``, the
+            anchor is auto-derived from wall-clock ``now`` (§9.6): only a window whose
+            final bar is within a few minutes of the system clock is treated as a live
+            launch, so it needs no threading through call sites — a historical window
+            (backtests, the parity harness) keeps the exact full-window replay semantics.
 
     Returns:
         ``(state, new_events)`` — the (same) state and the events this slice produced.
@@ -503,9 +550,21 @@ def step(
     if aux_data is not None:
         state.aux_data = dict(aux_data)
 
+    # Fresh-session live anchor (§9.6): when the caller did not pin one explicitly
+    # (workers do not — see _auto_live_anchor_ns), auto-derive it from wall-clock now so a
+    # live launch starts trading at the current bar and ignores the warmup backfill.
+    if start_from_ns is None and state.last_processed_ns is None:
+        start_from_ns = _auto_live_anchor_ns(data)
+
     try:
         engine = engine_cls()
-        new_events = engine.execute(state=state, data=data, signals=signals, config=config)
+        new_events = engine.execute(
+            state=state,
+            data=data,
+            signals=signals,
+            config=config,
+            start_from_ns=start_from_ns,
+        )
     except DuplicateBarError:
         raise
     except EngineError:
@@ -513,6 +572,10 @@ def step(
     except CalendarMismatchError:
         # §4.4 strict mode: the declared calendar has authority — surface the data error
         # unchanged (backtest parity) instead of wrapping it as an execution failure.
+        raise
+    except DataShapeError:
+        # §5.2 contract: a misaligned precomputed aux array is a data error, not an engine
+        # failure — surface it unchanged (backtest parity) so callers can handle it.
         raise
     except Exception as exc:  # noqa: BLE001 — wrap engine failure as §15 EngineError
         raise EngineError(f"paper engine {config.engine!r} failed: {exc}") from exc
@@ -633,6 +696,7 @@ def run(
     db_path: str | None = None,
     run_id: str | None = None,
     aux_data: Mapping[str, Any] | None = None,
+    start_from_ns: int | None = None,
 ) -> tuple[PaperState, list[LedgerEvent]]:
     """One-call scheduled-run entry point (strategy_name → run_id → step → auto-save).
 
@@ -656,6 +720,8 @@ def run(
             ``strategy_name``).
         aux_data: Optional derived-series map (§5.2) referenced by name from ATR exits —
             forwarded to :func:`step` and stored on ``state.aux_data``.
+        start_from_ns: Optional int64-ns first-tradable-bar anchor for a fresh session —
+            forwarded to :func:`step` (suppresses pre-anchor entries on a live launch).
 
     Returns:
         ``(state, new_events)`` — same as ``step`` but with auto-persistence
@@ -712,7 +778,7 @@ def run(
             raise
 
     # delegate to step (which now auto-saves and persists trades/equity)
-    return step(data, signals, state, config, aux_data=aux_data)
+    return step(data, signals, state, config, aux_data=aux_data, start_from_ns=start_from_ns)
 
 
 def run_auto(
@@ -841,6 +907,7 @@ class RecordingBackend(PaperEngine):
         data: MarketData,
         signals: Signals,
         config: PaperConfig,
+        start_from_ns: int | None = None,
     ) -> list[LedgerEvent]:
         from ube.core.cost import fill_cost, resolve_cost_model, slipped_price
 
@@ -881,6 +948,15 @@ class RecordingBackend(PaperEngine):
                 continue
             price = float(data.close[i])
             t = int(ts[i])
+            # Fresh-session live anchor (§9.6): bars fetched for indicator warmup are not
+            # tradable — suppress their entries until ``start_from_ns`` (exits are inert
+            # here: a fresh session holds no position before the anchor).
+            if (
+                start_from_ns is not None
+                and state.last_processed_ns is None
+                and t < int(start_from_ns)
+            ):
+                le = se = False
             action = decide_action(
                 sim_side,
                 long_entry=le,

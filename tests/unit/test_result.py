@@ -255,7 +255,7 @@ def test_trade_table_columns_match_spec():
     assert row["balance"] == pytest.approx(1000.0)
     assert row["entry_fee_pct"] == 0.0
     assert row["exit_fee_pct"] == 0.0
-    assert row["reason"] is None
+    assert row["reason"] == "signal"
 
 
 def test_trade_table_has_one_row_per_closed_trade():

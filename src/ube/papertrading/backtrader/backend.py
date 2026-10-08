@@ -210,6 +210,7 @@ class BacktraderPaperEngine(PaperEngine):
         data: MarketData,
         signals: Signals,
         config: Any,
+        start_from_ns: int | None = None,
     ) -> list[Any]:
         instrument = config.base.instrument
         if not isinstance(instrument, Instrument):
@@ -280,6 +281,9 @@ class BacktraderPaperEngine(PaperEngine):
             # re-creates its history from the carried entry instead, so this only guards
             # the flat case.
             win_sig = _zero_entries_at_or_before(win_sig, win_ts, cursor)
+        if open_pos is None and cursor is None and start_from_ns is not None:
+            # Fresh-session live anchor (§9.6): same warmup suppression as vectorbt.
+            win_sig = _zero_entries_at_or_before(win_sig, win_ts, int(start_from_ns) - 1)
 
         policy = config.base.signal.on_opposite_signal
         if policy is None:

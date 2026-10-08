@@ -752,6 +752,13 @@ def _process_fill(
             mt.exit_notional += close_q * p * multiplier
             if event.exit_reason is not None:
                 mt.exit_reason = event.exit_reason
+            elif abs(mt.entry_units - mt.exit_units) < tol:
+                # An unmarked opposite-direction fill that fully closes the round
+                # trip was signal-driven: window-replay engines (vectorbt) coalesce a
+                # same-bar reversal into one net replacement fill carrying no
+                # exit_reason, so the fold attributes the reverse signal here
+                # (nautilus/backtrader stamp it on the fill itself).
+                mt.exit_reason = "signal"
             pos += close_q
             remaining -= close_q
             if abs(remaining) <= tol:

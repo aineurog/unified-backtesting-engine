@@ -164,6 +164,7 @@ def _build_size_series(
     settlement: str = "USD",
     exits: tuple[Any, ...] = (),
     aux_data: Mapping[str, Any] | None = None,
+    signals: Signals | None = None,
 ) -> pd.Series:
     """Per-bar ``size`` (amount) array: target qty at entry bars, same qty at exit bars.
 
@@ -174,8 +175,12 @@ def _build_size_series(
     margin/cash).
 
     The per-unit realised PnL and the exit-bar size clear use the same core re-location as the
-    fold (:func:`core_stop_override`), so the running equity that sizes the next entry grows by
-    the level fill backtrader/nautilus book — not vectorbt's entry-anchored close fill.
+    fold (:func:`core_stop_override`, then the forward :func:`core_stop_exit_window` scan
+    over later risk levels and signal exits when ``signals`` is supplied), so the running
+    equity that sizes the next entry grows by the fill backtrader/nautilus book — not
+    vectorbt's entry-anchored close fill. Re-timing matters for parity: sizing the leg after
+    a flip off vectorbt's early native stop instead of the flip close the reference engines
+    realise drifts every subsequent quantity.
     """
     ts = bar_timestamps_ns(data)
     n = data.n_bars
@@ -204,6 +209,27 @@ def _build_size_series(
         )
         if core_exit is not None:
             exit_bar, raw_exit, _reason = core_exit
+        elif signals is not None and str(trade.get("Status", "")).strip().lower() != "open":
+            # Same forward re-time as the fold: when neither a core risk level nor a
+            # signal fired on vectorbt's own exit bar (the frozen fraction closed early),
+            # book the first later core trigger — risk level or signal/flip close — so the
+            # equity sizing the next entry matches the close the fold actually books.
+            exit_reason = classify_exit_reason(
+                exits, data, side, slipped_entry, entry_bar, exit_bar, aux_data, signals
+            )
+            if exit_reason == "end_of_run":
+                late_exit = core_stop_exit_window(
+                    exits,
+                    data,
+                    side=side,
+                    entry_price=slipped_entry,
+                    entry_bar=entry_bar,
+                    exit_bar=exit_bar,
+                    aux_data=aux_data,
+                    signals=signals,
+                )
+                if late_exit is not None:
+                    exit_bar, raw_exit, _reason = late_exit
         vol = float(vol_arr[entry_bar]) if vol_arr is not None and 0 <= entry_bar < n else None
         qty = _target_quantity(sizing, slipped_entry, running, vol, cost_model, vbt_inst, leverage)
         if qty <= 0.0:
@@ -422,6 +448,7 @@ class VectorbtAdapter(EngineAdapter):
                 settlement=settlement,
                 exits=exits,
                 aux_data=aux_data,
+                signals=signals,
             )
             pf = build_portfolio(
                 inputs,
@@ -570,7 +597,10 @@ class VectorbtAdapter(EngineAdapter):
                 # An ``end_of_run`` label on a closed record means no core exit and no signal
                 # fired on vectorbt's own exit bar: its frozen entry-anchored fraction stop
                 # closed early, while backtrader/nautilus were still holding. Re-time the
-                # fill to the core rule's real trigger bar further in the window.
+                # fill to the core rule's real trigger bar further in the window — a risk
+                # level or, with no level, the signal/flip close (carrying the close past
+                # the native stop onto the flip bar keeps the carried leg from netting
+                # against the incoming opposite-side entry and flattening the ledger).
                 if not is_open and exit_reason == "end_of_run":
                     late_exit = core_stop_exit_window(
                         exits,
@@ -580,6 +610,7 @@ class VectorbtAdapter(EngineAdapter):
                         entry_bar=entry_bar,
                         exit_bar=exit_bar,
                         aux_data=aux_data,
+                        signals=signals,
                     )
                     if late_exit is not None:
                         exit_bar, raw_exit, exit_reason = late_exit

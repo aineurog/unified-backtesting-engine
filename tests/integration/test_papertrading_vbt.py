@@ -531,3 +531,43 @@ def test_ulp_residue_close_does_not_resurrect_a_closed_trade() -> None:
         state.ledger, iid, state.open_position, 10_000.0, multiplier=multiplier
     )
     assert after < 2.0 * before, f"checkpoint inflated {before:.2f} -> {after:.2f}"
+
+
+def test_fresh_start_from_ns_suppresses_pre_anchor_entries() -> None:
+    # A live launch fetches bars for indicator warmup (ATR aux); on a fresh session those
+    # warmup bars must *not* open trades. Fold the same window with and without the fresh
+    # live anchor (``start_from_ns``) and compare the resulting ledgers.
+    import tempfile
+    from pathlib import Path
+
+    n, anchor_idx = 24, 12
+    target = np.zeros(n, dtype=int)
+    target[4:11] = 1    # pre-anchor long entry � must be suppressed on a fresh session
+    target[14:20] = -1  # post-anchor short entry (flips the phantom long if unfixed)
+    target[20:24] = 1   # post-anchor long entry (flips the short back to long)
+    data = synthetic_bars(PRESETS[AC], n_bars=n)
+    signals = from_target(target)
+    cfg = _config()
+    anchor_ns = int(np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)[anchor_idx])
+
+    with tempfile.TemporaryDirectory() as td:
+        db = str(Path(td) / "s.db")
+        init(cfg, run_id="x", db_path=db)
+        state, _ = run("x", data, signals, cfg, db_path=db, start_from_ns=anchor_ns)
+        anchored = _summary(state, cfg)
+        anchored_pos = state.open_position
+
+    # The pre-anchor long opened nothing: every folded trade (and the carried entry, if
+    # any) starts at/after the anchor.
+    assert anchored, "expected at least the post-anchor short round trip"
+    assert all(entry_ts >= anchor_ns for _, _, entry_ts, _ in anchored), anchored
+    if anchored_pos is not None:
+        assert anchored_pos.entry_ns >= anchor_ns
+
+    # Control: the legacy fresh replay (no anchor) still books the pre-anchor long pair.
+    with tempfile.TemporaryDirectory() as td2:
+        db2 = str(Path(td2) / "s.db")
+        init(cfg, run_id="x", db_path=db2)
+        state2, _ = run("x", data, signals, cfg, db_path=db2)
+        legacy = _summary(state2, cfg)
+    assert any(entry_ts < anchor_ns for _, _, entry_ts, _ in legacy), legacy
