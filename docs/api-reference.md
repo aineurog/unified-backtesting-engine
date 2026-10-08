@@ -187,20 +187,61 @@ Required for paper trading.
 
 ### `ube.BenchmarkConfig(kind='buy_and_hold', weights=None)`
 
+| Kind | `weights` | Description |
+|---|---|---|
+| `buy_and_hold` | forbidden | Single-instrument normalized close curve (default). |
+| `equal_weight` | forbidden | Portfolio average of each instrument's normalized curve. |
+| `custom` | required | Portfolio weighted sum; weights normalized to sum to one. |
+
+`build_benchmark(config, data)` builds the `BenchmarkCurve` (`returns` / `equity`
+arrays) over the bar index; `ube.run()` attaches it for supported
+single-instrument runs on `result.benchmark`.
+
 ---
 
 ## Exits
 
-All exits are configured via `RiskConfig(exit=(...))`.
+All exits are configured via `RiskConfig(exit=(...))`; a single exit object is
+accepted as one-element shorthand. `RiskConfig.exit` is stored as an ordered
+tuple and each exit is evaluated in that order.
 
 | Class | Signature | Description |
 |---|---|---|
-| `StopLoss` | `(percent, trigger='touched')` | Fixed percentage stop. |
-| `TakeProfit` | `(percent, scale_out=1.0, trigger='touched')` | Fixed percentage target. |
-| `TrailingStop` | `(percent, trigger='touched')` | Trailing percentage stop. |
-| `TimeExit` | `(bars)` | Close after N bars. |
-| `ATRStop` | `(mult, trigger='touched', trailing=False, period=14, atr=None)` | ATR-based stop. `atr` names an `aux_data` series. |
-| `ChandelierExit` | `(mult, trigger='touched', period=14, atr=None)` | Chandelier exit. |
+| `StopLoss` | `(percent, trigger='touched')` | Static stop a fixed fraction from entry; never ratchets. |
+| `TakeProfit` | `(percent, scale_out=1.0, trigger='touched')` | Fixed target; `scale_out` exits that fraction (in `(0, 1]`) when hit. |
+| `TrailingStop` | `(percent, trigger='touched')` | Trailing percentage stop off the running peak/trough since entry. |
+| `TimeExit` | `(bars)` | Close after N bars held. |
+| `ATRStop` | `(mult, trigger='touched', trailing=False, period=14, atr=None)` | ATR stop (entry-anchored, or ratcheting when `trailing=True`). `atr` **must** name an `aux_data` series. |
+| `ChandelierExit` | `(mult, trigger='touched', period=14, atr=None)` | Running high/low offset by `mult × ATR`. `atr` **must** name an `aux_data` series. |
+
+**Trigger** (`Trigger = Literal["touched", "close"]`) is the intrabar rule:
+`"touched"` compares the bar's high/low to the level; `"close"` compares only the
+close. `TimeExit` has no trigger. See
+[risk and costs](risk-and-costs.md#exits) for full semantics, scale-out
+constraints, and the named-`atr` `aux_data` requirement.
+
+### Low-level exit helpers
+
+The pure, vectorized exit primitives live in `ube.core.risk` (not exported at the
+top level). They are useful when building a custom adapter or inspecting levels
+without running an engine:
+
+| Function | Purpose |
+|---|---|
+| `atr(market_data, period=14)` | Wilder's ATR series. |
+| `exit_level(cfg, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Per-bar level for a price-level exit. |
+| `exit_triggered(cfg, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Per-bar bool mask (level + trigger rule) for any exit. |
+| `time_exit_mask(cfg, market_data, *, entry_bar=0)` | Per-bar mask for a `TimeExit`. |
+| `is_triggered(trigger, level, *, high, low, close, direction)` | Apply the trigger rule to a raw level array. |
+| `first_reached_exit(levels, *, open_price, triggered=None)` | Which of several touched levels fired first (by distance from the open). |
+| `scale_out_fraction(cfg)` | The fraction an exit takes (only `TakeProfit` is `!= 1.0`). |
+| `scale_out_plan(exits, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Ordered `ExitPlan` of fractions + per-exit triggered masks. |
+| `size_position(model, *, capital, price, n=None, vol=None, cost_model=None)` | Dispatch a `SizeModel` to its sizer (returns units). |
+| `floor_to_step(units, step)` | Floor sized units onto the instrument's lot grid. |
+
+Sizing primitives (`fixed_fraction_size`, `fixed_units_size`,
+`volatility_target_size`, `all_in_size`, `equal_weight_size`) are also public on
+`ube.core.risk`.
 
 ---
 
@@ -255,6 +296,43 @@ Build the reporting trade table.
 ### `equity_curve(ledger, market_data, instruments, *, base_currency, fx_rates=None) -> EquityCurve`
 
 Build the equity curve.
+
+## Errors
+
+All library errors derive from `ube.core.errors.ConfigError` (or `Exception`).
+Import them from `ube.core.errors`:
+
+| Error | Raised when |
+|---|---|
+| `ConfigError` | A config field is invalid or an adapter override is unsupported. |
+| `UndeclaredConfigError` | A required explicit-over-default field is unset for the run mode (`base_currency` for portfolio, `signal.on_opposite_signal` for paper). |
+| `DataShapeError` | Data/signals/aux shapes are misaligned, timestamps are not tz-aware, or a named aux series has the wrong length. |
+| `InvalidSignalError` | Signals are non-boolean, misaligned, or contradictory. |
+| `InvalidInstrumentError` | An unsupported `asset_class` or non-positive metadata field. |
+| `CalendarMismatchError` | A bar falls outside the instrument's declared trading calendar. |
+| `EngineError` | The underlying engine failed (the original error is preserved). |
+
+`ube.papertrading` additionally exposes `PaperTradingError`, `DuplicateBarError`,
+`StateCorruptionError`, and re-exports `EngineError`.
+
+## Experiment Log
+
+`ube.run()` **unconditionally** records every run to a local SQLite experiment
+log (the true trial count that later overfitting statistics depend on). It is not
+opt-in. Resolution order for the database path:
+
+1. `log_path=` passed to `ube.run()`.
+2. The `BACKTEST_LOG_PATH` environment variable.
+3. The default `~/.backtest/experiments.db`.
+
+```python
+result = ube.run(md, signals, config, log_path="runs/experiments.db")
+```
+
+Each row stores the resolved params, engine, a content hash of the data
+(instrument, date range, row count), the code version, and an optional result
+hash. A repeated `run_id` is ignored (first write wins) so `count` stays honest.
+This is separate from diagnostic logging (`logging.getLogger("ube")`).
 
 ---
 
@@ -327,6 +405,19 @@ the cursor.
 | `entry_price` | Fill price. |
 | `entry_ns` | Entry bar timestamp (ns). |
 | `trade_id` | Trade identifier. |
+
+### Paper backend registry
+
+| Function | Description |
+|---|---|
+| `ube.paper.get_paper_engine(name) -> type[PaperEngine]` | Resolve a registered paper backend. |
+| `ube.paper.register_paper_engine(name, backend_class) -> None` | Register a custom paper backend. |
+| `ube.paper.get_state_class(name) -> type[PaperState]` | Resolve the state class for a backend. |
+| `ube.paper.register_state_class(name, state_class) -> None` | Register a custom state class. |
+
+`PaperConfig` also exposes `overrides` (engine overrides as a plain dict) and
+`instrument_calendar` properties. The built-in `"recording"` backend is
+dependency-free and used by the unit tests.
 
 ---
 

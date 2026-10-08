@@ -349,3 +349,124 @@ print(loaded.trade_table)
 ```
 
 Only load pickles from trusted sources.
+
+---
+
+## Tutorial 11: Engine-Computed ATR from Aux Bars
+
+Instead of precomputing an ATR array, hand UBE a signal-timeframe OHLCV
+`MarketData` as the named aux series. The adapter computes Wilder's ATR on those
+bars (using the exit's `period`), forward-fills it onto the main grid, and shifts
+it one bar so there is no look-ahead.
+
+```python
+import ube
+
+# bars_4h is a MarketData of the higher timeframe you want ATR measured on.
+config = ube.BacktestConfig(
+    instrument=ube.Instrument(symbol="XAUUSD", asset_class="commodities",
+                             settlement_currency="USD"),
+    engine="vectorbt",
+    risk=ube.RiskConfig(
+        sizing=ube.SizeModel(kind="fixed_fraction", value=0.10, leverage=10.0),
+        exit=(ube.ATRStop(mult=2.0, period=14, atr="atr_4h"),),
+    ),
+    engine_overrides={"starting_balance": 10_000.0},
+)
+
+result = ube.run(md, signals, config, aux_data={"atr_4h": bars_4h})
+```
+
+Compare with [Tutorial 3](#tutorial-3-atr-based-exits-with-auxiliary-data), which
+passes a precomputed `atr_series` array (length must equal the number of main
+bars) instead. Both forms require the `atr=` name; the library never derives ATR
+from the signal bars, and a missing name or series raises `ConfigError`.
+
+---
+
+## Tutorial 12: Trailing Stops
+
+A `TrailingStop` follows the favourable extreme since entry and never loosens,
+locking in gains while leaving room to run.
+
+```python
+import ube
+
+config = ube.BacktestConfig(
+    instrument=ube.Instrument(symbol="BTCUSDT", asset_class="crypto_perp",
+                             settlement_currency="USDT"),
+    engine="backtrader",
+    risk=ube.RiskConfig(
+        sizing=ube.SizeModel(kind="fixed_fraction", value=0.10, leverage=5.0),
+        exit=(
+            ube.StopLoss(percent=0.03),           # initial hard stop
+            ube.TrailingStop(percent=0.02),       # then trail 2% off the peak
+            ube.TimeExit(bars=96),                # optional backstop
+        ),
+    ),
+    engine_overrides={"starting_balance": 10_000.0},
+)
+
+result = ube.run(md, signals, config)
+```
+
+Use an ATR-trailing stop when you want the trail distance to scale with
+volatility rather than a fixed percentage:
+
+```python
+exit=(ube.ATRStop(mult=2.5, period=14, atr="atr_1h", trailing=True),)
+```
+
+`ATRStop(..., trailing=True)` ratchets with the favourable extreme but never
+loosens below the entry-anchored stop. `ChandelierExit` is the other
+volatility-trailing family (running high/low minus `mult × ATR`). All of these
+require the named `atr` aux series described above.
+
+To make an exit evaluate only on closes (ignoring intrabar touches), set
+`trigger="close"`:
+
+```python
+exit=(ube.TrailingStop(percent=0.02, trigger="close"),)
+```
+
+---
+
+## Tutorial 13: Layered Exits and Scale-Out
+
+Layer stops, targets, and a time exit in one ordered tuple. Multiple
+`TakeProfit` entries with `scale_out` break a winner into pieces; stops always
+exit whatever remains.
+
+```python
+import ube
+
+config = ube.BacktestConfig(
+    instrument=ube.Instrument(symbol="EURUSD", asset_class="forex",
+                             settlement_currency="USD"),
+    engine="nautilus",
+    risk=ube.RiskConfig(
+        sizing=ube.SizeModel(kind="fixed_fraction", value=0.10, leverage=10.0),
+        exit=(
+            ube.StopLoss(percent=0.01),                    # 1% hard stop
+            ube.TakeProfit(percent=0.02, scale_out=0.50),  # bank half at +2%
+            ube.TakeProfit(percent=0.04, scale_out=0.50),  # bank the rest at +4%
+            ube.TrailingStop(percent=0.015),               # trail the remainder
+            ube.TimeExit(bars=72),                         # time backstop
+        ),
+    ),
+    engine_overrides={"starting_balance": 10_000.0},
+)
+
+result = ube.run(md, signals, config)
+
+for t in result.trades:
+    print(t.exit_reason, t.net_pnl)
+```
+
+Rules to remember:
+
+- `TakeProfit.scale_out` fractions must sum to at most `1.0`.
+- Exits are evaluated in order; when one bar touches several levels, the winner
+  is chosen by proximity to the bar's open (see
+  [risk and costs](risk-and-costs.md#ordering-and-same-bar-collisions)).
+- Check `exit_reason` on each `Trade` to confirm which rule fired.

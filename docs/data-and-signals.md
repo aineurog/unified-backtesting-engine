@@ -22,6 +22,14 @@ The DataFrame must contain canonical OHLC columns and a timestamp column or
 compatible index. See `MarketData.standardize()` and its constructors in
 `src/ube/core/data.py` for accepted array, mapping, and record forms.
 
+Other constructors mirror the input shapes: `from_dataframe`, `from_dict`,
+`from_records`, `from_array` (a `(n, 5)` OHLCV array plus `timestamps`), and the
+auto-detecting `standardize`. `to_dataframe()` and `head(n)` round out the
+container. With `timestamp_col=None`, `from_dataframe` uses the DataFrame index —
+so a frame with a `timestamp` column *and* a default `RangeIndex` must set
+`timestamp_col="timestamp"`, or be run through `ube.run()` which standardizes by
+position. All timestamps must be timezone-aware.
+
 ## Signal Formats
 
 The canonical `Signals` fields are boolean arrays with one element per bar:
@@ -42,6 +50,17 @@ the same bar.
 In this representation `0` means flat, so a transition from `1` to `0` emits a
 long exit. `ube.from_callable()` evaluates a callable over growing data prefixes
 and converts its `-1/0/1` results in the same way.
+
+`Signals.from_array()` accepts a `(n, 4)` boolean array in canonical column order,
+and `ube.signals` is an alias of the submodule so both `ube.from_target(...)` and
+`ube.signals.from_target(...)` work.
+
+### Long-only asset classes
+
+`crypto_spot` cannot short. `ube.signals.neutralize_shorts(signals)` clears the
+short leg (preserving the long-side action of a flip) so a long-only run is
+caller-independent; the built-in adapters and the paper front-end apply it
+automatically. `allows_short` is also available on an `Instrument`.
 
 ## Alignment
 
