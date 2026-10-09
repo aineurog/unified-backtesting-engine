@@ -122,20 +122,25 @@ def _zero_entries_at_or_before(
 
 
 def _apply_policy(
-    signals: Signals, *, allow_short: bool, policy: str
+    signals: Signals, *, allow_short: bool, policy: str, initial_side: int = 0
 ) -> Signals:
     """Encode the §9.3 position-change policy into fresh signal arrays.
 
-    ``sim_side`` is seeded flat (``0``) — the window starts at the carried entry bar when a
-    position is open, so the entry's own raw signal re-opens it. A bar whose four raw
-    columns are all ``False`` is skipped (raw ``False`` means "no action", never "close").
+    ``sim_side`` is seeded from the carried position's side (``0`` on a cold window) — a
+    window that resumes a persisted trade must keep encoding that side's *closes* and
+    flips exactly as the reference backend does (:func:`decide_action` on the carried
+    side). Seeding flat would mis-encode the first opposite signal as ``open_long``/
+    ``open_short`` from flat instead of ``reverse`` (a bare entry with no matching exit),
+    because ``df_to_signals`` is computed over the engine window *with a lead*, so the
+    carried entry's own raw signal is already consumed by the time bar 0 is reached and
+    does not re-open it. A bar whose four raw columns are all ``False`` is skipped.
     """
     n = signals.n_bars
     long_entry = np.zeros(n, dtype=bool)
     long_exit = np.zeros(n, dtype=bool)
     short_entry = np.zeros(n, dtype=bool)
     short_exit = np.zeros(n, dtype=bool)
-    sim_side = 0
+    sim_side = int(initial_side)
     for i in range(n):
         a_le = bool(signals.long_entry[i])
         a_lx = bool(signals.long_exit[i])
@@ -281,6 +286,7 @@ class VbtPaperEngine(PaperEngine):
             win_sig,
             allow_short=allows_short(instrument.asset_class),
             policy=str(policy),
+            initial_side=int(open_pos.side) if open_pos is not None else 0,
         )
         if open_pos is not None:
             side = int(open_pos.side)
