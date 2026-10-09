@@ -555,6 +555,12 @@ class VectorbtAdapter(EngineAdapter):
         )
 
         net: float = 0.0
+        # The bar a *risk* stop closed the previous leg on. The reference engines consume
+        # that bar: an opposite entry signal on it does not re-enter (only a signal exit
+        # reverses same-bar — §4.6). vectorbt encodes the flip as a separate record that
+        # enters on the stop bar; the phantom leg is dropped below so the ledger stays flat
+        # until the next signal, matching nautilus/backtrader.
+        prev_risk_exit_bar: int | None = None
         for _, trade in records.iterrows():
             entry_dt = pd.Timestamp(trade["Entry Timestamp"])
             exit_dt = pd.Timestamp(trade["Exit Timestamp"])
@@ -565,6 +571,8 @@ class VectorbtAdapter(EngineAdapter):
             size = abs(float(trade["Size"]))
             direction = str(trade["Direction"])
             side = 1 if direction == "Long" else -1
+            if prev_risk_exit_bar is not None and entry_bar == prev_risk_exit_bar:
+                continue
             # An open record carries the last bar as its "exit" in vectorbt; the position
             # is still held at the end of the run and must stay open in the ledger (the
             # trade_table renders its mark via the open row) — matching the nautilus fold.
@@ -767,6 +775,12 @@ class VectorbtAdapter(EngineAdapter):
                     ),
                     int(bar_ts[exit_bar]),
                 )
+
+            # Arm the same-bar re-entry guard only for a real, risk-terminated close; a
+            # signal exit (or an open/carried leg) leaves the next bar free to enter.
+            prev_risk_exit_bar = (
+                exit_bar if (not is_open and exit_reason != "signal") else None
+            )
 
         # Carry (funding/swap + short borrow) from the core cost model (§24).
         funding_rate = float(cost_model.funding)

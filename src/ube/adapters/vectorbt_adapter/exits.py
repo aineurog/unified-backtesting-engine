@@ -255,55 +255,51 @@ def exit_stop_params(
 ) -> tuple[Any, Any, Any]:
     """Translate the exit configs into vectorbt ``sl_stop`` / ``tp_stop`` / ``sl_trail``.
 
-    ``sl_stop`` is the tightest per-bar stop fraction over every stop-type exit (fixed
-    ``StopLoss``, trailing ``TrailingStop``, and any ATR/Chandelier fractions — all merged
-    via per-bar minimum); ``tp_stop`` is the first ``TakeProfit``; ``sl_trail`` is a boolean
-    flag that is ``True`` when at least one trailing stop (``TrailingStop`` /
-    ``ChandelierExit`` / trailing ``ATRStop``) is present, ``False`` otherwise.  Vectorbt
-    expects ``sl_stop`` to carry the distance fraction and ``sl_trail`` to be a boolean
-    that activates the trailing mechanism — passing a fraction as ``sl_trail`` is ignored
-    because ``sl_stop`` is ``NaN``.  ATR/Chandelier fractions are ``mult * atr / close`` —
-    an approximation of the absolute core level (which is anchored to entry/running peak),
-    accepted for the vectorized engine (§16 parity tolerance).
+    ``sl_stop`` is the tightest per-bar stop fraction over every **non-trailing** stop-type
+    exit (fixed ``StopLoss`` and non-trailing ``ATRStop`` fractions — merged via per-bar
+    minimum); ``tp_stop`` is the first ``TakeProfit``; ``sl_trail`` is always ``None``.
+
+    Trailing stops (``TrailingStop`` / ``ChandelierExit`` / trailing ``ATRStop``) are
+    deliberately kept out of vectorbt's native stop. Vectorbt exposes a single
+    ``sl_stop`` distance plus one ``sl_trail`` boolean, so the only way to pass a trailing
+    stop alongside a non-trailing one is to merge them and trail the merged distance. When
+    the non-trailing level is tighter (e.g. an entry-anchored ATR fraction of ~0.11%
+    beside a 1% trailing stop) vectorbt then ratchets that tighter, non-trailing level —
+    firing intrabar on bars where the core rule, which trails only its own level off the
+    running peak, holds (a wrong exit price and a dropped same-bar reversal). Trailing
+    exits are instead resolved exactly by the fold's :func:`core_stop_override`, which
+    re-times every close to the core first-trigger bar/level, so no trailing distance needs
+    to reach vectorbt. ATR fractions are ``mult * atr / close`` — an approximation of the
+    absolute core level, accepted for the vectorized engine (§16 parity tolerance).
     """
     tp_stop: float | None = None
-    # All stop distances (fixed + trailing) merged into one per-bar ``sl_stop``.
+    # Non-trailing stop distances merged into one per-bar ``sl_stop``.
     all_fractions: list[np.ndarray] = []
-    # Scalar stops (StopLoss / TrailingStop) broadcast to per-bar arrays.
+    # Scalar StopLoss broadcast to a per-bar array.
     sl_scalar: float | None = None
-    trail_scalar: float | None = None
-    has_trailing = False
 
     for exit in exits:
         if isinstance(exit, TakeProfit):
             tp_stop = exit.percent if tp_stop is None else tp_stop
         elif isinstance(exit, StopLoss):
             sl_scalar = exit.percent if sl_scalar is None else sl_scalar
-        elif isinstance(exit, TrailingStop):
-            trail_scalar = exit.percent if trail_scalar is None else trail_scalar
-            has_trailing = True
         elif isinstance(exit, ATRStop):
+            if exit.trailing:
+                # Trailing ATR — resolved by the core re-timing fold, not by vectorbt.
+                continue
             series = atr_series_for_exit(exit, aux_data, data)
             fraction = exit.mult * series / np.where(data.close > 0, data.close, np.nan)
             all_fractions.append(fraction)
-            if exit.trailing:
-                has_trailing = True
-        elif isinstance(exit, ChandelierExit):
-            series = atr_series_for_exit(exit, aux_data, data)
-            all_fractions.append(
-                exit.mult * series / np.where(data.close > 0, data.close, np.nan)
-            )
-            has_trailing = True
+        elif isinstance(exit, (TrailingStop, ChandelierExit)):
+            # Always trailing — resolved by the core re-timing fold, not by vectorbt.
+            continue
 
-    # Merge scalar stops as per-bar constant arrays.
+    # Merge the scalar StopLoss as a per-bar constant array.
     n = data.n_bars
     if sl_scalar is not None:
         all_fractions.append(np.full(n, sl_scalar))
-    if trail_scalar is not None:
-        all_fractions.append(np.full(n, trail_scalar))
-        has_trailing = True
 
-    # ``sl_stop``: per-bar minimum of every stop fraction.
+    # ``sl_stop``: per-bar minimum of every non-trailing stop fraction.
     sl_stop: Any = None
     if all_fractions:
         combined = all_fractions[0]
@@ -311,10 +307,9 @@ def exit_stop_params(
             combined = np.minimum(combined, frac)
         sl_stop = np.nan_to_num(combined, nan=0.0)
 
-    # ``sl_trail``: boolean — vectorbt trails when this is truthy.
-    sl_trail: Any = True if has_trailing else None
-
-    return sl_stop, tp_stop, sl_trail
+    # Never trail natively: vectorbt's single trailing primitive cannot represent a
+    # heterogeneous stop set (see the docstring). ``None`` disables the trailing mechanism.
+    return sl_stop, tp_stop, None
 
 
 def _exit_reason_name(exit: Any) -> str | None:
