@@ -55,6 +55,7 @@ __all__ = [
     "chandelier_level",
     "stop_loss_level",
     "time_exit_mask",
+    "time_exit_mask_for_entries",
     "exit_level",
     "is_triggered",
     "exit_triggered",
@@ -499,6 +500,36 @@ def time_exit_mask(cfg: TimeExit, market_data: MarketData, *, entry_bar: int = 0
     md = _require_market_data(market_data)
     eb = _validate_entry_bar(entry_bar, md.n_bars)
     return np.arange(md.n_bars) >= eb + cfg.bars
+
+
+def time_exit_mask_for_entries(entries: object, bars: int) -> np.ndarray:
+    """Holding-period exit mask driven by an entry-action column (§8, engine helper).
+
+    Vectorized engines receive signal *actions* rather than a single ``entry_bar``: each
+    fresh ``entries`` bar re-arms a countdown and the mask fires at ``entry + bars``,
+    then goes idle until the next entry (a stale ``True`` must never close a later
+    position). This is the entry-column form of :func:`time_exit_mask`.
+    """
+    ent = np.asarray(entries)
+    if ent.ndim != 1 or ent.dtype != np.bool_:
+        raise DataShapeError(
+            f"entries must be a 1-D boolean array; got dtype {ent.dtype} "
+            f"with shape {ent.shape}"
+        )
+    held = _validate_period(bars, "TimeExit bars")
+    n = ent.shape[0]
+    mask = np.zeros(n, dtype=np.bool_)
+    armed = False
+    fire_at: int | None = None
+    for i in range(n):
+        if bool(ent[i]):
+            armed = True
+            fire_at = i + held
+        if armed and fire_at is not None and i >= fire_at:
+            mask[i] = True
+            armed = False
+            fire_at = None
+    return mask
 
 
 # ---------------------------------------------------------------------------

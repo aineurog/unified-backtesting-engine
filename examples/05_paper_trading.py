@@ -8,10 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
-import ube
+import ube  # noqa: E402
 
 
 def make_bars() -> pd.DataFrame:
@@ -33,7 +33,10 @@ def compute_atr_14(md: ube.MarketData) -> np.ndarray:
     prev_close = np.empty_like(md.close)
     prev_close[0] = md.close[0]
     prev_close[1:] = md.close[:-1]
-    true_range = np.maximum(md.high - md.low, np.maximum(np.abs(md.high - prev_close), np.abs(md.low - prev_close)))
+    true_range = np.maximum(
+        md.high - md.low,
+        np.maximum(np.abs(md.high - prev_close), np.abs(md.low - prev_close)),
+    )
     true_range[0] = md.high[0] - md.low[0]
     kernel = np.ones(14, dtype=float) / 14.0
     return np.convolve(true_range, kernel, mode="same")
@@ -41,11 +44,17 @@ def compute_atr_14(md: ube.MarketData) -> np.ndarray:
 
 def build_paper_config(*, use_precomputed_atr: bool = False) -> ube.paper.PaperConfig:
     base = ube.BacktestConfig(
-        instrument=ube.Instrument(symbol="BTCUSDT", asset_class="crypto_perp", settlement_currency="USDT"),
+        instrument=ube.Instrument(
+            symbol="BTCUSDT", asset_class="crypto_perp", settlement_currency="USDT"
+        ),
         signal=ube.SignalConfig(on_opposite_signal="reverse"),
         risk=ube.RiskConfig(
             sizing=ube.SizeModel(kind="fixed_units", value=1.0),
-            exit=(ube.ATRStop(mult=2.0, period=14, atr="atr_14m") if use_precomputed_atr else ube.ATRStop(mult=2.0, period=14),),
+            exit=(
+                ube.ATRStop(mult=2.0, period=14, atr="atr_14m")
+                if use_precomputed_atr
+                else ube.ATRStop(mult=2.0, period=14),
+            ),
         ),
     )
     return ube.paper.PaperConfig(base=base, engine="recording")
@@ -54,7 +63,11 @@ def build_paper_config(*, use_precomputed_atr: bool = False) -> ube.paper.PaperC
 def step_example() -> None:
     bars = make_bars()
     md = ube.MarketData.from_dataframe(bars, timestamp_col="timestamp")
-    signals = ube.from_target(np.array([0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0], dtype=int))
+    target = np.array(
+        [0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+        dtype=int,
+    )
+    signals = ube.from_target(target)
     config = build_paper_config(use_precomputed_atr=True)
     state = ube.paper.init(config, run_id="atr-paper-step")
     atr = compute_atr_14(md)
@@ -67,7 +80,11 @@ def step_example() -> None:
 def run_example() -> None:
     bars = make_bars()
     md = ube.MarketData.from_dataframe(bars, timestamp_col="timestamp")
-    signals = ube.from_target(np.array([0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0], dtype=int))
+    target = np.array(
+        [0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+        dtype=int,
+    )
+    signals = ube.from_target(target)
     config = build_paper_config(use_precomputed_atr=False)
     # A fresh database per invocation: ``run`` resumes from a persisted state, so a fixed
     # path would make a second example run replay already-processed bars (DuplicateBarError).

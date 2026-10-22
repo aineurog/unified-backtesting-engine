@@ -74,7 +74,6 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
-import pandas as pd
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide, OrderType
 from nautilus_trader.model.events import OrderFilled, OrderRejected
@@ -85,8 +84,13 @@ from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from ube.core.cost import CostModel, slipped_price
 from ube.core.data import MarketData
-from ube.core.errors import ConfigError, DataShapeError, EngineError
+from ube.core.errors import EngineError
 from ube.core.instrument import allows_short
+from ube.core.risk.aux import (
+    atr_series_for_exit,
+    resolve_vol_for_sizing,
+    validate_aux,
+)
 from ube.core.risk.exits import (
     ATRStop,
     ChandelierExit,
@@ -96,7 +100,6 @@ from ube.core.risk.exits import (
     TakeProfit,
     TimeExit,
     TrailingStop,
-    atr,
     exit_level,
     scale_out_plan,
 )
@@ -231,9 +234,6 @@ class UbeActor(Strategy):  # type: ignore[misc]
         self._instrument = self.cache.instrument(self.instrument_id)
         if self._instrument is None:
             raise EngineError(f"instrument {self.instrument_id} is not registered")
-        from ube.adapters.nautilus_adapter.overrides import apply_synthetic_rates
-
-        apply_synthetic_rates(self.cache)
         self.subscribe_bars(self.config.bar_type)
 
     def on_bar(self, bar: Bar) -> None:
@@ -300,180 +300,29 @@ class UbeActor(Strategy):  # type: ignore[misc]
     def _validate_aux(self) -> None:
         """Fail fast if an ATR exit or ``volatility_target`` sizing has no usable series.
 
-        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) must name a specific
-        ``aux_data`` series via its ``atr`` key (§5.2); ``volatility_target`` sizing names
-        one via ``SizeModel.vol`` (§6.3). The library never computes ATR or volatility
-        from the signal ``data`` bars — those may be non-time bars that cannot be
-        resampled, and even time bars may be at a too-fine level (§5.2). A missing
-        reference, or a name absent from ``aux_data``, is a config-shape error surfaced
-        here, before the engine runs (§3 fail-fast principle).
+        Delegates to the shared :func:`ube.core.risk.aux.validate_aux` so every engine
+        applies the same presence and span checks before it runs (§3 fail-fast).
         """
-        named: set[str] = set()
-        for e in self._exits:
-            if isinstance(e, (ATRStop, ChandelierExit)):
-                atr_name = getattr(e, "atr", None)
-                if atr_name is None:
-                    raise ConfigError(
-                        f"{type(e).__name__} requires an 'atr' key referencing an "
-                        "aux_data series (§5.2); ATR is never computed from the signal "
-                        "data bars"
-                    )
-                named.add(str(atr_name))
-
-        if self._sizing.kind == "volatility_target":
-            vol_name = self._sizing.vol
-            if not vol_name:
-                raise ConfigError(
-                    "volatility_target sizing requires a 'vol' key referencing an "
-                    "aux_data series (§6.3); volatility is never computed from the "
-                    "signal data bars"
-                )
-            named.add(str(vol_name))
-
-        if not named:
-            return
-
-        if self._aux_atr is None:
-            raise ConfigError(
-                "config references aux_data series(es) "
-                f"{sorted(named)} but aux_data was not supplied"
-            )
-        missing = named - set(self._aux_atr)
-        if missing:
-            raise ConfigError(
-                "config references aux_data series(es) "
-                f"{sorted(missing)} that are absent from aux_data"
-            )
-
-        # Range consistency vs the data/signal grid (named MarketData series only).
-        main_ts = self._market_data.timestamps
-        main_start, main_end = main_ts[0], main_ts[-1]
-        main_step = main_ts[1] - main_ts[0] if len(main_ts) > 1 else pd.Timedelta(0)
-        for name in sorted(named):
-            value = self._aux_atr[name]
-            if not isinstance(value, MarketData):
-                continue  # precomputed arrays are length-checked in _atr_from_aux/_vol_from_aux
-            aux_ts = value.timestamps
-            if aux_ts[0] > main_start + main_step:
-                raise DataShapeError(
-                    f"aux_data[{name!r}] starts at {aux_ts[0]} which is after the data "
-                    f"start {main_start}; the leading main bars would have no value "
-                    "(aux_data must start at or before the signal/price period)"
-                )
-            aux_step = aux_ts[1] - aux_ts[0] if len(aux_ts) > 1 else main_step
-            if aux_ts[-1] < main_end - aux_step:
-                raise DataShapeError(
-                    f"aux_data[{name!r}] ends at {aux_ts[-1]} which is more than one aux "
-                    f"bar before the data end {main_end}; aux_data must span the "
-                    "signal/price period (the trailing value would be stale)"
-                )
+        validate_aux(
+            self._exits,
+            self._aux_atr,
+            sizing=self._sizing,
+            data=self._market_data,
+        )
 
     def _resolve_exit_atr(self, cfg: Exit) -> np.ndarray | None:
-        """Resolve the ATR series for ``cfg`` (§5.2).
-
-        An ATR-based exit (``ATRStop`` / ``ChandelierExit``) names an ``aux_data`` series
-        via its ``atr`` key; that series is resolved by :meth:`_atr_from_aux` (a
-        ``MarketData`` value is turned into ATR internally; a precomputed array is used
-        verbatim). The missing-input case is a config error caught up front in
-        :meth:`_validate_aux`, so this method never raises mid-engine.run().
+        """Resolve the ATR series for ``cfg`` via the shared aux resolver (§5.2).
 
         Returns ``None`` for exits that need no ATR (e.g. ``TrailingStop``); the core
         level functions compute their running extremes from the bars directly.
         """
         if isinstance(cfg, (ATRStop, ChandelierExit)):
-            return self._atr_from_aux(str(cfg.atr), cfg.period)
+            return atr_series_for_exit(cfg, self._aux_atr, self._market_data)
         return None
 
-    def _atr_from_marketdata(self, value: MarketData, period: int) -> np.ndarray:
-        """Compute ATR(``period``) from a raw OHLCV ``MarketData`` (§5.2), no look-ahead.
-
-        1. ATR(``period``) is computed over the aux bars (Wilder, causal — value at bar
-           ``h`` uses only bars through ``h``).
-        2. The series is shifted forward one aux bar, so a main bar inside hour ``h``
-           only ever sees the ATR of the *last completed* aux bar (``h-1``) — no
-           look-ahead into the bar being traded.
-        3. The aux ATR is forward-filled onto the (possibly finer) main bar grid so it
-           is row-aligned with ``data`` (length ``n_bars``).
-        """
-        atr_aux = atr(value, period)  # causal Wilder ATR, aligned to aux bars
-        series = pd.Series(atr_aux, index=value.timestamps)
-        # No look-ahead: shift forward one aux bar (bar h uses ATR through h-1).
-        series = series.shift(1).fillna(series.iloc[0])
-        # Forward-fill the aux ATR onto the main bar grid (length == n_bars).
-        aligned = series.reindex(self._market_data.timestamps, method="ffill")
-        return aligned.to_numpy(dtype=np.float64)
-
-    def _atr_from_aux(self, name: str, period: int) -> np.ndarray:
-        """Resolve an ``aux_data`` entry into an ATR series (§5.2), with no look-ahead.
-
-        A ``MarketData`` value is a raw OHLCV series — typically coarser than the signal
-        bars — that the library turns into ATR (via :meth:`_atr_from_marketdata`); a
-        precomputed array is used verbatim.
-        """
-        aux = self._aux_atr
-        if aux is None or name not in aux:
-            raise ConfigError(f"aux_data[{name!r}] was not supplied")
-        value = aux[name]
-        if isinstance(value, MarketData):
-            arr = self._atr_from_marketdata(value, period)
-        else:
-            arr = np.asarray(value, dtype=np.float64)
-        if arr.shape[0] != self._market_data.n_bars:
-            raise DataShapeError(
-                f"aux_data[{name!r}] has {arr.shape[0]} bars but data has "
-                f"{self._market_data.n_bars}"
-            )
-        if not np.isfinite(arr).all() or (arr <= 0).any():
-            raise ConfigError("atr_series must be finite and positive")
-        return arr
-
     def _resolve_vol(self) -> np.ndarray:
-        """Resolve the ``volatility_target`` vol estimate from ``aux_data`` (§6.3).
-
-        The ``SizeModel.vol`` name is validated up front in :meth:`_validate_aux`, so
-        this method never raises mid-engine.run() for a missing reference.
-        """
-        return self._vol_from_aux(str(self._sizing.vol))
-
-    def _vol_from_marketdata(self, value: MarketData) -> np.ndarray:
-        """Per-bar volatility (ATR/price) from a raw OHLCV ``MarketData``, no look-ahead.
-
-        Mirrors :meth:`_atr_from_marketdata`: ATR over the aux bars (causal Wilder), then
-        shifted forward one aux bar so a main bar inside hour ``h`` only ever sees the
-        volatility of the *last completed* aux bar (``h-1``), then forward-filled onto the
-        main bar grid. Dividing by the aux close turns ATR into a dimensionless fraction.
-        """
-        vol_aux = atr(value) / value.close
-        series = pd.Series(vol_aux, index=value.timestamps)
-        # No look-ahead: shift forward one aux bar (bar h uses vol through h-1).
-        series = series.shift(1).fillna(series.iloc[0])
-        # Forward-fill the aux vol onto the main bar grid (length == n_bars).
-        aligned = series.reindex(self._market_data.timestamps, method="ffill")
-        return aligned.to_numpy(dtype=np.float64)
-
-    def _vol_from_aux(self, name: str) -> np.ndarray:
-        """Resolve an ``aux_data`` entry into a per-bar volatility fraction (§6.3).
-
-        A ``MarketData`` value is a raw OHLCV series — typically coarser than the signal
-        bars — that the library turns into ``ATR/price`` (via
-        :meth:`_vol_from_marketdata`); a precomputed array is used verbatim.
-        """
-        aux = self._aux_atr
-        if aux is None or name not in aux:
-            raise ConfigError(f"aux_data[{name!r}] was not supplied")
-        value = aux[name]
-        if isinstance(value, MarketData):
-            arr = self._vol_from_marketdata(value)
-        else:
-            arr = np.asarray(value, dtype=np.float64)
-        if arr.shape[0] != self._market_data.n_bars:
-            raise DataShapeError(
-                f"aux_data[{name!r}] has {arr.shape[0]} bars but data has "
-                f"{self._market_data.n_bars}"
-            )
-        if not np.isfinite(arr).all() or (arr <= 0).any():
-            raise ConfigError("vol estimate must be finite and positive")
-        return arr
+        """Resolve the ``volatility_target`` vol estimate via the shared resolver (§6.3)."""
+        return resolve_vol_for_sizing(self._sizing, self._aux_atr, self._market_data)
 
     def _apply_signal(self, signals: tuple[bool, bool, bool, bool], bar: Bar, idx: int) -> None:
         le, lx, se, sx = signals

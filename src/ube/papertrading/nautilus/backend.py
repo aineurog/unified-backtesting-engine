@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from itertools import chain
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -21,7 +20,7 @@ import numpy as np
 from ube.adapters.nautilus_adapter.adapt_data import build_bar_type
 from ube.adapters.nautilus_adapter.instrument_map import build_instrument
 from ube.core.cost import resolve_cost_model
-from ube.core.data import MarketData, max_price_decimals
+from ube.core.data import MarketData, resolve_price_precision
 from ube.core.errors import CalendarMismatchError, DataShapeError, EngineError
 from ube.core.instrument import Instrument, allows_short
 from ube.core.ledger import EventType, LedgerEvent
@@ -116,10 +115,7 @@ class NautilusPaperEngine(PaperEngine):
             # sandbox requires bar OHLC precision to equal the instrument's, and a coarse
             # config tick (0.1) must never round away digits the data actually carries.
             instrument_pp = int(instrument.price_precision)
-            data_pp = max_price_decimals(
-                chain(data.open, data.high, data.low, data.close),
-                base=instrument_pp,
-            )
+            data_pp = resolve_price_precision(data, instrument_pp)
             if data_pp > instrument_pp:
                 overrides = dict(overrides)
                 overrides["price_precision"] = data_pp

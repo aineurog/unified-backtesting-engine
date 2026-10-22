@@ -45,6 +45,7 @@ from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidInstrumentError, InvalidSignalError
 from ube.core.experiment_log import DataReference, ExperimentLog, PortfolioDataReference
+from ube.core.instrument import resolve_settlement_currency
 from ube.core.result import BacktestResult, result_hash
 from ube.core.signals import Signals
 
@@ -73,9 +74,14 @@ def _slice_market_data(md: MarketData, start: Any, end: Any) -> tuple[MarketData
     when the window excludes every bar — never a silent empty run.
     """
     # MarketData guarantees a tz-aware DatetimeIndex (raised at construction otherwise),
-    # so this narrows the declared ``pd.Index`` to what _window_mask needs.
+    # but a date_range window is a time-bar concept: reject an event-bar index explicitly
+    # rather than relying on an assertion (which ``python -O`` removes).
     index = md.index
-    assert isinstance(index, pd.DatetimeIndex), "MarketData.index must be a DatetimeIndex"
+    if not isinstance(index, pd.DatetimeIndex):
+        raise DataShapeError(
+            "date_range slicing requires time bars (a DatetimeIndex); got "
+            f"{type(index).__name__} — event bars have no wall-clock window (§7.2)"
+        )
     mask = _window_mask(index, start, end)
     if not mask.any():
         raise DataShapeError(
@@ -194,30 +200,18 @@ def _standardize_signals(signals: object) -> Signals:
     )
 
 
-#: Per-asset-class default settlement currency, applied when an instrument declares
-#: none (mirrors :data:`ube.core.result._DEFAULT_SETTLEMENT`).
-_DEFAULT_SETTLEMENT: dict[str, str] = {
-    "crypto_spot": "USDT",
-    "crypto_perp": "USDT",
-    "forex": "USD",
-    "futures": "USD",
-    "stocks": "USD",
-    "commodities": "USD",
-}
-
-
 def _default_settlement_currency(config: BacktestConfig) -> BacktestConfig:
     """Return a config whose instrument has a settlement currency when omitted.
 
-    The minimal ``ube.Instrument(symbol, asset_class=...)`` usage declares no
-    settlement currency; the downstream ledger normalization (core) requires one. It is
-    defaulted per asset class here (the canonical entry point) so the simple
-    construction path runs without forcing a settlement currency on the caller.
+    The minimal ``ube.Instrument(symbol, asset_class=...)`` usage declares no settlement
+    currency; the downstream ledger normalization (core) requires one. The fallback is
+    the asset-class default from :func:`~ube.core.instrument.resolve_settlement_currency`
+    (§4.7) — the single definition shared by the result builder and the adapters.
     """
     instrument = config.instrument
     if instrument.settlement_currency is not None:
         return config
-    settled = _DEFAULT_SETTLEMENT.get(instrument.asset_class, "USD")
+    settled = resolve_settlement_currency(instrument)
     return replace(
         config,
         instrument=replace(instrument, settlement_currency=settled),
@@ -370,6 +364,4 @@ def run(
             data_reference=data_reference,
             result_hash=result_hash(result),
         )
-    return result
-
     return result

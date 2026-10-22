@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, Literal, TypedDict
 
 from ube.core.errors import ConfigError
+from ube.core.fx import stablecoin_peg_rate
 
 __all__ = [
     "DEFAULT_OMS_TYPE",
@@ -150,10 +151,13 @@ def apply_synthetic_rates(
     settlement_currency: str | None = None,
     base_currency: str | None = None,
 ) -> None:
-    """Pre-load fixed 1:1 or custom synthetic exchange rates into Nautilus Cache.
+    """Pre-load declared synthetic exchange rates into the Nautilus ``Cache``.
 
-    Prevents 'insufficient data for USD/USDT' or missing quote map errors when
-    converting portfolio account state between USD and USDT or custom pairs.
+    Also registers the documented USD/USDT stablecoin peg **only when** the run actually
+    converts between USD and USDT (the settlement/base pair). The adapter announces that
+    assumption with a ``UserWarning`` (see :mod:`ube.core.fx`). Callers that declare no
+    rates and need no USD/USDT conversion register nothing — the cache never invents a
+    cross-currency rate (§4.7).
     """
     if cache is None:
         return
@@ -165,13 +169,16 @@ def apply_synthetic_rates(
             Currency,
         )
 
-        # Default USD <-> USDT 1:1 synthetic rate
-        try:
-            cache.add_currency(USD)
-            cache.add_currency(USDT)
-            cache.set_mark_xrate(USD, USDT, 1.0)
-        except Exception:
-            pass
+        _sc = (settlement_currency or "").strip().upper()
+        _bc = (base_currency or "").strip().upper()
+        peg = stablecoin_peg_rate(_sc, _bc)
+        if peg is not None:
+            try:
+                cache.add_currency(USD)
+                cache.add_currency(USDT)
+                cache.set_mark_xrate(USD, USDT, peg)
+            except Exception:
+                pass
 
         if settlement_currency and settlement_currency not in ("USD", "USDT"):
             try:

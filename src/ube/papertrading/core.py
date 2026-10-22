@@ -44,7 +44,7 @@ from ube.core.errors import (
 )
 from ube.core.instrument import Instrument, allows_short
 from ube.core.ledger import EventLedger, EventType, LedgerEvent
-from ube.core.signals import Signals, from_target, neutralize_shorts, validate_long_only
+from ube.core.signals import Signals, from_target, validate_long_only
 
 from .config import PaperConfig
 from .state import OpenPosition, PaperState, step_position_after_fill
@@ -503,14 +503,9 @@ def step(
 
     instrument = config.base.instrument
     asset_class = instrument.asset_class if isinstance(instrument, Instrument) else ""
+    # §4.5/§6.1: a long-only asset class cannot express a short; reject before any
+    # backend work (same validate phase as the backtest adapters).
     validate_long_only(signals, asset_class)
-    # §4.5 long-only gate at the paper front-end: ``crypto_spot``/``stocks`` ignore
-    # short signals entirely — only long entry/exit rows are acted on. Same
-    # ``neutralize_shorts`` the backtest adapters apply, so paper matches backtest: a
-    # short signal can never open, and a bare ``short_entry`` cannot close an open long
-    # (the parallel ``long_exit`` of a flip is preserved).
-    if asset_class and not allows_short(asset_class):
-        signals = neutralize_shorts(signals)
 
     ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
     ts = np.asarray(ts, dtype=np.int64)
@@ -984,11 +979,23 @@ class RecordingBackend(PaperEngine):
                 close_price = float(slipped_price(price, close_side, cost_model.slippage))
                 notional = sim_qty * close_price
                 commission = float(fill_cost(cost_model, notional=notional))
+                close_order_id = f"close-{t}"
+                events.append(
+                    LedgerEvent(
+                        EventType.ORDER_SUBMITTED,
+                        t,
+                        iid,
+                        order_id=close_order_id,
+                        side=close_side,
+                        quantity=sim_qty,
+                    )
+                )
                 events.append(
                     LedgerEvent(
                         EventType.FILL,
                         t,
                         iid,
+                        order_id=close_order_id,
                         side=close_side,
                         quantity=sim_qty,
                         price=close_price,

@@ -28,7 +28,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from ube.core.errors import InvalidInstrumentError
-from ube.core.instrument import Instrument, resolve_funding_interval_hours
+from ube.core.instrument import (
+    Instrument,
+    resolve_funding_interval_hours,
+    resolve_settlement_currency,
+)
 
 __all__ = [
     "BtInstrument",
@@ -172,7 +176,7 @@ def build_instrument(
         if canonical.contract_multiplier is not None
         else 1.0
     )
-    settlement_currency = canonical.settlement_currency or "USD"
+    settlement_currency = resolve_settlement_currency(canonical)
     # §4.5/§24: the funding cadence is asset-class metadata that travels with the instrument
     # (mirroring the nautilus/vectorbt adapters), so the schedule is not silently rewritten.
     # An explicit engine override still wins; otherwise the canonical instrument's

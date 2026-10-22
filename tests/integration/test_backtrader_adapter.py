@@ -757,41 +757,36 @@ def test_run_rejects_row_misaligned_signals():
 
 
 
-def test_backtrader_ignores_short_signals_on_long_only_crypto_spot():
+def test_backtrader_rejects_short_signals_on_long_only_crypto_spot():
     # crypto_spot is the engine's one long-only class (§4.5): shorting is undefined
-    # (nothing to borrow), so the backtrader adapter ignores short_entry/short_exit at
-    # the engine layer even when the caller passes them — only long entries/exits are
-    # acted on. from_target([0, -1, ...]) opens a short at bar 1; the adapter drops it,
-    # so the run completes with zero fills and no short-side events (no signal-gate
-    # error).  (crypto_spot is not a preset, so build the instrument explicitly.)
+    # (nothing to borrow), so a short signal is rejected in the validate phase (§6.1)
+    # rather than silently dropped.  (crypto_spot is not a preset, so build the
+    # instrument explicitly.)
     inst = replace(PRESETS["stocks"].instrument, asset_class="crypto_spot")
     md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
-    result = BacktraderAdapter().run(
-        md,
-        from_target([0, -1, -1, -1, -1, -1]),
-        BacktestConfig(instrument=inst),
-    )
-    assert _fills(result) == []
-    assert len(result.trades) == 0
+    with pytest.raises(InvalidSignalError, match="bar 1.*short_entry"):
+        BacktraderAdapter().run(
+            md,
+            from_target([0, -1, -1, -1, -1, -1]),
+            BacktestConfig(instrument=inst),
+        )
 
 
 
-def test_backtrader_crypto_spot_drops_short_leg_of_flip_keeps_long_exit():
-    # A flip encoding (long held, then short_entry) is legal (§6.2) but its short leg is
-    # dead for a long-only class: the adapter keeps the long_exit (a long-side action)
-    # and drops only short_entry/short_exit, so the long closes normally and no short
-    # ever opens.  [0, 1, 1, 1, -1, -1] emits long_entry at 1, flip long_exit +
-    # short_entry at 4, hold. Backtrader fills one bar later (next-bar-open fills).
+def test_backtrader_rejects_short_leg_of_flip_on_long_only_crypto_spot():
+    # A flip encoding (long held, then short_entry) is legal for shortable classes
+    # (§6.2), but its short leg is invalid on a long-only class. The whole signal set
+    # is rejected in the validate phase — the exit alone is how a long-only caller
+    # must express the close.  [0, 1, 1, 1, -1, -1] emits long_entry at 1 and a flip
+    # (long_exit + short_entry) at 4.
     inst = replace(PRESETS["stocks"].instrument, asset_class="crypto_spot")
     md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
-    result = BacktraderAdapter().run(
-        md,
-        from_target([0, 1, 1, 1, -1, -1]),
-        BacktestConfig(instrument=inst),
-    )
-    fills = _fills(result)
-    assert [e.side for e in fills] == [1, -1]  # one long entry + one long exit
-    assert len(result.trades) == 1  # the long trade, not a short
+    with pytest.raises(InvalidSignalError, match="bar 4.*short_entry"):
+        BacktraderAdapter().run(
+            md,
+            from_target([0, 1, 1, 1, -1, -1]),
+            BacktestConfig(instrument=inst),
+        )
 
 
 

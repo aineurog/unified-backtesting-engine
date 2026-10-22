@@ -52,7 +52,7 @@ import json
 import pickle
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +63,7 @@ from ube.core.benchmark import BenchmarkCurve
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import DataShapeError, UndeclaredConfigError
-from ube.core.instrument import Instrument
+from ube.core.instrument import Instrument, resolve_settlement_currency
 from ube.core.ledger import (
     EquityCurve,
     EventLedger,
@@ -169,6 +169,14 @@ class BacktestResult:
             raise DataShapeError("from_ledger expects an EventLedger")
         if not isinstance(config, BacktestConfig):
             raise DataShapeError("from_ledger expects a BacktestConfig")
+
+        # §4.7: an omitted settlement_currency means "apply the asset-class default".
+        # Resolve it before the ledger views run — the same helper the orchestrator and
+        # adapters use — so a direct adapter run and a ``ube.run`` run normalize to the
+        # same currency instead of the ledger rejecting the raw ``None``.
+        instruments = {
+            iid: _with_resolved_settlement(instr) for iid, instr in instruments.items()
+        }
 
         base_currency = _resolve_base_currency(config, instruments)
 
@@ -324,18 +332,25 @@ def result_hash(result: BacktestResult) -> str:
 # Module-private helpers.
 # ---------------------------------------------------------------------------
 
-#: Per-asset-class default settlement currency used only when neither
-#: ``config.base_currency`` nor ``Instrument.settlement_currency`` is declared (§4.7).
-#: Keeps the minimal ``ube.Instrument(symbol, asset_class=...)`` usage runnable
-#: without forcing a settlement currency on the caller.
-_DEFAULT_SETTLEMENT: Mapping[str, str] = {
-    "crypto_spot": "USDT",
-    "crypto_perp": "USDT",
-    "forex": "USD",
-    "futures": "USD",
-    "stocks": "USD",
-    "commodities": "USD",
-}
+def _with_resolved_settlement(instrument: Instrument) -> Instrument:
+    """Return ``instrument`` with its omitted settlement currency resolved (§4.7).
+
+    The declared currency wins; when omitted, the asset-class default applies via
+    :func:`~ube.core.instrument.resolve_settlement_currency`. The ledger's own
+    normalization is strict about a ``None`` settlement (item 07 contract), so the
+    default is applied here — once, at the result-builder boundary — exactly as
+    ``ube.run`` applies it to the config.
+    """
+    if not isinstance(instrument, Instrument):
+        raise DataShapeError(
+            "from_ledger instruments must be Instrument instances; got "
+            f"{type(instrument).__name__}"
+        )
+    if instrument.settlement_currency is not None:
+        return instrument
+    return replace(
+        instrument, settlement_currency=resolve_settlement_currency(instrument)
+    )
 
 
 def _resolve_base_currency(
@@ -358,16 +373,13 @@ def _resolve_base_currency(
             "silently assume a base currency)"
         )
     only = next(iter(instruments.values()))
-    settlement = only.settlement_currency
-    if settlement is None:
-        # No explicit settlement currency was declared. Rather than raise on the
-        # simplest-usage path (``ube.Instrument(symbol, asset_class=...)`` with no
-        # settlement), fall back to the asset-class default so the equity curve has a
-        # denomination. A single-instrument run keeps a 1:1 identity FX; this only
-        # picks the currency label. ``config.base_currency`` (when declared) still
-        # wins, and portfolio runs still require an explicit base (see above).
-        settlement = _DEFAULT_SETTLEMENT.get(only.asset_class, "USD")
-    return settlement
+    # No explicit base or settlement currency was declared. Rather than raise on the
+    # simplest-usage path (``ube.Instrument(symbol, asset_class=...)`` with no
+    # settlement), resolve the asset-class default so the equity curve has a
+    # denomination. A single-instrument run keeps a 1:1 identity FX; this only picks the
+    # currency label. ``config.base_currency`` (when declared) still wins, and portfolio
+    # runs still require an explicit base (see above).
+    return resolve_settlement_currency(only)
 
 
 def _slice_curve(curve: EquityCurve, n: int) -> EquityCurve:

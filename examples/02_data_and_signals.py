@@ -7,10 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
-import ube
+import ube  # noqa: E402
 
 
 def make_bars() -> pd.DataFrame:
@@ -43,7 +43,8 @@ def main() -> None:
     bars = make_bars()
     market_data = ube.MarketData.from_dataframe(bars, timestamp_col="timestamp")
 
-    target_signals = ube.from_target(np.array([0, 1, 1, 1, 0, 0, -1, -1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
+    target = np.array([0, 1, 1, 1, 0, 0, -1, -1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+    target_signals = ube.from_target(target)
     callable_signals = ube.from_callable(trend_signal, market_data)
 
     print("target signal columns:", target_signals.columns)

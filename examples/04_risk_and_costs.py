@@ -7,10 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
-import ube
+import ube  # noqa: E402
 
 
 def make_bars() -> pd.DataFrame:
@@ -34,7 +34,10 @@ def compute_atr_14(md: ube.MarketData) -> np.ndarray:
     prev_close = np.empty_like(md.close)
     prev_close[0] = md.close[0]
     prev_close[1:] = md.close[:-1]
-    true_range = np.maximum(md.high - md.low, np.maximum(np.abs(md.high - prev_close), np.abs(md.low - prev_close)))
+    true_range = np.maximum(
+        md.high - md.low,
+        np.maximum(np.abs(md.high - prev_close), np.abs(md.low - prev_close)),
+    )
     true_range[0] = md.high[0] - md.low[0]
     kernel = np.ones(14, dtype=float) / 14.0
     return np.convolve(true_range, kernel, mode="same")
@@ -56,7 +59,9 @@ def run_precomputed_atr() -> None:
     signals = ube.from_target(target)
 
     config = ube.BacktestConfig(
-        instrument=ube.Instrument(symbol="XAUUSD", asset_class="commodities", settlement_currency="USD"),
+        instrument=ube.Instrument(
+            symbol="XAUUSD", asset_class="commodities", settlement_currency="USD"
+        ),
         engine=resolve_engine(),
         risk=ube.RiskConfig(
             sizing=ube.SizeModel(kind="fixed_fraction", value=0.10),
@@ -68,7 +73,10 @@ def run_precomputed_atr() -> None:
     result = ube.run(md, signals, config, aux_data={"atr_14h": atr_series})
     print("Precomputed ATR example:")
     print(f"Final equity: {result.equity_curve.equity[-1]:.2f}")
-    print(result.trade_table[["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]].head())
+    table = result.trade_table[
+        ["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]
+    ]
+    print(table.head())
 
 
 def run_engine_computed_atr() -> None:
@@ -78,7 +86,9 @@ def run_engine_computed_atr() -> None:
     signals = ube.from_target(target)
 
     config = ube.BacktestConfig(
-        instrument=ube.Instrument(symbol="XAUUSD", asset_class="commodities", settlement_currency="USD"),
+        instrument=ube.Instrument(
+            symbol="XAUUSD", asset_class="commodities", settlement_currency="USD"
+        ),
         engine=resolve_engine(),
         risk=ube.RiskConfig(
             sizing=ube.SizeModel(kind="fixed_fraction", value=0.10),
@@ -93,7 +103,10 @@ def run_engine_computed_atr() -> None:
     result = ube.run(md, signals, config, aux_data={"atr_14h": md})
     print("Engine-computed ATR example:")
     print(f"Final equity: {result.equity_curve.equity[-1]:.2f}")
-    print(result.trade_table[["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]].head())
+    table = result.trade_table[
+        ["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]
+    ]
+    print(table.head())
 
 
 def main() -> None:

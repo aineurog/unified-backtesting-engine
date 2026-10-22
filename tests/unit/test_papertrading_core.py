@@ -11,6 +11,7 @@ import pytest
 
 from ube.core.config import BacktestConfig, SignalConfig
 from ube.core.data import MarketData
+from ube.core.errors import InvalidSignalError
 from ube.core.instrument import Instrument
 from ube.core.ledger import trades
 from ube.core.signals import from_target
@@ -130,9 +131,9 @@ def test_on_opposite_signal_ignore() -> None:
     assert state.open_position.side == 1
 
 
-def test_long_only_skips_short_signals() -> None:
-    # A crypto_spot instrument is long-only: short signals are gated at the strategy
-    # level (decide_action/actor) — a short_entry on flat skips and never errors.
+def test_long_only_rejects_short_signals() -> None:
+    # A crypto_spot instrument is long-only: a short signal is rejected in the
+    # validate phase (§4.5/§6.1) — never silently skipped.
     data = _data(n_bars=8)
     target = np.array([0, 0, 0, -1, -1, -1, -1, -1])
     signals = from_target(target)
@@ -144,14 +145,13 @@ def test_long_only_skips_short_signals() -> None:
         engine="recording",
     )
     state = init(cfg)
-    step(data, signals, state, cfg)
-    # No short is ever opened on a long-only asset; the run completes flat.
-    assert state.open_position is None
+    with pytest.raises(InvalidSignalError, match="bar 3.*short_entry"):
+        step(data, signals, state, cfg)
 
 
-def test_long_only_short_signal_exits_existing_long() -> None:
-    # A short signal while already long on a long-only asset closes the long (the
-    # §9.3 exit-or-skip gate) instead of reversing into an impossible short.
+def test_long_only_rejects_short_signal_while_long() -> None:
+    # Even when a short signal would merely close an existing long, it is an invalid
+    # long-only encoding: the caller must emit the long_exit instead (§6.1).
     data = _data(n_bars=8)
     target = np.array([1, 1, 1, -1, -1, -1, -1, -1])
     signals = from_target(target)
@@ -163,11 +163,8 @@ def test_long_only_short_signal_exits_existing_long() -> None:
         engine="recording",
     )
     state = init(cfg)
-    step(data, signals, state, cfg)
-    assert state.open_position is None
-    closed = trades(state.ledger, instruments={instr.symbol: instr})
-    assert len(closed) == 1
-    assert closed[0].side == 1
+    with pytest.raises(InvalidSignalError, match="bar 3.*short_entry"):
+        step(data, signals, state, cfg)
 
 
 def test_open_position_recomputed_from_ledger() -> None:

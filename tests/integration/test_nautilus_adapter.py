@@ -1414,7 +1414,7 @@ def test_nautilus_run_rejects_contradictory_signal_entries():
         )
 
 
-def test_nautilus_run_skips_short_on_crypto_spot():
+def test_nautilus_run_rejects_short_on_crypto_spot():
     from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
     from ube.core.config import BacktestConfig
     from ube.core.instrument import Instrument
@@ -1427,10 +1427,9 @@ def test_nautilus_run_skips_short_on_crypto_spot():
         instrument=instr, engine_overrides={"starting_balance": 100000.0}
     )
     # from_target([0, -1, ...]) emits short_entry at bar 1; spot is long-only, so the
-    # shorting gate at the strategy level (§4.5/§6.1) skips it — never a short, and
-    # never an error (mirrors the nautilus reference signals.py gate).
-    result = NautilusAdapter().run(md, from_target([0, -1, -1, -1, -1, -1]), cfg)
-    assert all(e.side >= 0 for e in _fills(result))
+    # validate phase (§4.5/§6.1) rejects the series rather than silently dropping it.
+    with pytest.raises(InvalidSignalError, match="bar 1.*short_entry"):
+        NautilusAdapter().run(md, from_target([0, -1, -1, -1, -1, -1]), cfg)
 
 
 def test_nautilus_engine_exception_wrapped_preserves_cause():

@@ -32,7 +32,9 @@ __all__ = [
     "LONG_ONLY_ASSET_CLASSES",
     "allows_short",
     "DEFAULT_FUNDING_INTERVAL_HOURS",
+    "DEFAULT_SETTLEMENT_BY_ASSET_CLASS",
     "resolve_funding_interval_hours",
+    "resolve_settlement_currency",
 ]
 
 # The asset classes the engine supports. The labels are locked by the per-asset-class
@@ -56,10 +58,38 @@ LONG_ONLY_ASSET_CLASSES: frozenset[str] = frozenset({"crypto_spot"})
 #: nothing because their cost model carries a zero funding rate.
 DEFAULT_FUNDING_INTERVAL_HOURS: float = 8.0
 
+#: Default settlement currency per asset class, applied only when an instrument omits
+#: ``settlement_currency`` (§4.7's "``None`` = apply the asset-class default"). Crypto
+#: settles in the stablecoin it is quoted against; everything else settles in USD. This
+#: is the single definition: the orchestrator, the result builder and every adapter
+#: resolve through :func:`resolve_settlement_currency`, so a direct adapter run and a
+#: ``ube.run`` run cannot disagree about an undeclared settlement currency.
+DEFAULT_SETTLEMENT_BY_ASSET_CLASS: dict[str, str] = {
+    "crypto_spot": "USDT",
+    "crypto_perp": "USDT",
+    "forex": "USD",
+    "futures": "USD",
+    "stocks": "USD",
+    "commodities": "USD",
+}
+
 
 def allows_short(asset_class: str) -> bool:
     """Whether an ``asset_class`` can open a short position (§4.5)."""
     return asset_class not in LONG_ONLY_ASSET_CLASSES
+
+
+def resolve_settlement_currency(instrument: Instrument) -> str:
+    """The settlement currency for ``instrument`` (§4.7).
+
+    The declared ``settlement_currency`` always wins; when it is omitted the asset-class
+    default applies (:data:`DEFAULT_SETTLEMENT_BY_ASSET_CLASS`). Unknown asset classes
+    cannot occur on a constructed ``Instrument`` (validation rejects them), so there is
+    no further fallback to guess.
+    """
+    if instrument.settlement_currency:
+        return instrument.settlement_currency
+    return DEFAULT_SETTLEMENT_BY_ASSET_CLASS[instrument.asset_class]
 
 
 def resolve_funding_interval_hours(instrument: Instrument | None) -> float:

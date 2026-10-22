@@ -12,13 +12,13 @@
    "trades_hash": "32bfbbb590e83ac290d8339bc3a835e0e8c77b53e839fff0c0243d126ef68286"
   },
   "vectorbt": {
-   "final_equity": 0.0,
-   "n_trades": 0,
-   "trades_hash": ""
+   "final_equity": 92040.0,
+   "n_trades": 1,
+   "trades_hash": "32bfbbb590e83ac290d8339bc3a835e0e8c77b53e839fff0c0243d126ef68286"
   }
  },
  "instrument": "GC",
- "locked_at": "2026-09-29",
+ "locked_at": "2026-10-22",
  "strategy": "trivial_long_roundtrip",
  "tolerance": {
   "final_equity_rtol": 1e-06

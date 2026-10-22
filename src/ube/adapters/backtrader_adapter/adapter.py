@@ -53,9 +53,9 @@ from ube.adapters.backtrader_adapter.strategy import (
 from ube.adapters.base import EngineAdapter
 from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel, fill_cost, resolve_cost_model, slipped_price
-from ube.core.data import MarketData
-from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
-from ube.core.instrument import allows_short
+from ube.core.data import MarketData, resolve_price_precision, snap_prices
+from ube.core.errors import ConfigError, DataShapeError, EngineError, InvalidSignalError
+from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
 from ube.core.ledger import (
     EventLedger,
     EventType,
@@ -64,7 +64,7 @@ from ube.core.ledger import (
     funding_payments,
 )
 from ube.core.result import BacktestResult
-from ube.core.signals import Signals, neutralize_shorts, validate_long_only
+from ube.core.signals import Signals, validate_long_only
 
 __all__ = ["BacktraderAdapter"]
 
@@ -84,21 +84,6 @@ _KIND_RANK: dict[EventType, int] = {
 _MARGIN_INIT: float = 0.05
 
 
-def _neutralize_shorts(signals: Signals) -> Signals:
-    """Return ``signals`` with the short leg cleared for a long-only asset class (§4.5).
-
-    ``crypto_spot`` cannot open a short — there is nothing to borrow — so
-    ``short_entry``/``short_exit`` are meaningless for it. Zeroing the columns (rather
-    than rejecting the series, which the strategy/actor layer gates elsewhere) makes the
-    ignore-at-the-engine guarantee caller-independent: a caller that passes short rows
-    (a flip encoding from ``from_target``, a provider that emits both sides, ...) still
-    gets a strict long-only run, and the parallel long-side action of a flip (the
-    ``long_exit``) is preserved so an open long still closes when its exit bar comes.
-    Mirrors the vectorbt adapter's gate exactly.
-    """
-    return neutralize_shorts(signals)
-
-
 def _fx_series_grid(
     overrides: Mapping[str, Any],
     ts_ns: np.ndarray,
@@ -113,6 +98,8 @@ def _fx_series_grid(
     first-declared wins) is turned into a constant-rate ``FXSeries`` on the bar grid, and a
     1:1 USD/USDT pair is auto-seeded when settlement and base differ and are both in
     ``{USD, USDT}`` so common XAUUSD/USDT runs don't raise ``FXRateUnavailableError`` (§4.7).
+    The assumption is announced with a ``UserWarning`` (see :mod:`ube.core.fx`); a declared
+    rate wins.
     """
     raw: dict[str, float] = {}
     for alias in FX_ALIASES:
@@ -125,16 +112,17 @@ def _fx_series_grid(
         key: FXSeries(index=grid, rate=np.full(len(grid), rate))
         for key, rate in raw.items()
     }
-    _sc = (settlement or "").upper()
-    _bc = (base_currency or "").upper()
-    if _sc and _bc and _sc != _bc and {_sc, _bc} == {"USD", "USDT"}:
-        fwd = _sc + _bc
-        inv = _bc + _sc
-        ones = np.ones(len(grid))
-        if fwd not in fx:
-            fx[fwd] = FXSeries(index=grid, rate=ones)
-        if inv not in fx:
-            fx[inv] = FXSeries(index=grid, rate=np.ones(len(grid)))
+    _sc = (settlement or "").strip().upper()
+    _bc = (base_currency or "").strip().upper()
+    peg = stablecoin_peg_rate(_sc, _bc)
+    if peg is not None:
+        seeded = False
+        for key in (_sc + _bc, _bc + _sc):
+            if key not in fx:
+                fx[key] = FXSeries(index=grid, rate=np.full(len(grid), peg))
+                seeded = True
+        if seeded:
+            warn_stablecoin_peg(_sc, _bc, engine="backtrader")
     return fx
 
 
@@ -188,15 +176,9 @@ class BacktraderAdapter(EngineAdapter):
                 f"{data.n_bars}; signal rows must be row-aligned with bars"
             )
 
+        # §4.5/§6.1: a long-only asset class cannot express a short. Validation raises
+        # before any engine work rather than letting the engine silently drop it.
         validate_long_only(signals, config.instrument.asset_class)
-
-        # §4.5 long-only gate at the engine layer (mirrors the vectorbt adapter / nautilus
-        # actor gates): a long-only asset class has nothing to borrow, so shorting is
-        # undefined for it. The adapter ignores short signals entirely here — even when
-        # the caller passes ``short_entry``/``short_exit`` rows, only long entries/exits
-        # are acted on and backtrader can never open a short position.
-        if not allows_short(config.instrument.asset_class):
-            signals = _neutralize_shorts(signals)
 
         overrides = validate_overrides(config.engine_overrides)
         cost_model: CostModel | None = (
@@ -205,6 +187,13 @@ class BacktraderAdapter(EngineAdapter):
             else resolve_cost_model(config.instrument)
         )
         inst = build_instrument(config.instrument, overrides)
+        # §4.5: snap the bars onto the instrument's price grid before anything reads them
+        # — the venue-level adaptation Nautilus performs in ``to_nautilus_bars`` and the
+        # vectorbt adapter in its own entry. Fills, notionals, commissions, funding and
+        # exit levels then all price off the same grid in every engine. The grid is the
+        # wider of the declared tick and the digits the data carries
+        # (``resolve_price_precision``).
+        data = snap_prices(data, resolve_price_precision(data, inst.price_precision))
         instrument_id = config.instrument.symbol
         settlement = inst.settlement_currency
         starting_balance = float(
@@ -320,22 +309,25 @@ class BacktraderAdapter(EngineAdapter):
 
         sorted_events: list[tuple[int, int, int, LedgerEvent]] = []
         seq = 0
-        order_seq = 0
+        # Per-bar order ordinal: ids must be stable when the same bar is replayed in a
+        # later paper-trading window, so they cannot use a run-global counter.
+        order_seq: dict[int, int] = {}
 
-        def _order_submitted(ts: int, side: int, quantity: float) -> None:
-            nonlocal order_seq
-            order_seq += 1
+        def _order_submitted(ts: int, side: int, quantity: float) -> str:
+            order_seq[ts] = order_seq.get(ts, 0) + 1
+            order_id = f"bt-{int(ts)}-{order_seq[ts]}"
             _add(
                 LedgerEvent(
                     EventType.ORDER_SUBMITTED,
                     int(ts),
                     instrument_id,
-                    order_id=f"bt-{order_seq}",
+                    order_id=order_id,
                     side=side,
                     quantity=quantity,
                 ),
                 int(ts),
             )
+            return order_id
 
         def _add(event: LedgerEvent, ts: int) -> None:
             nonlocal seq
@@ -374,7 +366,9 @@ class BacktraderAdapter(EngineAdapter):
             float(carried.side) * float(carried.quantity) if carried is not None else 0.0
         )
         for orec in strat.order_records:
-            _order_submitted(int(bar_ts[orec.submit_bar]), orec.side, orec.quantity)
+            order_id = _order_submitted(
+                int(bar_ts[orec.submit_bar]), orec.side, orec.quantity
+            )
             if orec.fill_bar is None:
                 # Defensive: an order with no fill bar (should not occur — ``stop()``
                 # realizes any final-bar in-flight order at the final close). Book only
@@ -386,6 +380,7 @@ class BacktraderAdapter(EngineAdapter):
                 bar_ts,
                 orec,
                 _add,
+                order_id=order_id,
                 position_after=net,
                 cost_model=cost_model,
                 instrument_id=instrument_id,
@@ -452,6 +447,7 @@ class BacktraderAdapter(EngineAdapter):
         rec: BtOrderRecord,
         _add: Any,
         *,
+        order_id: str,
         position_after: float,
         cost_model: CostModel | None,
         instrument_id: str,
@@ -460,8 +456,11 @@ class BacktraderAdapter(EngineAdapter):
         slip: float,
     ) -> None:
         """One fill's events: cash leg, fill (with reason), commission, position change (§4.6)."""
-        assert rec.fill_bar is not None, "submit-only order records must not reach _fold_fill"
-        assert rec.price is not None, "submit-only order records must not reach _fold_fill"
+        if rec.fill_bar is None or rec.price is None:
+            raise EngineError(
+                "backtrader fold received an order with no fill bar/price; "
+                "submit-only records must be booked as an order submission only"
+            )
         ts = int(bar_ts[rec.fill_bar])
         price = float(slipped_price(rec.price, rec.side, slip))
         notional = rec.quantity * price * multiplier
@@ -481,6 +480,7 @@ class BacktraderAdapter(EngineAdapter):
                 EventType.FILL,
                 ts,
                 instrument_id,
+                order_id=order_id,
                 side=rec.side,
                 quantity=rec.quantity,
                 price=price,

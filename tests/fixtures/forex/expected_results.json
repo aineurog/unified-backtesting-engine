@@ -1,17 +1,6 @@
 {
  "asset_class": "forex",
- "instrument": "EURUSD",
- "strategy": "trivial_long_roundtrip",
- "locked_at": "2026-09-29",
- "tolerance": {
-  "final_equity_rtol": 1e-06
- },
  "engines": {
-  "vectorbt": {
-   "final_equity": 0.0,
-   "n_trades": 0,
-   "trades_hash": ""
-  },
   "backtrader": {
    "final_equity": 99999.981,
    "n_trades": 1,
@@ -21,6 +10,17 @@
    "final_equity": 99999.981,
    "n_trades": 1,
    "trades_hash": "3584d37cbac450f8e0e268db9653910ac12c806295a20b06cde34e6254bbdcc3"
+  },
+  "vectorbt": {
+   "final_equity": 99999.981,
+   "n_trades": 1,
+   "trades_hash": "3584d37cbac450f8e0e268db9653910ac12c806295a20b06cde34e6254bbdcc3"
   }
+ },
+ "instrument": "EURUSD",
+ "locked_at": "2026-10-22",
+ "strategy": "trivial_long_roundtrip",
+ "tolerance": {
+  "final_equity_rtol": 1e-06
  }
 }

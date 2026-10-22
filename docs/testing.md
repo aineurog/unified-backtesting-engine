@@ -33,6 +33,28 @@ identical results. VectorBT, Backtrader, and NautilusTrader have different nativ
 execution models. Always add a focused test for new behavior and run the relevant
 adapter tests.
 
+## Engine parity locks (§16)
+
+Each asset class has one `expected_results.json` holding an `engines` block per
+adapter (`vectorbt`, `nautilus`, `backtrader`). Every block is a real, reviewed
+run — no placeholders — and `tests/parity/test_fixtures.py` fails if one is left
+zeroed.
+
+`tests/parity/_parity.py` is the only definition of the trade-table hash and the
+fixture loader. All three engines run the trivial `trivial_long_roundtrip`
+strategy over the same committed parquet bars and must agree **exactly** on the
+trade count, the trade table hash and the final equity
+(`tests/parity/test_cross_engine_parity.py`). That equality is only meaningful
+because every adapter snaps OHLC onto the instrument's venue price grid before
+running: without `core.snap_prices`, vectorbt would price the raw float64 bar
+while Nautilus prices the rounded venue price, and the reported fills would
+differ in the last float bits. Each engine's own parity file pins it to the
+locked baseline independently.
+
+Engine extras are optional. `tests/conftest.py` collects an engine test module
+only when all of its engines are importable, so an install without extras runs
+the core suite cleanly and each CI engine job runs exactly its own files.
+
 ## Synthetic data
 
 `ube.testing` exposes the seeded generator behind the parity fixtures, so tests

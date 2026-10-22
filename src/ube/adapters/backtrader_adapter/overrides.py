@@ -58,6 +58,9 @@ class BacktraderEngineOverrides(TypedDict, total=False):
     - ``starting_balance`` — account cash in ``base_currency``.
     - ``funding_interval_hours`` — funding cadence; overrides the canonical instrument's
       ``funding_interval_hours`` when provided (default: the instrument metadata, §4.5).
+    - ``price_precision`` — decimal places of the venue's price grid; overrides the
+      canonical ``tick_size`` when provided (default: the tick, §4.5). Mirrors the
+      nautilus/vectorbt adapters, and drives the pre-run price snap (``core.snap_prices``).
     - ``size_precision`` / ``size_increment`` — the asset-class lot grid (decimal places and
       the smallest tradable unit); defaults are asset-class tables in ``instrument_map``.
     - ``account_type`` — ``"margin"`` (the sizing ``leverage`` is honored) or ``"cash"``
@@ -69,6 +72,7 @@ class BacktraderEngineOverrides(TypedDict, total=False):
 
     starting_balance: float
     funding_interval_hours: float
+    price_precision: int
     size_precision: int
     size_increment: float
     account_type: Literal["margin", "cash"]
@@ -193,6 +197,7 @@ def _validate_fx_rates(value: Any, field: str) -> Any:
 _FIELD_VALIDATORS: dict[str, Callable[[Any, str], Any]] = {
     "starting_balance": _require_positive_number,
     "funding_interval_hours": _require_positive_number,
+    "price_precision": _require_nonneg_int,
     "size_precision": _require_nonneg_int,
     "size_increment": _require_positive_number,
     "account_type": _validate_account_type,

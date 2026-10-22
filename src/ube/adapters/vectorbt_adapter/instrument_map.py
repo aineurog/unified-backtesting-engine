@@ -27,14 +27,30 @@ from dataclasses import dataclass
 from typing import Any
 
 from ube.core.errors import InvalidInstrumentError
-from ube.core.instrument import Instrument, resolve_funding_interval_hours
+from ube.core.instrument import (
+    Instrument,
+    resolve_funding_interval_hours,
+    resolve_settlement_currency,
+)
 
 __all__ = [
     "VbtInstrument",
     "build_instrument",
+    "resolve_price_precision",
     "round_to_increment",
     "floor_to_increment",
 ]
+
+#: Default price precision per asset class when ``tick_size`` cannot be used
+#: (mirrors the nautilus/backtrader ``instrument_map`` tables).
+_DEFAULT_PRICE_PRECISION: dict[str, int] = {
+    "crypto_perp": 2,
+    "crypto_spot": 2,
+    "futures": 2,
+    "commodities": 2,
+    "stocks": 2,
+    "forex": 5,
+}
 
 #: Default size precision (decimal places) per asset class.
 _DEFAULT_SIZE_PRECISION: dict[str, int] = {
@@ -62,6 +78,7 @@ class VbtInstrument:
     """The vectorbt-relevant parameters derived from a canonical instrument (§4.5)."""
 
     asset_class: str
+    price_precision: int
     size_precision: int
     size_increment: float
     contract_multiplier: float
@@ -92,6 +109,31 @@ def floor_to_increment(qty: float, increment: float) -> float:
         return float(qty)
     inc = float(increment)
     return math.floor(float(qty) / inc + 1e-9) * inc
+
+
+def _decimal_places(value: float) -> int:
+    """Number of decimal places in ``value`` (e.g. ``0.25 -> 2``, ``0.1 -> 1``)."""
+    text = f"{value:.10f}".rstrip("0").rstrip(".")
+    return len(text.split(".")[1]) if "." in text else 0
+
+
+def resolve_price_precision(
+    canonical: Instrument, overrides: Mapping[str, Any] | None = None
+) -> int:
+    """Resolve the ``price_precision`` (decimal places) of the venue's price grid (§4.5).
+
+    The canonical ``tick_size`` supplies the default, the asset-class table is the
+    fallback when no tick is declared, and an explicit ``price_precision`` override wins
+    — exactly as the nautilus/backtrader maps resolve it, so every engine prices the same
+    bars off the same grid.
+    """
+    overrides = overrides if overrides is not None else {}
+    tick = canonical.tick_size
+    if tick is not None:
+        default_precision = _decimal_places(tick)
+    else:
+        default_precision = _DEFAULT_PRICE_PRECISION[canonical.asset_class]
+    return int(overrides.get("price_precision", default_precision))
 
 
 def build_instrument(
@@ -128,7 +170,7 @@ def build_instrument(
         if canonical.contract_multiplier is not None
         else 1.0
     )
-    settlement_currency = canonical.settlement_currency or "USD"
+    settlement_currency = resolve_settlement_currency(canonical)
     # §4.5/§24: the funding cadence is asset-class metadata that travels with the instrument
     # (mirroring ``resolve_funding_interval_hours`` in the nautilus adapter), so the schedule
     # is not silently rewritten by the adapter defaults. An explicit engine override still
@@ -140,6 +182,7 @@ def build_instrument(
         funding_interval_hours = resolve_funding_interval_hours(canonical)
     return VbtInstrument(
         asset_class=asset_class,
+        price_precision=resolve_price_precision(canonical, overrides),
         size_precision=size_precision,
         size_increment=size_increment,
         contract_multiplier=contract_multiplier,

@@ -47,7 +47,12 @@ from ube.adapters.vectorbt_adapter.overrides import (
 from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel, resolve_cost_model
 from ube.core.data import MarketData
-from ube.core.errors import ConfigError, DataShapeError, InvalidSignalError
+from ube.core.errors import (
+    ConfigError,
+    DataShapeError,
+    IncompatibleConfigError,
+    InvalidSignalError,
+)
 from ube.core.experiment_log import ExperimentLog
 from ube.core.ledger import EventType
 from ube.core.result import BacktestResult
@@ -263,6 +268,23 @@ def test_exit_stop_params_translates_atr_and_take_profit():
     assert sl_trail is None
     assert isinstance(sl_stop, np.ndarray)
     assert sl_stop.shape[0] == md.n_bars
+
+
+def test_exit_stop_params_uses_tightest_take_profit():
+    # vectorbt exposes one ``tp_stop``; the nearest target is the one that can fire.
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    exits = (TakeProfit(0.10), TakeProfit(0.03))
+    _, tp_stop, _ = exit_stop_params(exits, md, None)
+    assert tp_stop == 0.03
+
+
+def test_exit_stop_params_rejects_take_profit_scale_out():
+    # §6.4 partial exits cannot be represented by one vectorbt ``tp_stop``; fail
+    # explicitly instead of silently exiting the whole position at the first target.
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    exits = (TakeProfit(0.02, scale_out=0.5), TakeProfit(0.05, scale_out=0.5))
+    with pytest.raises(IncompatibleConfigError, match="scale-out"):
+        exit_stop_params(exits, md, None)
 
 
 def test_classify_exit_reason_signal_bar():
@@ -763,40 +785,35 @@ def test_vectorbt_run_tolerates_single_bar_data():
     )
 
 
-def test_vectorbt_ignores_short_signals_on_long_only_crypto_spot():
+def test_vectorbt_rejects_short_signals_on_long_only_crypto_spot():
     # crypto_spot is the engine's one long-only class (§4.5): shorting is undefined
-    # (nothing to borrow), so the vectorbt adapter ignores short_entry/short_exit at
-    # the engine layer even when the caller passes them — only long entries/exits are
-    # acted on. from_target([0, -1, ...]) opens a short at bar 1; the adapter drops it,
-    # so the run completes with zero fills and no short-side events (no signal-gate
-    # error).  (crypto_spot is not a preset, so build the instrument explicitly.)
+    # (nothing to borrow), so a short signal is rejected in the validate phase (§6.1)
+    # rather than silently dropped.  (crypto_spot is not a preset, so build the
+    # instrument explicitly.)
     inst = replace(PRESETS["stocks"].instrument, asset_class="crypto_spot")
     md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
-    result = VectorbtAdapter().run(
-        md,
-        from_target([0, -1, -1, -1, -1, -1]),
-        BacktestConfig(instrument=inst),
-    )
-    assert _fills(result) == []
-    assert len(result.trades) == 0
+    with pytest.raises(InvalidSignalError, match="bar 1.*short_entry"):
+        VectorbtAdapter().run(
+            md,
+            from_target([0, -1, -1, -1, -1, -1]),
+            BacktestConfig(instrument=inst),
+        )
 
 
-def test_vectorbt_crypto_spot_drops_short_leg_of_flip_keeps_long_exit():
-    # A flip encoding (long held, then short_entry) is legal (§6.2) but its short leg is
-    # dead for a long-only class: the adapter keeps the long_exit (a long-side action)
-    # and drops only short_entry/short_exit, so the long closes normally and no short
-    # ever opens.  [0, 1, 1, 1, -1, -1] emits long_entry at 1, flip long_exit +
-    # short_entry at 4, hold.
+def test_vectorbt_rejects_short_leg_of_flip_on_long_only_crypto_spot():
+    # A flip encoding (long held, then short_entry) is legal for shortable classes
+    # (§6.2), but its short leg is invalid on a long-only class. The whole signal set
+    # is rejected in the validate phase — the exit alone is how a long-only caller
+    # must express the close.  [0, 1, 1, 1, -1, -1] emits long_entry at 1 and a flip
+    # (long_exit + short_entry) at 4.
     inst = replace(PRESETS["stocks"].instrument, asset_class="crypto_spot")
     md = synthetic_bars(PRESETS["stocks"], seed=3, n_bars=6)
-    result = VectorbtAdapter().run(
-        md,
-        from_target([0, 1, 1, 1, -1, -1]),
-        BacktestConfig(instrument=inst),
-    )
-    fills = _fills(result)
-    assert [e.side for e in fills] == [1, -1]  # one long entry + one long exit
-    assert len(result.trades) == 1  # the long trade, not a short
+    with pytest.raises(InvalidSignalError, match="bar 4.*short_entry"):
+        VectorbtAdapter().run(
+            md,
+            from_target([0, 1, 1, 1, -1, -1]),
+            BacktestConfig(instrument=inst),
+        )
 
 
 def test_vectorbt_short_signals_still_accepted_for_shortable_asset_class():

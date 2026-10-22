@@ -41,13 +41,13 @@ import pandas as pd
 
 from ube.core.data import MarketData
 from ube.core.errors import InvalidSignalError
+from ube.core.instrument import allows_short
 
 __all__ = [
     "SIGNAL_COLUMNS",
     "Signals",
     "from_target",
     "from_callable",
-    "neutralize_shorts",
     "validate_long_only",
 ]
 
@@ -287,40 +287,31 @@ def from_callable(fn: Callable[[MarketData], int], bars: MarketData) -> Signals:
     return from_target(np.asarray(targets))
 
 
-def neutralize_shorts(signals: Signals) -> Signals:
-    """Return ``signals`` with the short leg cleared for a long-only asset class (§4.5).
-
-    ``crypto_spot`` cannot open a short — there is nothing to borrow — so
-    ``short_entry``/``short_exit`` are meaningless for it. Zeroing the columns (rather
-    than rejecting the series, which the strategy/actor layer gates elsewhere) makes the
-    ignore-at-the-engine guarantee caller-independent: a caller that passes short rows
-    (a flip encoding from ``from_target``, a provider that emits both sides, ...) still
-    gets a strict long-only run, and the parallel long-side action of a flip (the
-    ``long_exit``) is preserved so an open long still closes when its exit bar comes.
-
-    Single source of truth for the long-only gate: the vectorbt/backtrader backtest
-    adapters and the paper front-end all apply this so short signals (``crypto_spot``,
-    ``stocks``) can never open, keep, or close a position.
-    """
-    dead = np.zeros(signals.n_bars, dtype=np.bool_)
-    return Signals(
-        long_entry=signals.long_entry,
-        long_exit=signals.long_exit,
-        short_entry=dead,
-        short_exit=dead,
-    )
-
-
 def validate_long_only(signals: Signals, asset_class: str) -> None:
-    """Validate a signal series against a long-only asset class (§4.5).
+    """Reject short signals on a long-only asset class (§4.5, §6.1).
 
-    ``crypto_spot`` is long-only: a ``short_entry`` can never *open* a short, and a
-    ``short_exit`` has no short to close. The gate lives at the strategy level (the
-    paper ``decide_action`` and the nautilus actor both consult ``allows_short`` and
-    already turn a short signal into an exit-of-an-existing-long or a skip), so this
-    function no longer rejects the series — rejecting here would prevent that
-    exit-or-skip handling and contradict the reference shorting gate (backtrader
-    ``strategy.py``/nautilus ``signals.py``). It remains for call-site compatibility
-    and is a no-op for shortable classes; structural validation is left to the caller.
+    ``crypto_spot`` cannot open a short — there is nothing to borrow — so a
+    ``short_entry`` or ``short_exit`` row is meaningless for it. Per §6.1 such a
+    signal is rejected in the validate phase, naming the offending bar; it is never
+    silently dropped. A flip bar (``long_exit`` + ``short_entry``) is rejected too:
+    the short leg is the bug, and the caller must express the exit on its own.
     """
-    return
+    if allows_short(asset_class):
+        return
+    offending = signals.short_entry | signals.short_exit
+    if not offending.any():
+        return
+    bar = int(np.flatnonzero(offending)[0])
+    legs = [
+        name
+        for name, mask in (
+            ("short_entry", signals.short_entry),
+            ("short_exit", signals.short_exit),
+        )
+        if mask[bar]
+    ]
+    raise InvalidSignalError(
+        f"bar {bar}: {'/'.join(legs)} is invalid for long-only asset class "
+        f"'{asset_class}' (no borrow available, §4.5); a short signal is never "
+        "silently ignored"
+    )

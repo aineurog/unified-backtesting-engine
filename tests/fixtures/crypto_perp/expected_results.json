@@ -7,18 +7,18 @@
    "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
   },
   "nautilus": {
-   "final_equity": 91259.9899,
+   "final_equity": 91259.98991624996,
    "n_trades": 1,
    "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
   },
   "vectorbt": {
-   "final_equity": 0.0,
-   "n_trades": 0,
-   "trades_hash": ""
+   "final_equity": 91259.98991624996,
+   "n_trades": 1,
+   "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
   }
  },
  "instrument": "BTC-USDT",
- "locked_at": "2026-09-29",
+ "locked_at": "2026-10-22",
  "strategy": "trivial_long_roundtrip",
  "tolerance": {
   "final_equity_rtol": 1e-06

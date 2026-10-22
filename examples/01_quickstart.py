@@ -7,10 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
-import ube
+import ube  # noqa: E402
 
 
 def make_bars() -> pd.DataFrame:
@@ -51,7 +51,10 @@ def main() -> None:
     result = ube.run(market_data, signals, config)
     print(f"Engine: {config.engine}")
     print(f"Final equity: {result.equity_curve.equity[-1]:.2f}")
-    print(result.trade_table[["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]].head())
+    table = result.trade_table[
+        ["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]
+    ]
+    print(table.head())
 
 
 if __name__ == "__main__":

@@ -7,10 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
-import ube
+import ube  # noqa: E402
 
 
 def make_bars() -> pd.DataFrame:
@@ -30,7 +30,8 @@ def make_bars() -> pd.DataFrame:
 
 def main() -> None:
     bars = make_bars()
-    signals = ube.from_target(np.array([0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]))
+    target = np.array([0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0])
+    signals = ube.from_target(target)
     market_data = ube.MarketData.from_dataframe(bars, timestamp_col="timestamp")
 
     config = ube.BacktestConfig(
@@ -42,7 +43,10 @@ def main() -> None:
 
     result = ube.run(market_data, signals, config)
     print("First rows of trade table:")
-    print(result.trade_table[["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]].head())
+    table = result.trade_table[
+        ["entry_datetime", "exit_datetime", "side", "quantity", "realized_pnl"]
+    ]
+    print(table.head())
     print("Final equity curve value:", result.equity_curve.equity[-1])
     print("Ledger events:", len(result.ledger.events))
 

@@ -69,7 +69,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from decimal import Decimal
-from itertools import chain
 from typing import Any, cast
 
 import numpy as np
@@ -91,14 +90,18 @@ from ube.adapters.nautilus_adapter.overrides import (
 )
 from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel, fill_cost, resolve_cost_model, slipped_price
-from ube.core.data import MarketData, max_price_decimals
+from ube.core.data import MarketData, resolve_price_precision
 from ube.core.errors import (
     ConfigError,
     DataShapeError,
     EngineError,
     InvalidSignalError,
 )
-from ube.core.instrument import resolve_funding_interval_hours
+from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
+from ube.core.instrument import (
+    resolve_funding_interval_hours,
+    resolve_settlement_currency,
+)
 from ube.core.ledger import EventLedger, EventType, FXSeries, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
 from ube.core.signals import Signals, validate_long_only
@@ -320,10 +323,7 @@ class NautilusAdapter(EngineAdapter):
         # the instrument's, so keep that precision, but never let a coarse config tick
         # (e.g. 0.1) round away digits the data actually carries (BTC 2 dp, 0.00329 5 dp).
         instrument_pp = int(build.instrument.price_precision)
-        data_pp = max_price_decimals(
-            chain(data.open, data.high, data.low, data.close),
-            base=instrument_pp,
-        )
+        data_pp = resolve_price_precision(data, instrument_pp)
         if data_pp > instrument_pp:
             fee_overrides = dict(fee_overrides)
             fee_overrides["price_precision"] = data_pp
@@ -335,7 +335,7 @@ class NautilusAdapter(EngineAdapter):
         instrument_id = config.instrument.symbol
         bars, bar_type = to_nautilus_bars(data, build)
         signal_map = to_signal_map(data, signals)
-        settlement = config.instrument.settlement_currency or "USD"
+        settlement = resolve_settlement_currency(config.instrument)
 
         # Cash accounts cannot be leveraged: the reference nautilus_trader forces
         # leverage to 1.0 for cash, so mirror that here (§3.2).
@@ -436,22 +436,22 @@ class NautilusAdapter(EngineAdapter):
         _grid = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
         fx_rates = _synthetic_fx_rates(overrides, _grid)
         # Auto-seed a 1:1 USD/USDT rate when the instrument settles in USD
-        # but the account base currency is USDT (or vice-versa).  USDT is a
-        # USD-pegged stablecoin; assuming parity avoids FXRateUnavailableError
-        # without any live API call.  Only injected when the pair is absent from
-        # the already-declared overrides — explicit rates always win.
-        _sc = str(getattr(config.instrument, "settlement_currency", "") or "")
-        _bc = str(getattr(config, "base_currency", "") or "")
-        if _sc and _bc and _sc != _bc and {_sc.upper(), _bc.upper()} == {"USD", "USDT"}:
-            _fwd = (_sc + _bc).upper()
-            _inv = (_bc + _sc).upper()
-            if _fwd not in fx_rates:
-                _ones = np.ones(len(_grid))
-                fx_rates = dict(fx_rates)  # make mutable copy if needed
-                fx_rates[_fwd] = FXSeries(index=_grid, rate=_ones)
-            if _inv not in fx_rates:
-                fx_rates = dict(fx_rates)
-                fx_rates[_inv] = FXSeries(index=_grid, rate=np.ones(len(_grid)))
+        # but the account base currency is USDT (or vice-versa). USDT is a
+        # USD-pegged stablecoin; the assumption is announced with a UserWarning
+        # (see ube.core.fx) and only fills pairs absent from the already-declared
+        # overrides — explicit rates always win.
+        _sc = settlement.strip().upper()
+        _bc = str(config.base_currency or "").strip().upper()
+        peg = stablecoin_peg_rate(_sc, _bc)
+        if peg is not None:
+            seeded = False
+            fx_rates = dict(fx_rates)
+            for key in (_sc + _bc, _bc + _sc):
+                if key not in fx_rates:
+                    fx_rates[key] = FXSeries(index=_grid, rate=np.full(len(_grid), peg))
+                    seeded = True
+            if seeded:
+                warn_stablecoin_peg(_sc, _bc, engine="nautilus")
         return BacktestResult.from_ledger(
             ledger,
             config,

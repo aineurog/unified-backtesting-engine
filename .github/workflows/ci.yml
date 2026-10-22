@@ -6,9 +6,18 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # §16: core + property tests in one job (fast, no engines).
+  #
+  # This job installs no engine extra, so `tests/conftest.py` does not collect the engine
+  # test modules at all. It therefore exercises exactly the engine-free stack — the core
+  # contract, the property tests, the regression hashes, and the parity lock files, which
+  # are plain JSON and need no engine to validate. It is the only job that runs across all
+  # three supported interpreters.
+  core:
+    name: core (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
@@ -24,5 +33,65 @@ jobs:
         run: ruff check .
       - name: Type check (mypy)
         run: mypy src
+      - name: Test (pytest)
+        run: pytest
+
+  # §16: each engine adapter's integration + parity tests in its own job.
+  #
+  # One engine per job, so a failure names the engine at fault instead of being buried in a
+  # combined run. `tests/conftest.py` collects only the modules whose engines are all
+  # present, which is what makes the same `pytest` invocation mean "this engine's tests"
+  # here — and why the import guard below matters: if the extra failed to install, the suite
+  # would quietly shrink instead of failing.
+  engine:
+    name: ${{ matrix.engine }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: vectorbt
+            extra: vectorbt
+            module: vectorbt
+          - engine: backtrader
+            extra: backtrader
+            module: backtrader
+          - engine: nautilus
+            extra: nautilus
+            module: nautilus_trader
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,${{ matrix.extra }}]"
+      - name: Assert the engine is importable
+        run: python -c "import ${{ matrix.module }}; print('${{ matrix.module }}', getattr(${{ matrix.module }}, '__version__', 'installed'))"
+      - name: Test (pytest)
+        run: pytest
+
+  # §16: cross-engine parity — "the same deterministic strategy through all engines".
+  #
+  # The only job with every engine installed. Two things live here that no other job can
+  # run: the relation *between* engines (the same bars must produce the same trade table in
+  # vectorbt, nautilus and backtrader), and the integration tests that exercise more than
+  # one engine at once (the calendar file parametrizes backtests over all three adapters and
+  # paper trading over vectorbt and nautilus). Without this job both would silently never
+  # execute in CI.
+  all-engines:
+    name: all engines
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,all]"
       - name: Test (pytest)
         run: pytest

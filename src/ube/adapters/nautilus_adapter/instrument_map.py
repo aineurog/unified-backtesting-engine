@@ -49,7 +49,7 @@ from nautilus_trader.model.objects import Currency, Price, Quantity
 
 from ube.adapters.nautilus_adapter.overrides import DEFAULT_VENUE
 from ube.core.errors import InvalidInstrumentError
-from ube.core.instrument import Instrument
+from ube.core.instrument import Instrument, resolve_settlement_currency
 
 __all__ = [
     "NautilusInstrumentBuild",
@@ -139,7 +139,7 @@ def _base_quote(canonical: Instrument) -> tuple[str, str]:
         # convert to the account's USD base (fill/capital failures).
         if quote and quote.isalpha() and len(quote) in (3, 4):
             return base, quote
-    quote = canonical.settlement_currency or "USD"
+    quote = resolve_settlement_currency(canonical)
     if canonical.asset_class == "forex" and symbol.endswith(quote) and len(symbol) > len(quote):
         return symbol[:-len(quote)], quote
     return quote, quote
@@ -307,7 +307,7 @@ def _build_crypto_perp(
     margin_init, margin_maint = _margin(overrides)
     maker_fee, taker_fee = _fees(overrides)
     base, quote = _base_quote(canonical)
-    settlement = canonical.settlement_currency or quote
+    settlement = resolve_settlement_currency(canonical)
     instrument = CryptoPerpetual(
         instrument_id=instrument_id,
         raw_symbol=raw_symbol,

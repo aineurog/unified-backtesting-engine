@@ -25,6 +25,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
+from itertools import chain
 from typing import Any, cast
 
 import numpy as np
@@ -39,6 +40,8 @@ __all__ = [
     "OHLCV_COLUMNS",
     "derive_bar_period_ns",
     "max_price_decimals",
+    "resolve_price_precision",
+    "snap_prices",
 ]
 
 OHLC_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close")
@@ -464,3 +467,67 @@ def max_price_decimals(values: Iterable[Any], base: int = 0) -> int:
                     precision = p
                 break
     return precision
+
+
+def resolve_price_precision(market_data: MarketData, base: int) -> int:
+    """The price precision every engine must use for ``market_data`` (§4.5).
+
+    The instrument declares its venue grid (``tick_size`` -> ``base`` decimal places),
+    but the data may carry *more* digits than that grid — a bar series resolved finer
+    than the config tick (BTC prices at 2 dp against a 0.1 tick). Rounding those away
+    would silently rewrite the prices the run is made of, so the wider of the two wins:
+    the venue grid is the floor, the data's own precision the ceiling.
+
+    This is the single definition of that rule. Every adapter resolves its price
+    precision through it, so the same bars price onto the same grid in every engine —
+    which is what lets §16's cross-engine lock assert equality instead of a tolerance
+    (see :func:`snap_prices`).
+    """
+    return max_price_decimals(
+        chain(market_data.open, market_data.high, market_data.low, market_data.close),
+        base=base,
+    )
+
+
+def snap_prices(market_data: MarketData, price_precision: int) -> MarketData:
+    """Snap OHLC onto the price grid ``price_precision`` decimals wide (§4.5).
+
+    A venue only ever prints prices on its grid, so this is where raw float64 bars
+    become venue prices. It exists because the same input bars must reach every engine
+    as the *same* numbers: without it, a bar stored as ``59995.100000000006`` fills at
+    that value in one engine and at ``59995.1`` (its 1-dp grid value) in another, and
+    the two engines' fill prices, notionals and commissions differ in the last float
+    bits for no economic reason.
+
+    Decimal-place rounding — not an increment multiply — is deliberate: it is the exact
+    operation the Nautilus bar builder performs (``f"{price:.{precision}f}"``), and an
+    increment multiply (``round(p / 0.1) * 0.1``) reintroduces representation error of
+    its own for non-binary ticks like ``0.1``.
+
+    Volume is deliberately untouched: it is a size, not a price, and carries its own
+    (``size_precision``) grid.
+
+    Args:
+        market_data: The canonical bars to snap.
+        price_precision: Decimal places of the target grid, from
+            :func:`resolve_price_precision`.
+
+    Returns:
+        A new :class:`MarketData` with grid-aligned OHLC (``market_data`` is never
+        mutated).
+
+    Raises:
+        ValueError: ``price_precision`` is negative.
+    """
+    if price_precision < 0:
+        raise ValueError(f"price_precision must be >= 0; got {price_precision}")
+    # Finiteness is already a ``MarketData`` construction invariant (``_validate_ohlc``),
+    # so there is nothing to re-check here: every instance in hand has finite prices.
+    return MarketData(
+        open=np.round(market_data.open, price_precision),
+        high=np.round(market_data.high, price_precision),
+        low=np.round(market_data.low, price_precision),
+        close=np.round(market_data.close, price_precision),
+        volume=market_data.volume,
+        index=market_data.index,
+    )

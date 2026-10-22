@@ -7,10 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
-import ube
+import ube  # noqa: E402
 
 
 def make_bars() -> pd.DataFrame:
@@ -30,24 +30,34 @@ def make_bars() -> pd.DataFrame:
 
 def main() -> None:
     ube.ensure_builtin_engines_registered()
-    engines = [name for name in ("backtrader", "vectorbt", "nautilus") if name in ube.registered_engines()]
+    engines = [
+        name
+        for name in ("backtrader", "vectorbt", "nautilus")
+        if name in ube.registered_engines()
+    ]
     if not engines:
         raise RuntimeError("At least one engine must be installed to compare results.")
 
     bars = make_bars()
-    signals = ube.from_target(np.array([0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0]))
+    target = np.array(
+        [0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0]
+    )
+    signals = ube.from_target(target)
     market_data = ube.MarketData.from_dataframe(bars, timestamp_col="timestamp")
 
     print("Comparing engines:", engines)
     for engine in engines:
         config = ube.BacktestConfig(
-            instrument=ube.Instrument(symbol="BTCUSDT", asset_class="crypto_perp", settlement_currency="USDT"),
+            instrument=ube.Instrument(
+                symbol="BTCUSDT", asset_class="crypto_perp", settlement_currency="USDT"
+            ),
             engine=engine,
             risk=ube.RiskConfig(sizing=ube.SizeModel(kind="fixed_units", value=1.0)),
             engine_overrides={"starting_balance": 10_000.0},
         )
         result = ube.run(market_data, signals, config)
-        print(f"{engine:>10}: final_equity={result.equity_curve.equity[-1]:.2f}, trades={len(result.trade_table)}")
+        equity = result.equity_curve.equity[-1]
+        print(f"{engine:>10}: final_equity={equity:.2f}, trades={len(result.trade_table)}")
 
 
 if __name__ == "__main__":

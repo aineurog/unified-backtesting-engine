@@ -7,7 +7,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ube.core.data import MarketData, derive_bar_period_ns
+from ube.core.data import (
+    MarketData,
+    derive_bar_period_ns,
+    resolve_price_precision,
+    snap_prices,
+)
 from ube.core.errors import DataError, DataShapeError
 from ube.testing.synthetic import PRESETS, synthetic_bars
 
@@ -366,3 +371,51 @@ def test_derive_bar_period_ns_single_bar_raises():
     md = synthetic_bars(PRESETS["futures"], n_bars=1)
     with pytest.raises(DataShapeError, match="at least two bars"):
         derive_bar_period_ns(md)
+
+
+# ---------------------------------------------------------------------------
+# Price-grid resolution + snapping (§4.5) — the cross-engine parity hinge.
+# ---------------------------------------------------------------------------
+
+
+def _bars_with_close(close: list[float]) -> MarketData:
+    """A MarketData whose OHLC all carry ``close`` (so grid tests read one series)."""
+    n = len(close)
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    arr = np.asarray(close, dtype=np.float64)
+    return MarketData(open=arr, high=arr, low=arr, close=arr, volume=np.ones(n), index=idx)
+
+
+def test_resolve_price_precision_keeps_the_declared_grid_when_data_is_coarser():
+    # 2 dp of data against a 1 dp instrument grid: the grid is the floor, so it wins.
+    md = _bars_with_close([59995.1, 60047.1])
+    assert resolve_price_precision(md, base=1) == 1
+
+
+def test_resolve_price_precision_widens_for_finer_data():
+    # Data resolved finer than a coarse config tick must not be rounded away (§4.5):
+    # a 0.1 tick (1 dp) with 4 dp of data resolves to 4.
+    md = _bars_with_close([1.0837, 1.0841])
+    assert resolve_price_precision(md, base=1) == 4
+
+
+def test_snap_prices_lands_prices_on_the_grid():
+    md = _bars_with_close([59995.100000000006, 51843.100000000006])
+    snapped = snap_prices(md, 1)
+    assert snapped.close[0] == 59995.1
+    assert snapped.close[1] == 51843.1
+    # The original is never mutated (MarketData is frozen and the arrays are copies).
+    assert md.close[0] != 59995.1
+
+
+def test_snap_prices_leaves_volume_alone():
+    # Volume is a size on its own grid; only prices are snapped.
+    md = _bars_with_close([100.0, 101.0])
+    snapped = snap_prices(md, 0)
+    np.testing.assert_array_equal(snapped.volume, md.volume)
+
+
+def test_snap_prices_rejects_negative_precision():
+    md = _bars_with_close([100.0])
+    with pytest.raises(ValueError, match="price_precision must be >= 0"):
+        snap_prices(md, -1)

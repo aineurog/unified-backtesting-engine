@@ -58,18 +58,18 @@ from ube.adapters.vectorbt_adapter.overrides import (
 )
 from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel, fill_cost, resolve_cost_model, slipped_price
-from ube.core.data import MarketData
+from ube.core.data import MarketData, resolve_price_precision, snap_prices
 from ube.core.errors import (
     ConfigError,
     DataShapeError,
     EngineError,
     InvalidSignalError,
 )
-from ube.core.instrument import allows_short
+from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
 from ube.core.ledger import EventLedger, EventType, FXSeries, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
 from ube.core.risk.sizing import _entry_fee_rate, size_position
-from ube.core.signals import Signals, neutralize_shorts, validate_long_only
+from ube.core.signals import Signals, validate_long_only
 
 __all__ = ["VectorbtAdapter"]
 
@@ -278,7 +278,8 @@ def _fx_series_grid(
 
     A 1:1 USD/USDT pair is auto-seeded when settlement and base differ and are both in
     ``{USD, USDT}``, mirroring the nautilus adapter so runs don't raise
-    ``FXRateUnavailableError`` for the common XAUUSD/USDT case (§4.7).
+    ``FXRateUnavailableError`` for the common XAUUSD/USDT case (§4.7). The assumption is
+    announced with a ``UserWarning`` (see :mod:`ube.core.fx`); a declared rate wins.
     """
     raw: dict[str, float] = {}
     for alias in FX_ALIASES:
@@ -291,32 +292,20 @@ def _fx_series_grid(
         key: FXSeries(index=grid, rate=np.full(len(grid), rate))
         for key, rate in raw.items()
     }
-    # USD/USDT 1:1 auto-seed (mirrors nautilus adapter post-run block).
-    _sc = (settlement or "").upper()
-    _bc = (base_currency or "").upper()
-    if _sc and _bc and _sc != _bc and {_sc, _bc} == {"USD", "USDT"}:
-        fwd = _sc + _bc
-        inv = _bc + _sc
-        ones = np.ones(len(grid))
-        if fwd not in fx:
-            fx[fwd] = FXSeries(index=grid, rate=ones)
-        if inv not in fx:
-            fx[inv] = FXSeries(index=grid, rate=np.ones(len(grid)))
+    # USD/USDT 1:1 auto-seed (mirrors nautilus adapter post-run block). Only pairs
+    # absent from the declared overrides are seeded; the assumption is announced.
+    _sc = (settlement or "").strip().upper()
+    _bc = (base_currency or "").strip().upper()
+    peg = stablecoin_peg_rate(_sc, _bc)
+    if peg is not None:
+        seeded = False
+        for key in (_sc + _bc, _bc + _sc):
+            if key not in fx:
+                fx[key] = FXSeries(index=grid, rate=np.full(len(grid), peg))
+                seeded = True
+        if seeded:
+            warn_stablecoin_peg(_sc, _bc, engine="vectorbt")
     return fx
-
-
-def _neutralize_shorts(signals: Signals) -> Signals:
-    """Return ``signals`` with the short leg cleared for a long-only asset class (§4.5).
-
-    ``crypto_spot`` cannot open a short — there is nothing to borrow — so
-    ``short_entry``/``short_exit`` are meaningless for it. Zeroing the columns (rather
-    than rejecting the series, which the strategy/actor layer gates elsewhere) makes the
-    ignore-at-the-engine guarantee caller-independent: a caller that passes short rows
-    (a flip encoding from ``from_target``, a provider that emits both sides, ...) still
-    gets a strict long-only run, and the parallel long-side action of a flip (the
-    ``long_exit``) is preserved so an open long still closes when its exit bar comes.
-    """
-    return neutralize_shorts(signals)
 
 
 class VectorbtAdapter(EngineAdapter):
@@ -369,15 +358,9 @@ class VectorbtAdapter(EngineAdapter):
                 f"{data.n_bars}; signal rows must be row-aligned with bars"
             )
 
+        # §4.5/§6.1: a long-only asset class cannot express a short. Validation raises
+        # before any engine work rather than letting the engine silently drop it.
         validate_long_only(signals, config.instrument.asset_class)
-
-        # §4.5 long-only gate at the engine layer (mirrors the backtrader strategy /
-        # nautilus actor gates): a long-only asset class has nothing to borrow, so
-        # shorting is undefined for it. The adapter ignores short signals entirely
-        # here — even when the caller passes ``short_entry``/``short_exit`` rows, only
-        # long entries/exits are acted on and vectorbt can never open a short position.
-        if not allows_short(config.instrument.asset_class):
-            signals = _neutralize_shorts(signals)
 
         overrides = validate_overrides(config.engine_overrides)
         cost_model: CostModel = (
@@ -386,6 +369,16 @@ class VectorbtAdapter(EngineAdapter):
             else resolve_cost_model(config.instrument)
         )
         vbt_inst = build_instrument(config.instrument, overrides)
+        # §4.5: snap the bars onto the instrument's price grid before anything reads
+        # them — the venue-level adaptation Nautilus performs in ``to_nautilus_bars``.
+        # Doing it once here means fills, notionals, commissions, funding and exit
+        # levels all price off the same grid the venue would, so the engines agree
+        # exactly on the reported trade table instead of differing in the last float
+        # bits. The grid is the wider of the declared tick and the digits the data
+        # actually carries (``resolve_price_precision``).
+        data = snap_prices(
+            data, resolve_price_precision(data, vbt_inst.price_precision)
+        )
         instrument_id = config.instrument.symbol
         settlement = vbt_inst.settlement_currency
         starting_balance = float(overrides.get("starting_balance", DEFAULT_STARTING_BALANCE))
@@ -520,22 +513,25 @@ class VectorbtAdapter(EngineAdapter):
 
         sorted_events: list[tuple[int, int, int, LedgerEvent]] = []
         seq = 0
-        order_seq = 0
+        # Per-bar order ordinal: ids must be stable when the same bar is replayed in a
+        # later paper-trading window, so they cannot use a run-global counter.
+        order_seq: dict[int, int] = {}
 
-        def _order_submitted(ts: int, side: int, quantity: float) -> None:
-            nonlocal order_seq
-            order_seq += 1
+        def _order_submitted(ts: int, side: int, quantity: float) -> str:
+            order_seq[ts] = order_seq.get(ts, 0) + 1
+            order_id = f"vbt-{int(ts)}-{order_seq[ts]}"
             _add(
                 LedgerEvent(
                     EventType.ORDER_SUBMITTED,
                     int(ts),
                     instrument_id,
-                    order_id=f"vbt-{order_seq}",
+                    order_id=order_id,
                     side=side,
                     quantity=quantity,
                 ),
                 int(ts),
             )
+            return order_id
 
         def _add(event: LedgerEvent, ts: int) -> None:
             nonlocal seq
@@ -666,12 +662,13 @@ class VectorbtAdapter(EngineAdapter):
                 ),
                 int(bar_ts[entry_bar]),
             )
-            _order_submitted(int(bar_ts[entry_bar]), side, size)
+            entry_order_id = _order_submitted(int(bar_ts[entry_bar]), side, size)
             _add(
                 LedgerEvent(
                     EventType.FILL,
                     int(bar_ts[entry_bar]),
                     instrument_id,
+                    order_id=entry_order_id,
                     side=side,
                     quantity=size,
                     price=entry_price,
@@ -724,8 +721,11 @@ class VectorbtAdapter(EngineAdapter):
 
             # Exit ORDER_SUBMITTED (§4.6): mirrors the nautilus actor, which records one
             # per order placed — entry and close/exit alike.
-            if not is_open:
+            exit_order_id = (
                 _order_submitted(int(bar_ts[exit_bar]), -side, size)
+                if not is_open
+                else None
+            )
 
             if not is_open:
                 # Exit fill (with reason) + cash leg + commission + position change.
@@ -745,6 +745,7 @@ class VectorbtAdapter(EngineAdapter):
                         EventType.FILL,
                         int(bar_ts[exit_bar]),
                         instrument_id,
+                        order_id=exit_order_id,
                         side=-side,
                         quantity=size,
                         price=exit_price,

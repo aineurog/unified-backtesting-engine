@@ -6,6 +6,8 @@ Drives a real Nautilus ``TradingNode`` + ``SandboxExecutionClient`` over synthet
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -13,6 +15,7 @@ nautilus = pytest.importorskip("nautilus_trader")
 
 from ube.core.config import BacktestConfig, RiskConfig, SignalConfig  # noqa: E402
 from ube.core.data import MarketData  # noqa: E402
+from ube.core.errors import InvalidSignalError  # noqa: E402
 from ube.core.ledger import EventType, trades  # noqa: E402
 from ube.core.risk.exits import ATRStop, StopLoss, TakeProfit  # noqa: E402
 from ube.core.signals import Signals, from_target  # noqa: E402
@@ -449,35 +452,24 @@ def _crypto_spot_cfg(starting_balance: float = 100_000.0) -> PaperConfig:
     return PaperConfig(base=bc, engine="nautilus", starting_balance=starting_balance)
 
 
-def test_crypto_spot_short_signal_skipped_when_flat() -> None:
-    """Issue A — a short signal on a long-only crypto spot never errors; it skips."""
+def test_crypto_spot_short_signal_rejected_when_flat() -> None:
+    """A short signal on a long-only crypto spot is rejected, never skipped (§6.1)."""
     data = synthetic_bars(PRESETS["crypto_perp"], n_bars=8, seed=1)
     signals = from_target(np.array([0, 0, -1, -1, -1, -1, 0, 0]))
     cfg = _crypto_spot_cfg()
     state = init(cfg)
-    _, events = step(data, signals, state, cfg)
-    assert state.open_position is None
-    fills = [e for e in events if e.event_type == EventType.FILL]
-    assert fills == []
+    with pytest.raises(InvalidSignalError, match="bar 2.*short_entry"):
+        step(data, signals, state, cfg)
 
 
-def test_crypto_spot_short_signal_exits_existing_long() -> None:
-    """Issue A — a short signal while long on a long-only crypto spot closes the long."""
-    instr = _crypto_spot_cfg().base.instrument
+def test_crypto_spot_short_signal_while_long_rejected() -> None:
+    """A short signal while long on a long-only crypto spot is rejected (§6.1)."""
     data = synthetic_bars(PRESETS["crypto_perp"], n_bars=8, seed=1)
     signals = from_target(np.array([1, 1, 1, -1, -1, -1, 0, 0]))
     cfg = _crypto_spot_cfg()
     state = init(cfg)
-    _, events = step(data, signals, state, cfg)
-    assert state.open_position is None
-    fills = [e for e in events if e.event_type == EventType.FILL]
-    assert len(fills) == 2
-    assert fills[0].side == 1
-    assert fills[1].side == -1
-    closed = trades(state.ledger, instruments={instr.symbol: instr})
-    assert len(closed) == 1
-    assert closed[0].side == 1
-    assert closed[0].exit_reason == "signal"
+    with pytest.raises(InvalidSignalError, match="bar 3.*short_entry"):
+        step(data, signals, state, cfg)
 
 
 def _last_saved_equity(db_path: str, run_id: str) -> float:
@@ -562,12 +554,12 @@ def test_account_currency_follows_instrument_currency() -> None:
 
 
 def test_backtest_usd_settlement_with_synthetic_usdt_rate() -> None:
-    """Regression: USD-settled instrument + USDT base works without declared rates.
+    """USD-settled instrument + USDT base: documented peg, announced, overridable.
 
-    The adapter automatically seeds a 1:1 USD/USDT FXSeries so that
-    ``trade_table``/``_fx_rate_at`` never raises ``FXRateUnavailableError`` for
-    the common XAUUSD-style case (USD-settled, USDT account).  Explicit
-    ``synthetic_rates`` declarations still take precedence and also succeed.
+    The adapter seeds a 1:1 USD/USDT FXSeries so ``trade_table``/``_fx_rate_at`` never
+    raise ``FXRateUnavailableError`` for the common XAUUSD-style case (USD-settled,
+    USDT account). The assumption is never silent — it emits a ``UserWarning``. An
+    explicit ``synthetic_rates`` declaration replaces it and warns not at all.
     """
     import ube
 
@@ -584,14 +576,17 @@ def test_backtest_usd_settlement_with_synthetic_usdt_rate() -> None:
             **kw,
         )
 
-    # Auto-seed path: adapter injects 1:1 USD/USDT — no engine_overrides needed.
-    result_auto = ube.run(data, signals, _cfg())
+    # Auto-seed path: adapter injects 1:1 USD/USDT and announces the assumption.
+    with pytest.warns(UserWarning, match="stablecoin peg"):
+        result_auto = ube.run(data, signals, _cfg())
     assert len(result_auto.trades) == 1
 
-    # Explicit override path still works and also returns one trade.
-    result_explicit = ube.run(
-        data, signals, _cfg(engine_overrides={"synthetic_rates": {"USDUSDT": 1.0}})
-    )
+    # Explicit override path still works, returns one trade, and is not an assumption.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result_explicit = ube.run(
+            data, signals, _cfg(engine_overrides={"synthetic_rates": {"USDUSDT": 1.0}})
+        )
     assert len(result_explicit.trades) == 1
 
 

@@ -15,10 +15,9 @@ time exits fill at the bar close; the slice otherwise exits on the signal
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
-import pandas as pd
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide
@@ -31,13 +30,13 @@ from ube.core.cost import fill_cost, slipped_price
 from ube.core.data import MarketData
 from ube.core.errors import DataShapeError
 from ube.core.ledger import EventType, LedgerEvent
+from ube.core.risk.aux import atr_from_aux
 from ube.core.risk.exits import (
     ATRStop,
     ChandelierExit,
     Exit,
     TimeExit,
     TrailingStop,
-    atr,
     exit_level,
     exit_triggered,
     first_reached_exit,
@@ -55,42 +54,6 @@ from .bridge import (
 )
 from .runtime import get_ready_event
 from .signals import SIGNAL_REGISTRY
-
-
-def _ts_ns_int(ts: Any) -> np.ndarray:
-    """Epoch-ns ints for a timestamp index, whatever dtype the caller exposes
-    (the strategy rebuilds MarketData with ``datetime64[ns, UTC]`` timestamps while the
-    aux ``MarketData`` keeps ``int64``; pandas ``reindex`` cannot compare the two dtypes).
-    """
-    idx = pd.Index(np.asarray(ts))
-    if str(idx.dtype).startswith("datetime64"):
-        # pandas may store the aux index at coarser resolution (e.g. datetime64[us]);
-        # the strategy's rebuilt market-data index is int64 ns. Normalize both to ns
-        # so the ffill reindex in ``_atr_from_aux`` aligns instead of collapsing to
-        # the aux's trailing value.
-        return cast(np.ndarray, idx.as_unit("ns").asi8)
-    return np.asarray(idx, dtype=np.int64)
-
-
-def _atr_from_aux(data: MarketData, aux_md: MarketData, period: int) -> np.ndarray:
-    """Main-grid ATR from a raw OHLCV aux ``MarketData`` — mirrors the vectorbt/backtrader
-    adapters (§5.2) so the nautilus paper strategy uses the exact same series.
-
-    ATR is computed on the aux bars and forward-filled onto the strategy's own bar grid
-    (keyed by historical timestamp), then shifted one bar so no bar sees the aux/own bar it
-    is inside (no look-ahead).
-    """
-    atr_aux = atr(aux_md, period)
-    ffill = pd.Series(atr_aux, index=_ts_ns_int(aux_md.timestamps)).reindex(
-        _ts_ns_int(data.timestamps), method="ffill"
-    )
-    out: np.ndarray = ffill.to_numpy(dtype=np.float64)
-    out = np.roll(out, 1)
-    out[0] = np.nan
-    first_valid = int(np.argmax(~np.isnan(out))) if np.any(~np.isnan(out)) else 0
-    if first_valid < out.shape[0]:
-        out[: first_valid + 1] = out[first_valid]
-    return np.where(np.isnan(out), 0.0, out)
 
 
 class UbePaperConfig(StrategyConfig):  # type: ignore[misc]
@@ -406,7 +369,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         """Resolve ``aux_data[name]`` onto the strategy's bar grid for an ATR exit (§5.2).
 
         A ``MarketData`` aux is timestamp-aligned onto the strategy grid via
-        :func:`_atr_from_aux` — it may span more bars than the step window (the
+        :func:`ube.core.risk.aux.atr_from_aux` — it may span more bars than the step window (the
         ATR-warmup pattern) and any resume seed bars fall into the aligned gaps.
 
         A precomputed array aligns with the ``MarketData`` passed to ``step()``
@@ -419,7 +382,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         a precomputed array did not match the cumulative grid.
         """
         if isinstance(raw, MarketData):
-            return _atr_from_aux(md, raw, period)
+            return atr_from_aux(md, raw, period)
         arr = np.asarray(raw, dtype=np.float64)
         if arr.ndim != 1:
             raise DataShapeError(
@@ -919,7 +882,24 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         price = self._slipped(price, close_side)
         notional = qty * price * self._multiplier
         hist = self._hist_ts
+        # No venue order backs this close (the fill lag strands it), so mint a
+        # deterministic synthetic id and book the submission first: every fill must be
+        # traceable to an order (§4.6).
+        seq: dict[int, int] = getattr(self, "_synth_close_seq", {})
+        seq[hist] = seq.get(hist, 0) + 1
+        self._synth_close_seq = seq
+        close_order_id = f"synth-close-{hist}-{seq[hist]}"
 
+        self._events.append(
+            LedgerEvent(
+                EventType.ORDER_SUBMITTED,
+                hist,
+                self._iid,
+                order_id=close_order_id,
+                side=close_side,
+                quantity=qty,
+            )
+        )
         # Cash leg: sell credits, buy debits — same formula as on_order_filled.
         self._events.append(
             cash_movement_event(
@@ -939,7 +919,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 quantity=qty,
                 price=price,
                 notional=notional,
-                order_id="",
+                order_id=close_order_id,
                 exit_reason=exit_reason,
             )
         )
