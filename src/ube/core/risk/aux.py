@@ -38,14 +38,16 @@ def _ns_index(ts: Any) -> pd.Index:
     already int64 nanoseconds (the paper strategy's rebuilt grid). Reindexing only
     aligns them when both sides use the same representation.
     """
+    # ``as_unit`` is present in pandas itself but typed inconsistently across the
+    # pandas-stubs/numpy combinations CI resolves, so each use is conditional.
     if isinstance(ts, pd.DatetimeIndex):
-        return pd.Index(ts.as_unit("ns").asi8)  # type: ignore[attr-defined]
+        return pd.Index(ts.as_unit("ns").asi8)  # type: ignore[attr-defined, unused-ignore]
     idx = pd.Index(np.asarray(ts))
     if isinstance(idx, pd.DatetimeIndex):
-        return pd.Index(idx.as_unit("ns").asi8)  # type: ignore[attr-defined]
+        return pd.Index(idx.as_unit("ns").asi8)  # type: ignore[attr-defined, unused-ignore]
     if str(idx.dtype).startswith("datetime64"):
         dt = cast(pd.DatetimeIndex, idx)
-        return pd.Index(dt.as_unit("ns").asi8)  # type: ignore[attr-defined]
+        return pd.Index(dt.as_unit("ns").asi8)  # type: ignore[attr-defined, unused-ignore]
     return pd.Index(np.asarray(idx, dtype=np.int64))
 
 

@@ -79,7 +79,9 @@ def bar_side(
     data: MarketData, step_ts: np.ndarray, step_value: np.ndarray
 ) -> np.ndarray:
     """Per-bar direction (``+1`` / ``-1`` / ``0``) from the position step series."""
-    return cast(
+    # numpy 2.5+ types np.sign's return, making this cast redundant there; earlier
+    # numpy versions return Any, so the cast is still needed. Accept both.
+    return cast(  # type: ignore[redundant-cast, unused-ignore]
         np.ndarray,
         np.sign(bar_step_grid(step_ts, step_value, bar_timestamps_ns(data))),
     )
