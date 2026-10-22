@@ -31,10 +31,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-vectorbt = ["vectorbt"]
+# vectorbt registers its plotly theme at import. Up to 1.0.0 that template still names
+# `scattermapbox`, which plotly 7 removed, so importing vectorbt crashes. vectorbt 1.1+
+# fixed the template but requires pandas>=3, while nautilus-trader pins pandas<3 — so the
+# all-engines install always resolves vectorbt 1.0.0. Cap plotly in both extras; vectorbt
+# itself accepts any plotly>=4.12, so 6.x is supported everywhere.
+vectorbt = ["vectorbt", "plotly<7"]
 backtrader = ["backtrader"]
 nautilus = ["nautilus-trader"]
-all = ["vectorbt", "backtrader", "nautilus-trader"]
+all = ["vectorbt", "plotly<7", "backtrader", "nautilus-trader"]
 docs = ["mkdocs"]
 dev = [
     "pytest",
@@ -82,10 +87,10 @@ disable_error_code = ["override"]
 module = ["nautilus_trader.*"]
 ignore_missing_imports = true
 
-# backtrader is an optional dependency that ships no type stubs; it is also absent
-# from type-checking environments that haven't installed it.
+# backtrader and vectorbt are optional dependencies that ship no type stubs; they are
+# also absent from the engine-free type-check job.
 [[tool.mypy.overrides]]
-module = ["backtrader", "backtrader.*"]
+module = ["backtrader", "backtrader.*", "vectorbt", "vectorbt.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

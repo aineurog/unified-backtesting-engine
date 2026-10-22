@@ -13,6 +13,7 @@ import pytest
 
 import ube
 import ube.adapters.base as base_mod
+from tests._engines import engine_is_installed
 from ube.adapters import EngineAdapter, get_engine, register_engine, registered_engines
 from ube.adapters.base import _REGISTRY, AUTO_ENGINE_ORDER
 from ube.adapters.nautilus_adapter.overrides import (
@@ -1536,14 +1537,16 @@ def test_ensure_builtin_engines_registered_registers_nautilus():
     ube.ensure_builtin_engines_registered()
     assert ube.get_engine("nautilus") is NautilusAdapter
     # vectorbt is also a builtin adapter, registered when its optional dep is installed.
+    # The adapter module imports without vectorbt (it guards that import), so presence
+    # must be judged by the engine package itself, not by the adapter import.
     # "auto" resolves to the highest-priority registered engine.
-    try:
+    if engine_is_installed("vectorbt"):
         from ube.adapters.vectorbt_adapter.adapter import VectorbtAdapter
-    except ImportError:
-        assert ube.resolve_engine_name("auto") == "nautilus"
-    else:
+
         assert ube.get_engine("vectorbt") is VectorbtAdapter
         assert ube.resolve_engine_name("auto") == "vectorbt"
+    else:
+        assert ube.resolve_engine_name("auto") == "nautilus"
 
 
 def test_ensure_builtin_engines_registered_is_idempotent():

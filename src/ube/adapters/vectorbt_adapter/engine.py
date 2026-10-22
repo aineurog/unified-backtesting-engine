@@ -19,7 +19,7 @@ __all__ = ["build_portfolio", "vbt"]
 # vectorbt is an optional dependency (installed by the user). Guard the import so the module
 # does not hard-fail when the package is absent; callers validate ``vbt is not None`` first.
 try:  # pragma: no cover - exercised only when vectorbt is installed
-    import vectorbt as vbt  # type: ignore[import-untyped]
+    import vectorbt as vbt
 except ImportError:  # pragma: no cover
     vbt = None
 

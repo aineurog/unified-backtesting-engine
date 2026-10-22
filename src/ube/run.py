@@ -30,6 +30,7 @@ Engines are registered lazily (:func:`ensure_builtin_engines_registered`) so tha
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -149,35 +150,58 @@ def _warmup_slice_market_data(md: MarketData, n: int) -> MarketData:
 __all__ = ["run", "ensure_builtin_engines_registered"]
 
 
+def _optional_dependency_installed(module: str) -> bool:
+    """Whether the optional engine package ``module`` is installed.
+
+    The vectorbt/backtrader adapter modules import their engine lazily (guarding the
+    import so ``ube`` stays importable without extras), so a successful adapter import
+    does **not** prove the engine is present. Registration must check the dependency
+    itself — otherwise ``"auto"`` would resolve to an engine whose package is missing and
+    fail at run time instead of falling through to an installed engine.
+    """
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def ensure_builtin_engines_registered() -> None:
     """Register the built-in engine adapters whose dependency is importable (§4.1).
 
-    Nautilus and vectorbt are both implemented and depend on their respective *optional*
-    packages (``nautilus-trader`` and ``vectorbt``). Registration is guarded so ``import ube``
-    never hard-requires either; an adapter whose optional dependency is missing is simply not
-    registered (its ``run`` would raise ``EngineError`` if somehow invoked). Idempotent —
-    re-registering the same class is a no-op — so calling this repeatedly is safe.
+    Nautilus, vectorbt and backtrader are implemented and depend on their respective
+    *optional* packages (``nautilus-trader``, ``vectorbt`` and ``backtrader``).
+    Registration is guarded so ``import ube`` never hard-requires any of them; an adapter
+    whose optional dependency is missing is simply not registered (its ``run`` would raise
+    ``EngineError`` if somehow invoked). Idempotent — re-registering the same class is a
+    no-op — so calling this repeatedly is safe.
     """
-    try:
-        from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
-    except ImportError:
-        pass
-    else:
-        register_engine("nautilus", NautilusAdapter)
-
-    try:
-        from ube.adapters.vectorbt_adapter.adapter import VectorbtAdapter
-    except ImportError:
-        pass
-    else:
-        register_engine("vectorbt", VectorbtAdapter)
-
-    try:
-        from ube.adapters.backtrader_adapter.adapter import BacktraderAdapter
-    except ImportError:
-        pass
-    else:
-        register_engine("backtrader", BacktraderAdapter)
+    for name, module_name, dependency, class_name in (
+        (
+            "nautilus",
+            "ube.adapters.nautilus_adapter.adapter",
+            "nautilus_trader",
+            "NautilusAdapter",
+        ),
+        (
+            "vectorbt",
+            "ube.adapters.vectorbt_adapter.adapter",
+            "vectorbt",
+            "VectorbtAdapter",
+        ),
+        (
+            "backtrader",
+            "ube.adapters.backtrader_adapter.adapter",
+            "backtrader",
+            "BacktraderAdapter",
+        ),
+    ):
+        if not _optional_dependency_installed(dependency):
+            continue
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        register_engine(name, getattr(module, class_name))
 
 
 def _standardize_data(data: object) -> MarketData:

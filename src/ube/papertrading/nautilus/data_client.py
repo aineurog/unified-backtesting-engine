@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from nautilus_trader.live.data_client import MarketDataClient  # type: ignore[attr-defined]
-from nautilus_trader.live.factories import (  # type: ignore[attr-defined]
+from nautilus_trader.live.data_client import (  # type: ignore[attr-defined, unused-ignore]
+    MarketDataClient,
+)
+from nautilus_trader.live.factories import (  # type: ignore[attr-defined, unused-ignore]
     LiveDataClientConfig,
     LiveDataClientFactory,
 )
@@ -186,7 +188,7 @@ class UbeDataClient(MarketDataClient):  # type: ignore[misc]
         return None
 
 
-class UbeDataClientFactory(LiveDataClientFactory):
+class UbeDataClientFactory(LiveDataClientFactory):  # type: ignore[misc, unused-ignore]
     """Node factory creating the ube ``MarketData``-backed data client."""
 
     @staticmethod

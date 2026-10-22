@@ -14,7 +14,10 @@ from typing import Any
 from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
 from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactory
 from nautilus_trader.config import LoggingConfig
-from nautilus_trader.live.node import TradingNode, TradingNodeConfig  # type: ignore[attr-defined]
+from nautilus_trader.live.node import (  # type: ignore[attr-defined, unused-ignore]
+    TradingNode,
+    TradingNodeConfig,
+)
 from nautilus_trader.model.enums import OrderStatus
 
 from .data_client import UbeDataClient, UbeDataClientConfig, UbeDataClientFactory

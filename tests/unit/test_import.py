@@ -56,6 +56,21 @@ def test_signals_submodule_is_exposed():
     assert sig.n_bars == 5
 
 
+def test_ensure_builtin_engines_registered_registers_only_installed_engines():
+    # Registration must follow the *engine package*, not the adapter module: the adapters
+    # import their engine lazily, so importing ``..._adapter.adapter`` succeeds even when
+    # the engine is absent. Registering such an adapter makes "auto" resolve to an engine
+    # that cannot run (this is what broke the nautilus-only CI job).
+    before = set(ube.registered_engines())
+    ube.ensure_builtin_engines_registered()
+    after = set(ube.registered_engines())
+    installed = {
+        name for name in ("vectorbt", "backtrader", "nautilus") if engine_is_installed(name)
+    }
+    assert after - before <= installed
+    assert installed <= after
+
+
 def test_paper_is_not_stubbed():
     # §9 (paper trading) is implemented under ``ube.paper`` and must NOT be a stub. The
     # engine-agnostic front-end (init/step/run_auto) is core, so it is asserted
