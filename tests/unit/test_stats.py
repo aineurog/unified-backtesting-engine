@@ -151,6 +151,27 @@ def test_from_arrays_benchmark_tier_and_positional_alignment() -> None:
     assert "information_ratio" in s.values
 
 
+def test_from_arrays_uses_persisted_returns_when_supplied(monkeypatch) -> None:
+    expected_returns = np.array([0.0, 0.01, -0.02])
+    captured: dict[str, pd.Series] = {}
+    original_compute = stats.compute
+
+    def capture_compute(returns, **kwargs):
+        captured["returns"] = returns.copy()
+        return original_compute(returns, **kwargs)
+
+    monkeypatch.setattr(stats, "compute", capture_compute)
+    result = stats.from_arrays(
+        _index(3),
+        np.array([100.0, 200.0, 50.0]),
+        trades=(),
+        equity_returns=expected_returns,
+    )
+
+    assert "returns" in result.tiers
+    np.testing.assert_allclose(captured["returns"].to_numpy(), expected_returns)
+
+
 def test_with_benchmark_merges_and_keeps_first_wins() -> None:
     rets = _returns(n=60)
     base = stats.compute(rets, periods_per_year=252)
@@ -222,6 +243,49 @@ def test_save_and_load_round_trip(tmp_path) -> None:
     assert stats.load_stats(tmp_path / "missing.db", "run").empty
     with pytest.raises(TypeError, match="StatsResult"):
         stats.save_stats(db, "run", {"not": "a result"})  # type: ignore[arg-type]
+
+
+def test_save_and_load_persists_equity_point_count(tmp_path) -> None:
+    db = tmp_path / "paper.db"
+    snapshot = stats.compute(
+        _returns(n=3),
+        periods_per_year=252,
+        extra_meta={"n_equity_points": 3},
+    )
+    stats.save_stats(db, "run", snapshot, trade_count=2)
+
+    loaded = stats.load_stats(db, "run")
+    assert set(loaded["trade_count"]) == {2}
+    assert set(loaded["n_equity_points"]) == {3}
+
+
+def test_load_stats_migrates_legacy_meta_schema(tmp_path) -> None:
+    import sqlite3
+
+    db = tmp_path / "legacy-stats.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE stats (run_id TEXT NOT NULL, seq INTEGER NOT NULL, "
+        "metric TEXT NOT NULL, value REAL, value_json TEXT, category TEXT, ref TEXT, "
+        "PRIMARY KEY (run_id, seq, metric))"
+    )
+    conn.execute(
+        "CREATE TABLE stats_meta (run_id TEXT NOT NULL, seq INTEGER NOT NULL, "
+        "as_of_ns INTEGER NOT NULL, trade_count INTEGER NOT NULL, periods_per_year REAL, "
+        "tiers TEXT, errors_json TEXT, PRIMARY KEY (run_id, seq))"
+    )
+    conn.execute(
+        "INSERT INTO stats_meta VALUES ('run', 1, 10, 2, 252, 'returns', '{}')"
+    )
+    conn.execute(
+        "INSERT INTO stats VALUES ('run', 1, 'sharpe_ratio', 1.5, NULL, 'risk', NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    loaded = stats.load_stats(db, "run")
+    assert set(loaded["trade_count"]) == {2}
+    assert set(loaded["n_equity_points"]) == {0}
 
 
 def test_enable_switch_round_trip(monkeypatch) -> None:

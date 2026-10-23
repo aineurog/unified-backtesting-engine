@@ -219,7 +219,7 @@ CREATE TABLE IF NOT EXISTS equity (
     run_id    TEXT NOT NULL,
     timestamp INTEGER NOT NULL,
     equity    REAL NOT NULL,
-    returns   REAL NOT NULL,
+    returns   REAL,
     PRIMARY KEY (run_id, timestamp)
 )
 """
@@ -240,6 +240,10 @@ def _ensure_all_tables(conn: sqlite3.Connection) -> None:
     conn.execute(_STRATEGIES_SCHEMA_SQL)
     conn.execute(_TRADES_SCHEMA_SQL)
     conn.execute(_EQUITY_SCHEMA_SQL)
+    equity_columns = conn.execute("PRAGMA table_info(equity)").fetchall()
+    returns_column = next(column for column in equity_columns if column[1] == "returns")
+    if returns_column[3]:
+        _migrate_equity_returns(conn)
     # migrations for old DBs that predate new tables
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE paper_state ADD COLUMN aux_data TEXT")
@@ -247,6 +251,40 @@ def _ensure_all_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE paper_state ADD COLUMN exit_seed TEXT")
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE paper_state ADD COLUMN last_funding_ns INTEGER")
+
+
+def _return_between(current: float, previous: float) -> float | None:
+    """Return the simple period return, or ``None`` when it is undefined."""
+    if not np.isfinite(current) or not np.isfinite(previous) or previous <= 0.0:
+        return None
+    return current / previous - 1.0
+
+
+def _migrate_equity_returns(conn: sqlite3.Connection) -> None:
+    """Make legacy equity returns nullable and replace their placeholder values."""
+    conn.execute("SAVEPOINT equity_returns_migration")
+    try:
+        rows = conn.execute(
+            "SELECT run_id, timestamp, equity FROM equity ORDER BY run_id, timestamp"
+        ).fetchall()
+        conn.execute("ALTER TABLE equity RENAME TO equity_legacy")
+        conn.execute(_EQUITY_SCHEMA_SQL)
+        previous_by_run: dict[str, float] = {}
+        for run_id, timestamp, equity_value in rows:
+            equity = float(equity_value)
+            previous = previous_by_run.get(str(run_id))
+            period_return = 0.0 if previous is None else _return_between(equity, previous)
+            conn.execute(
+                "INSERT INTO equity (run_id, timestamp, equity, returns) VALUES (?, ?, ?, ?)",
+                (run_id, timestamp, equity, period_return),
+            )
+            previous_by_run[str(run_id)] = equity
+        conn.execute("DROP TABLE equity_legacy")
+        conn.execute("RELEASE SAVEPOINT equity_returns_migration")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT equity_returns_migration")
+        conn.execute("RELEASE SAVEPOINT equity_returns_migration")
+        raise
 
 
 def get_or_create_run_id(
@@ -327,13 +365,14 @@ def save_trades(
 def save_equity(
     db_path: str, run_id: str, equity_df: Any
 ) -> None:
-    """Append equity points for run_id (expects DataFrame with timestamp/equity/returns)."""
+    """Append equity points and calculate returns from adjacent persisted equity values."""
     if equity_df is None or len(equity_df) == 0:
         return
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     try:
         _ensure_all_tables(conn)
+        points: list[tuple[int, float]] = []
         for _, r in equity_df.iterrows():
             # timestamp may be int ns or datetime
             raw_ts = r["timestamp"] if "timestamp" in r else r.get("timestamp")
@@ -341,11 +380,42 @@ def save_equity(
                 ts = int(pd.to_datetime(raw_ts, utc=True).value)  # ns
             except Exception:
                 ts = int(raw_ts)  # already int
+            points.append((ts, float(r["equity"])))
+        points.sort(key=lambda point: point[0])
+
+        conn.execute("BEGIN IMMEDIATE")
+        for ts, equity_value in points:
+            previous_row = conn.execute(
+                "SELECT equity FROM equity WHERE run_id = ? AND timestamp < ? "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (run_id, ts),
+            ).fetchone()
+            period_return = (
+                0.0
+                if previous_row is None
+                else _return_between(equity_value, float(previous_row[0]))
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO equity (run_id, timestamp, equity, returns) "
                 "VALUES (?, ?, ?, ?)",
-                (run_id, int(ts), float(r["equity"]), float(r["returns"])),
+                (run_id, ts, equity_value, period_return),
             )
+            next_row = conn.execute(
+                "SELECT timestamp, equity FROM equity WHERE run_id = ? AND timestamp > ? "
+                "ORDER BY timestamp LIMIT 1",
+                (run_id, ts),
+            ).fetchone()
+            if next_row is not None:
+                following_return = _return_between(float(next_row[1]), equity_value)
+                conn.execute(
+                    "UPDATE equity SET returns = ? WHERE run_id = ? AND timestamp = ?",
+                    (following_return, run_id, int(next_row[0])),
+                )
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 
@@ -469,17 +539,11 @@ class PaperState:
             the backend at the end of each ``execute`` and re-applied on resume so trailing /
             ATR exits are not degenerate after a restart (issue C). ``None`` when flat or no
             path-dependent exit needs it.
-        stats_trade_count: Closed trades as of the last persisted statistics snapshot.
-            Session-local (never written to disk): after a restart it reads ``0``, so the
-            first trade close refreshes a snapshot that is already current — a redundant
-            recompute, never a stale one.
-        stats_complete: Whether the last persisted snapshot contained the returns tier.
-            Session-local, like :attr:`stats_trade_count`. ``False`` after a snapshot was
-            taken with a one-point equity grid makes ``step()`` retry the snapshot until the
-            grid is long enough, instead of leaving ``returns`` out of the database for the
-        stats_equity_points: The equity-grid length seen by the last snapshot. Used with
-            :attr:`stats_complete` to retry an incomplete snapshot only when the grid has
-            grown, so a permanently short grid costs one recompute, not one per step.
+        stats_trade_count: Closed trades as of the last snapshot written during this
+            process. Informational only; resume-safe snapshot idempotency is determined
+            from the database.
+        stats_complete: Whether the last in-process snapshot contained the returns tier.
+        stats_equity_points: Equity-grid length used by the last in-process snapshot.
     """
 
     def __init__(
@@ -574,6 +638,7 @@ class PaperState:
         data: MarketData,
         config: BacktestConfig | PaperConfig,
         *,
+        through_ns: int | None = None,
         periods_per_year: float | None = None,
         resample_to: str | None = None,
         return_policy: str = "truncate",
@@ -582,10 +647,9 @@ class PaperState:
         """Compute the four-tier strategy statistics for this session (§10).
 
         The paper path differs from the backtest one only in where the equity comes from:
-        bars are never stored (§9.5), so the returns tier is rebuilt from the equity points
-        persisted by :func:`save_equity` (whose ``returns`` column is a placeholder and is
-        therefore recomputed here), falling back to a ledger-derived curve when no database
-        is attached and ``data`` covers the whole ledger.
+        bars are never stored (§9.5), so its returns tier uses the period returns persisted
+        by :func:`save_equity`. If no persisted curve is available, it falls back to a
+        ledger-derived curve when ``data`` covers the whole ledger.
 
         Args:
             data: Bars for the current window, used to price the exposure tier. A live
@@ -595,6 +659,9 @@ class PaperState:
             config: The run's :class:`~ube.papertrading.config.PaperConfig` (or its inner
                 :class:`~ube.core.config.BacktestConfig`) — the state carries no
                 ``Instrument``, so the caller must supply the config.
+            through_ns: Optional inclusive UTC nanosecond cutoff for the equity grid.
+                Paper snapshots pass the latest closed trade's exit timestamp so later
+                open-position mark-to-market is excluded.
             periods_per_year: Annualisation override; inferred from the equity grid
                 otherwise (§4.9).
             resample_to: Optional pandas offset alias (e.g. ``"1D"``) applied before
@@ -623,21 +690,31 @@ class PaperState:
         equity: np.ndarray = np.zeros(0, dtype=np.float64)
         persisted_index: pd.Index = pd.DatetimeIndex([])
         persisted_equity: np.ndarray = np.zeros(0, dtype=np.float64)
+        persisted_returns: np.ndarray = np.zeros(0, dtype=np.float64)
         if self.db_path:
             persisted = load_equity(self.db_path, run_id)
+            if through_ns is not None and len(persisted):
+                persisted = persisted.loc[
+                    persisted["timestamp"].astype("int64") <= int(through_ns)
+                ]
             if len(persisted):
                 persisted_index = pd.DatetimeIndex(persisted["timestamp"])
                 persisted_equity = np.asarray(persisted["equity"], dtype=np.float64)
+                persisted_returns = np.asarray(persisted["returns"], dtype=np.float64)
         if len(persisted_index) >= 2:
             index, equity = persisted_index, persisted_equity
             equity_source = "persisted"
-            equity_note = "equity points written by step(); returns recomputed here"
+            equity_note = "equity and period returns written by step()"
         else:
             # A one-point grid cannot produce returns. Try the ledger instead — possible
             # whenever the caller supplied the whole history (a one-shot step or a test).
             curve, reason = self._ledger_equity(data, base, instr)
             if curve is not None:
-                index, equity = curve.index, curve.equity
+                if through_ns is not None:
+                    keep = curve.index.asi8 <= int(through_ns)
+                    index, equity = curve.index[keep], curve.equity[keep]
+                else:
+                    index, equity = curve.index, curve.equity
                 equity_source = "ledger"
                 equity_note = "derived from the ledger + supplied bars (no db equity)"
             elif len(persisted_index):
@@ -657,6 +734,7 @@ class PaperState:
             ledger=self.ledger,
             market_data=market_data,
             instruments=instruments,
+            equity_returns=persisted_returns if equity_source == "persisted" else None,
             periods_per_year=periods_per_year,
             resample_to=resample_to,
             return_policy=return_policy,

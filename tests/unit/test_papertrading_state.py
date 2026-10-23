@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import sqlite3
+
+import pandas as pd
 import pytest
 
 from ube.core.errors import StateCorruptionError
 from ube.core.ledger import EventLedger, EventType, LedgerEvent
-from ube.papertrading.state import OpenPosition, PaperState
+from ube.papertrading.state import OpenPosition, PaperState, load_equity, save_equity
 
 
 def _sample_state() -> PaperState:
@@ -108,3 +111,45 @@ def test_empty_ledger_round_trip(tmp_path) -> None:
     assert loaded.last_processed_ns is None
     assert len(loaded.ledger) == 0
     assert loaded.open_position is None
+
+
+def test_save_equity_calculates_and_updates_adjacent_returns(tmp_path) -> None:
+    path = str(tmp_path / "equity.db")
+    save_equity(
+        path,
+        "run",
+        pd.DataFrame(
+            [
+                {"timestamp": 1, "equity": 100.0, "returns": 0.0},
+                {"timestamp": 3, "equity": 110.0, "returns": 0.0},
+            ]
+        ),
+    )
+    save_equity(
+        path,
+        "run",
+        pd.DataFrame([{"timestamp": 2, "equity": 120.0, "returns": 0.0}]),
+    )
+
+    rows = load_equity(path, "run")
+    assert rows["equity"].tolist() == [100.0, 120.0, 110.0]
+    assert rows["returns"].tolist() == pytest.approx([0.0, 0.2, 110.0 / 120.0 - 1.0])
+
+
+def test_load_equity_migrates_legacy_placeholder_returns(tmp_path) -> None:
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE equity (run_id TEXT NOT NULL, timestamp INTEGER NOT NULL, "
+        "equity REAL NOT NULL, returns REAL NOT NULL, PRIMARY KEY (run_id, timestamp))"
+    )
+    conn.executemany(
+        "INSERT INTO equity VALUES ('run', ?, ?, 0.0)",
+        [(1, 100.0), (2, 120.0), (3, 0.0), (4, 50.0)],
+    )
+    conn.commit()
+    conn.close()
+
+    rows = load_equity(path, "run")
+    assert rows["returns"].iloc[:3].tolist() == pytest.approx([0.0, 0.2, -1.0])
+    assert pd.isna(rows["returns"].iloc[3])

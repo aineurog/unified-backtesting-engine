@@ -86,6 +86,7 @@ LOAD_COLUMNS = [
     "seq",
     "as_of_ns",
     "trade_count",
+    "n_equity_points",
     "periods_per_year",
     "tiers",
     "errors_json",
@@ -110,6 +111,7 @@ CREATE TABLE IF NOT EXISTS stats_meta (
     seq              INTEGER NOT NULL,
     as_of_ns         INTEGER NOT NULL,
     trade_count      INTEGER NOT NULL,
+    n_equity_points  INTEGER NOT NULL DEFAULT 0,
     periods_per_year REAL,
     tiers            TEXT,
     errors_json      TEXT,
@@ -540,6 +542,7 @@ def from_arrays(
     equity: np.ndarray,
     *,
     trades: Sequence[Trade],
+    equity_returns: Sequence[float] | None = None,
     ledger: EventLedger | None = None,
     market_data: Mapping[str, MarketData] | None = None,
     instruments: Mapping[str, Any] | None = None,
@@ -561,6 +564,9 @@ def from_arrays(
         index: The equity grid (tz-aware UTC, normally bar timestamps).
         equity: Equity values on that grid, in the run's base currency.
         trades: The closed round-trip trades.
+        equity_returns: Optional returns already calculated and persisted alongside
+            ``equity``. Used directly when the curve is not resampled; for a resampled
+            curve, returns are derived from the resampled equity points.
         ledger: Needed for the exposure tier (position history); ``None`` skips it.
         market_data: ``instrument_id -> MarketData`` bars for pricing the exposure tier.
             A caller that cannot supply full history (a live ``step()`` window) gets
@@ -581,11 +587,24 @@ def from_arrays(
     """
     errors: dict[str, str] = {}
     curve = EquityCurve(index=index, equity=equity)
+    was_resampled = False
     if resample_to is not None:
         try:
             curve = curve.resample(resample_to)
+            was_resampled = True
         except Exception as exc:  # noqa: BLE001 — degrade to the unresampled grid
             errors["resample"] = f"{resample_to!r}: {type(exc).__name__}: {exc}"
+
+    returns_values = curve.returns
+    if equity_returns is not None:
+        persisted_returns = np.asarray(equity_returns, dtype=np.float64)
+        if persisted_returns.ndim != 1 or len(persisted_returns) != len(index):
+            errors["equity_returns"] = (
+                f"expected a one-dimensional array of {len(index)} return(s) aligned "
+                f"to the equity grid, got shape {persisted_returns.shape}"
+            )
+        elif not was_resampled:
+            returns_values = persisted_returns
 
     exposure = None
     notes: dict[str, Any] = {}
@@ -597,7 +616,7 @@ def from_arrays(
         notes.update(dict(extra_meta))
 
     return compute(
-        pd.Series(curve.returns, index=curve.index),
+        pd.Series(returns_values, index=curve.index),
         trades=trades,
         benchmark=benchmark,
         exposure=exposure,
@@ -667,19 +686,21 @@ def save_stats(
     try:
         conn.execute(_STATS_SCHEMA_SQL)
         conn.execute(_STATS_META_SCHEMA_SQL)
+        _ensure_stats_meta_equity_points(conn)
         row = conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM stats_meta WHERE run_id = ?", (run_id,)
         ).fetchone()
         seq = int(row[0]) if row else 1
         ppy = stats.periods_per_year
         conn.execute(
-            "INSERT INTO stats_meta (run_id, seq, as_of_ns, trade_count, periods_per_year, "
-            "tiers, errors_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO stats_meta (run_id, seq, as_of_ns, trade_count, n_equity_points, "
+            "periods_per_year, tiers, errors_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 seq,
                 int(stats.computed_at_ns),
                 int(trade_count),
+                int(stats.meta.get("n_equity_points", 0) or 0),
                 float(ppy) if ppy is not None and math.isfinite(ppy) else None,
                 ",".join(stats.tiers),
                 json.dumps(stats.errors, sort_keys=True),
@@ -726,6 +747,7 @@ def load_stats(
     try:
         conn.execute(_STATS_SCHEMA_SQL)
         conn.execute(_STATS_META_SCHEMA_SQL)
+        _ensure_stats_meta_equity_points(conn)
         target = seq
         if target is None:
             row = conn.execute(
@@ -736,7 +758,7 @@ def load_stats(
             target = int(row[0])
         rows = conn.execute(
             "SELECT s.metric, s.value, s.value_json, s.category, s.ref, m.seq, m.as_of_ns, "
-            "m.trade_count, m.periods_per_year, m.tiers, m.errors_json "
+            "m.trade_count, m.n_equity_points, m.periods_per_year, m.tiers, m.errors_json "
             "FROM stats AS s JOIN stats_meta AS m ON s.run_id = m.run_id AND s.seq = m.seq "
             "WHERE s.run_id = ? AND s.seq = ? ORDER BY s.category, s.metric",
             (run_id, int(target)),
@@ -746,6 +768,15 @@ def load_stats(
         return pd.DataFrame(rows, columns=LOAD_COLUMNS)
     finally:
         conn.close()
+
+
+def _ensure_stats_meta_equity_points(conn: sqlite3.Connection) -> None:
+    """Add the equity-grid size needed to resume incomplete snapshot retries."""
+    columns = conn.execute("PRAGMA table_info(stats_meta)").fetchall()
+    if not any(column[1] == "n_equity_points" for column in columns):
+        conn.execute(
+            "ALTER TABLE stats_meta ADD COLUMN n_equity_points INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 # ---------------------------------------------------------------------------

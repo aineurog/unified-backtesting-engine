@@ -675,24 +675,48 @@ def step(
                         [{"timestamp": int(ts[-1]), "equity": float(bal), "returns": 0.0}]
                     )
                     save_equity(db_path, run_id, eq_df)
-                    # §10: refresh the persisted strategy statistics on a trade close. The
-                    # equity point above was just written, so the snapshot reads it; the
-                    # closed-trade count is what makes the refresh idempotent for steps
-                    # that book nothing new. An earlier snapshot taken on a one-point grid
-                    # has no returns tier, so it is retried until the grid grows past it.
-                    # Failures stay inside this try/except like the rest of the block.
+                    # §10: refresh statistics only when new trades exist, or when a prior
+                    # incomplete snapshot can be retried against a larger equity grid.
                     closed_trades = len(tlist)
-                    seen_trades = int(getattr(state, "stats_trade_count", 0) or 0)
-                    retry_partial = (
-                        seen_trades > 0
-                        and not bool(getattr(state, "stats_complete", True))
-                        and len(load_equity(db_path, run_id))
-                        > int(getattr(state, "stats_equity_points", 0) or 0)
+                    latest_closed_trade_ns = (
+                        max(int(trade.exit_timestamp) for trade in tlist) if tlist else None
                     )
-                    if closed_trades > seen_trades or retry_partial:
+                    from ube.stats import load_stats as _load_stats
+
+                    latest_stats = _load_stats(db_path, run_id)
+                    if latest_stats.empty:
+                        seen_trades = 0
+                        seen_equity_points = 0
+                        stats_complete = True
+                    else:
+                        latest_meta = latest_stats.iloc[0]
+                        seen_trades = int(latest_meta["trade_count"])
+                        seen_equity_points = int(latest_meta["n_equity_points"])
+                        stats_complete = "returns" in str(latest_meta["tiers"]).split(",")
+                    equity_history = load_equity(db_path, run_id)
+                    if latest_closed_trade_ns is not None:
+                        equity_points_through_close = int(
+                            (
+                                equity_history["timestamp"].astype("int64")
+                                <= latest_closed_trade_ns
+                            ).sum()
+                        )
+                    else:
+                        equity_points_through_close = 0
+                    retry_partial = (
+                        not stats_complete
+                        and equity_points_through_close > seen_equity_points
+                    )
+                    if closed_trades > seen_trades or (
+                        closed_trades == seen_trades and retry_partial
+                    ):
                         from ube.stats import save_stats as _save_stats
 
-                        snapshot = state.stats(data, config)
+                        snapshot = state.stats(
+                            data,
+                            config,
+                            through_ns=latest_closed_trade_ns,
+                        )
                         _save_stats(db_path, run_id, snapshot, trade_count=closed_trades)
                         state.stats_trade_count = closed_trades
                         state.stats_complete = "returns" in snapshot.tiers

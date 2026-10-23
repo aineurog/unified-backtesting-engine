@@ -301,7 +301,7 @@ Persist one append-only snapshot; returns its `seq`.
 
 Read a snapshot as one row per metric (latest when `seq` is omitted). Columns:
 `metric`, `value`, `value_json`, `category`, `ref`, `seq`, `as_of_ns`,
-`trade_count`, `periods_per_year`, `tiers`, `errors_json`.
+`trade_count`, `n_equity_points`, `periods_per_year`, `tiers`, `errors_json`.
 
 ### `ube.stats.set_enabled(enabled) -> None` / `is_enabled() -> bool`
 

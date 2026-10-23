@@ -12,8 +12,10 @@ import pytest
 
 pytest.importorskip("nautilus_trader")
 
+import ube.papertrading.state as paper_state_module  # noqa: E402
 from ube.core.config import BacktestConfig, SignalConfig  # noqa: E402
 from ube.core.data import MarketData  # noqa: E402
+from ube.core.ledger import trades as ledger_trades  # noqa: E402
 from ube.core.signals import Signals, from_target  # noqa: E402
 from ube.papertrading import init, step  # noqa: E402
 from ube.papertrading.config import PaperConfig  # noqa: E402
@@ -86,6 +88,35 @@ def test_step_persists_stats_snapshot_on_trade_close(tmp_path) -> None:
     assert set(load_stats(db, "default", seq=1)["trade_count"]) == {1}
 
 
+def test_stats_snapshot_equity_stops_at_latest_closed_trade(tmp_path) -> None:
+    md, sig, cfg, state = _setup(tmp_path)
+    db = str(tmp_path / "paper.db")
+    closed_on = _drive(md, sig, cfg, state, until_trades=1)
+
+    # Continue into the next open position without closing another trade.
+    for n in range(closed_on + 1, min(closed_on + 4, md.n_bars + 1)):
+        step(
+            _slice_md(md, slice(n - 1, n)),
+            _slice_signals(sig, slice(n - 1, n)),
+            state,
+            cfg,
+        )
+
+    assert state.open_position is not None
+    closed = ledger_trades(
+        state.ledger,
+        {cfg.base.instrument.symbol: cfg.base.instrument},
+    )
+    latest_exit_ns = max(trade.exit_timestamp for trade in closed)
+    equity = load_equity(db, "default")
+    equity_ns = equity["timestamp"].astype("int64")
+    expected_snapshot_points = int((equity_ns <= latest_exit_ns).sum())
+    assert len(equity) > expected_snapshot_points
+
+    snapshot = load_stats(db, "default")
+    assert set(snapshot["n_equity_points"]) == {expected_snapshot_points}
+
+
 def test_snapshot_is_not_rewritten_when_no_trade_closes(tmp_path) -> None:
     md, _, cfg, state = _setup(tmp_path)
     db = str(tmp_path / "paper.db")
@@ -100,15 +131,52 @@ def test_snapshot_is_not_rewritten_when_no_trade_closes(tmp_path) -> None:
     assert int(load_stats(db, "default")["seq"].iloc[0]) == 1
 
 
-def test_state_stats_rebuilds_returns_from_persisted_equity(tmp_path) -> None:
+def test_resume_does_not_write_duplicate_trade_count_snapshot(tmp_path) -> None:
+    md, sig, cfg, state = _setup(tmp_path)
+    db = str(tmp_path / "paper.db")
+    closed_on = _drive(md, sig, cfg, state, until_trades=1)
+    assert state.stats_trade_count == 1
+
+    resumed = type(state).load(db, run_id="default")
+    resumed.db_path = db
+    resumed.run_id = "default"
+    no_new_trades = from_target(np.zeros(md.n_bars, dtype=np.int64))
+    for n in range(closed_on + 1, md.n_bars + 1):
+        step(
+            _slice_md(md, slice(n - 1, n)),
+            _slice_signals(no_new_trades, slice(n - 1, n)),
+            resumed,
+            cfg,
+        )
+
+    latest = load_stats(db, "default")
+    assert int(latest["seq"].iloc[0]) == 1
+    assert set(latest["trade_count"]) == {1}
+
+
+def test_state_stats_uses_returns_persisted_with_equity(tmp_path, monkeypatch) -> None:
     md, sig, cfg, state = _setup(tmp_path)
     db = str(tmp_path / "paper.db")
     _drive(md, sig, cfg, state, until_trades=1)
 
+    equity = load_equity(db, "default")
+    equity_values = equity["equity"].to_numpy()
+    expected_returns = np.r_[0.0, equity_values[1:] / equity_values[:-1] - 1.0]
+    np.testing.assert_allclose(equity["returns"].to_numpy(), expected_returns)
+
+    captured: dict[str, np.ndarray] = {}
+    original_from_arrays = paper_state_module.stats_from_arrays
+
+    def capture_from_arrays(*args, **kwargs):
+        captured["returns"] = np.asarray(kwargs["equity_returns"])
+        return original_from_arrays(*args, **kwargs)
+
+    monkeypatch.setattr(paper_state_module, "stats_from_arrays", capture_from_arrays)
     snapshot = state.stats(md, cfg)
     assert isinstance(snapshot, StatsResult)
     assert snapshot.meta["equity_source"] == "persisted"
     assert snapshot.meta["n_equity_points"] == len(load_equity(db, "default"))
+    np.testing.assert_allclose(captured["returns"], expected_returns)
     assert "returns" in snapshot.tiers
     assert "benchmark" not in snapshot.tiers  # no benchmark is attached in paper mode
     assert snapshot.n_metrics > 0

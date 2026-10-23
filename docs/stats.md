@@ -49,13 +49,21 @@ Methods: `get(name, default=None)`, `category(name)`, `table()`, `to_dict()`,
 
 ## Paper trading
 
-Paper sessions have no bars stored, so `PaperState.stats()` rebuilds the returns
-tier from the equity points written by `step()`:
+Paper sessions have no bars stored, so `step()` persists each equity point and its
+simple return relative to the preceding saved equity point. The first point has a
+return of `0.0` because no preceding point exists; if the preceding equity is
+non-positive, the return is undefined and stored as `NULL`. `PaperState.stats()`
+uses these persisted returns directly:
 
 ```python
 snapshot = state.stats(data, config)     # PaperConfig or its inner BacktestConfig
 snapshot.meta["equity_source"]           # 'persisted' | 'ledger' | 'none'
 ```
+
+For a resampled stats request, returns are recalculated from the resampled equity
+grid so they represent the requested longer period. Existing databases with the
+old `returns NOT NULL` placeholder column are migrated on access: their returns
+are reconstructed from adjacent equity values.
 
 `step()` also persists a snapshot on every trade close into two append-only
 tables in the session database:
@@ -63,7 +71,7 @@ tables in the session database:
 | Table | Columns |
 |---|---|
 | `stats` | `run_id`, `seq`, `metric`, `value`, `value_json`, `category`, `ref` |
-| `stats_meta` | `run_id`, `seq`, `as_of_ns`, `trade_count`, `periods_per_year`, `tiers`, `errors_json` |
+| `stats_meta` | `run_id`, `seq`, `as_of_ns`, `trade_count`, `n_equity_points`, `periods_per_year`, `tiers`, `errors_json` |
 
 ```python
 from ube.stats import load_stats
@@ -72,9 +80,15 @@ latest = load_stats("paper.db", "default")           # newest snapshot, one row 
 previous = load_stats("paper.db", "default", seq=1)  # an earlier snapshot
 ```
 
-Snapshots are written only when the closed-trade count changes (or when an
-earlier snapshot was taken before enough equity points existed to compute
-returns), so a session that books no trades does not rewrite the database.
+Snapshots are written only when the closed-trade count increases, or when an
+incomplete snapshot can be retried after the equity grid grows. The latest
+persisted snapshot controls this check, so resuming a process does not create
+duplicate snapshots for an unchanged trade count. `n_equity_points` records the
+grid size used by that snapshot; existing databases are migrated to add the column.
+Snapshot returns and equity-based metrics are capped at the equity point matching
+the latest closed trade's exit timestamp. Later points still accumulate in the
+`equity` table, but open-position mark-to-market after that close is excluded from
+the saved snapshot until another trade closes.
 
 ## Assembly API
 
