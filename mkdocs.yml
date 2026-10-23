@@ -17,6 +17,7 @@ nav:
       - NautilusTrader: engines/nautilus.md
   - Paper trading: paper-trading.md
   - Results and ledger: results-ledger.md
+  - Statistics: stats.md
   - Troubleshooting: troubleshooting.md
   - API reference: api-reference.md
   - Tutorials: tutorials.md

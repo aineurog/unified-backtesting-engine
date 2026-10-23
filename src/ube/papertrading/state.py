@@ -19,14 +19,28 @@ import json
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 
+from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import StateCorruptionError
-from ube.core.ledger import EventLedger, EventType, LedgerEvent
+from ube.core.instrument import Instrument, resolve_settlement_currency
+from ube.core.ledger import (
+    EquityCurve,
+    EventLedger,
+    EventType,
+    LedgerEvent,
+    equity_curve,
+    trades,
+)
+from ube.stats import StatsResult
+from ube.stats import from_arrays as stats_from_arrays
+
+if TYPE_CHECKING:
+    from ube.papertrading.config import PaperConfig
 
 __all__ = [
     "ExitSeed",
@@ -455,6 +469,17 @@ class PaperState:
             the backend at the end of each ``execute`` and re-applied on resume so trailing /
             ATR exits are not degenerate after a restart (issue C). ``None`` when flat or no
             path-dependent exit needs it.
+        stats_trade_count: Closed trades as of the last persisted statistics snapshot.
+            Session-local (never written to disk): after a restart it reads ``0``, so the
+            first trade close refreshes a snapshot that is already current — a redundant
+            recompute, never a stale one.
+        stats_complete: Whether the last persisted snapshot contained the returns tier.
+            Session-local, like :attr:`stats_trade_count`. ``False`` after a snapshot was
+            taken with a one-point equity grid makes ``step()`` retry the snapshot until the
+            grid is long enough, instead of leaving ``returns`` out of the database for the
+        stats_equity_points: The equity-grid length seen by the last snapshot. Used with
+            :attr:`stats_complete` to retry an incomplete snapshot only when the grid has
+            grown, so a permanently short grid costs one recompute, not one per step.
     """
 
     def __init__(
@@ -472,6 +497,9 @@ class PaperState:
         last_funding_ns: int | None = None,
         run_id: str | None = None,
         db_path: str | None = None,
+        stats_trade_count: int = 0,
+        stats_complete: bool = True,
+        stats_equity_points: int = 0,
     ) -> None:
         self.instrument_id = instrument_id
         self.ledger = ledger
@@ -488,6 +516,9 @@ class PaperState:
         self.last_funding_ns: int | None = last_funding_ns
         self.run_id: str | None = run_id
         self.db_path: str | None = db_path
+        self.stats_trade_count = int(stats_trade_count)
+        self.stats_complete = bool(stats_complete)
+        self.stats_equity_points = int(stats_equity_points)
 
     def window_start_ns(self, *, warmup_ns: int = 0) -> int:
         """The int64-ns start of the context window this engine needs to resume (§6.1).
@@ -533,6 +564,143 @@ class PaperState:
         if not isinstance(data, dict):
             raise StateCorruptionError("config_ref YAML must be a mapping")
         return data
+
+    # ------------------------------------------------------------------
+    # Statistics (§10 — StratStat, same four tiers as a backtest).
+    # ------------------------------------------------------------------
+
+    def stats(
+        self,
+        data: MarketData,
+        config: BacktestConfig | PaperConfig,
+        *,
+        periods_per_year: float | None = None,
+        resample_to: str | None = None,
+        return_policy: str = "truncate",
+        rf: float = 0.0,
+    ) -> StatsResult:
+        """Compute the four-tier strategy statistics for this session (§10).
+
+        The paper path differs from the backtest one only in where the equity comes from:
+        bars are never stored (§9.5), so the returns tier is rebuilt from the equity points
+        persisted by :func:`save_equity` (whose ``returns`` column is a placeholder and is
+        therefore recomputed here), falling back to a ledger-derived curve when no database
+        is attached and ``data`` covers the whole ledger.
+
+        Args:
+            data: Bars for the current window, used to price the exposure tier. A live
+                slice that starts after the run began cannot represent full-history
+                exposure, so the tier is skipped and recorded in ``errors`` rather than
+                silently reporting a partial book.
+            config: The run's :class:`~ube.papertrading.config.PaperConfig` (or its inner
+                :class:`~ube.core.config.BacktestConfig`) — the state carries no
+                ``Instrument``, so the caller must supply the config.
+            periods_per_year: Annualisation override; inferred from the equity grid
+                otherwise (§4.9).
+            resample_to: Optional pandas offset alias (e.g. ``"1D"``) applied before
+                annualisation.
+            return_policy: How insolvent ``NaN`` returns are handled; see
+                :func:`ube.stats.compute`.
+            rf: Risk-free rate passed through to stratstat.
+
+        Returns:
+            A frozen :class:`~ube.stats.StatsResult` — every failure lands in its
+            ``errors`` mapping instead of raising, exactly like the backtest path.
+        """
+        inner = getattr(config, "base", None)
+        base: BacktestConfig | PaperConfig = inner if isinstance(inner, BacktestConfig) else config
+        if not isinstance(base, BacktestConfig):
+            raise TypeError("stats() needs a BacktestConfig or a PaperConfig carrying one")
+        instrument = getattr(base, "instrument", None)
+        instr = instrument if isinstance(instrument, Instrument) else None
+        instruments = {self.instrument_id: instr} if instr is not None else {}
+        market_data = {self.instrument_id: data} if instr is not None else {}
+        run_id = self.run_id or "default"
+
+        equity_source = "none"
+        equity_note = "no persisted equity points and no ledger-covered bars"
+        index: pd.Index = pd.DatetimeIndex([])
+        equity: np.ndarray = np.zeros(0, dtype=np.float64)
+        persisted_index: pd.Index = pd.DatetimeIndex([])
+        persisted_equity: np.ndarray = np.zeros(0, dtype=np.float64)
+        if self.db_path:
+            persisted = load_equity(self.db_path, run_id)
+            if len(persisted):
+                persisted_index = pd.DatetimeIndex(persisted["timestamp"])
+                persisted_equity = np.asarray(persisted["equity"], dtype=np.float64)
+        if len(persisted_index) >= 2:
+            index, equity = persisted_index, persisted_equity
+            equity_source = "persisted"
+            equity_note = "equity points written by step(); returns recomputed here"
+        else:
+            # A one-point grid cannot produce returns. Try the ledger instead — possible
+            # whenever the caller supplied the whole history (a one-shot step or a test).
+            curve, reason = self._ledger_equity(data, base, instr)
+            if curve is not None:
+                index, equity = curve.index, curve.equity
+                equity_source = "ledger"
+                equity_note = "derived from the ledger + supplied bars (no db equity)"
+            elif len(persisted_index):
+                index, equity = persisted_index, persisted_equity
+                equity_source = "persisted_partial"
+                equity_note = (
+                    f"only {len(persisted_index)} equity point(s) persisted and the supplied "
+                    "bars do not span the ledger, so the returns tier is unavailable"
+                )
+            else:
+                equity_note = reason
+
+        return stats_from_arrays(
+            index,
+            equity,
+            trades=trades(self.ledger, instruments=instruments) if instruments else (),
+            ledger=self.ledger,
+            market_data=market_data,
+            instruments=instruments,
+            periods_per_year=periods_per_year,
+            resample_to=resample_to,
+            return_policy=return_policy,
+            rf=rf,
+            extra_meta={
+                "equity_source": equity_source,
+                "equity_note": equity_note,
+                "instrument_resolved": instr is not None,
+                "n_equity_points": int(len(index)),
+            },
+        )
+
+    def _ledger_equity(
+        self, data: MarketData, base: BacktestConfig, instr: Instrument | None
+    ) -> tuple[EquityCurve | None, str]:
+        """Derive the equity curve from the ledger + ``data`` when no db points exist.
+
+        Only possible when ``data`` spans the whole ledger: mark-to-market needs a bar for
+        every event, and a live ``step()`` window never has one. Returns the curve, or
+        ``(None, reason)`` when that is impossible.
+        """
+        if instr is None:
+            return None, "config did not resolve to an Instrument"
+        if not self.ledger.events:
+            return None, "the ledger is empty"
+        ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
+        first = min(int(e.timestamp) for e in self.ledger.events)
+        last = max(int(e.timestamp) for e in self.ledger.events)
+        if int(ts[0]) > first or int(ts[-1]) < last:
+            return None, (
+                "the supplied bars do not span the ledger "
+                f"({int(ts[0])}..{int(ts[-1])} vs {first}..{last})"
+            )
+        base_currency = base.base_currency or resolve_settlement_currency(instr)
+        try:
+            curve = equity_curve(
+                self.ledger,
+                {self.instrument_id: data},
+                {self.instrument_id: instr},
+                base_currency=base_currency,
+            )
+        except Exception as exc:  # noqa: BLE001 — a derivable curve is a bonus, not a contract
+            return None, f"ledger equity derivation failed: {type(exc).__name__}: {exc}"
+        return curve, ""
 
     # ------------------------------------------------------------------
     # Persistence.

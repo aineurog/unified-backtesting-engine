@@ -42,6 +42,26 @@ complete curve across missing bar history. A persistence failure should be
 verified from the database; persistence exceptions in the `step` path are not
 always surfaced to callers.
 
+## Statistics
+
+`step()` persists a statistics snapshot (same four tiers as a backtest) into the
+session database whenever a trade closes, and `state.stats()` computes one on
+demand — see [Statistics](stats.md):
+
+```python
+snapshot = state.stats(data, config)
+snapshot.values["sharpe_ratio"]
+snapshot.meta["equity_source"]   # 'persisted' | 'ledger' | 'none'
+
+from ube.stats import load_stats
+
+latest = load_stats("paper.db", "default")
+```
+
+Bars are not stored, so the returns tier is rebuilt from the equity points that
+`step()` writes; with fewer than two points (and no ledger-spanning `data`), the
+returns tier is skipped and recorded in `snapshot.errors`.
+
 ## CLI Status
 
 The CLI is invoked as `python -m ube.papertrading.cli`. `step` currently

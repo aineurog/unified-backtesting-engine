@@ -23,6 +23,9 @@ cost events before comparing a derived table or CSV export.
   settlement and base currencies differ.
 - `result.benchmark` is attached by `ube.run()` for supported single-instrument
   runs. `result.metrics` is currently `None`; metrics are not computed by UBE.
+- `result.stats` holds the four-tier statistical profile (returns, trades,
+  exposure, benchmark) computed before `ube.run()` returns. See
+  [Statistics](stats.md).
 
 `trade_table.balance` is a convenience projection derived from ledger trades and
 equity context. It is not an independent account-state store. CSV exporters in

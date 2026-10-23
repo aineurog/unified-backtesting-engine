@@ -613,7 +613,7 @@ def step(
                 # we need instrument for trades()
                 from ube.core.instrument import Instrument as _Instr
                 from ube.core.ledger import trades as _trades
-                from ube.papertrading.state import save_equity, save_trades
+                from ube.papertrading.state import load_equity, save_equity, save_trades
 
                 instr = config.base.instrument
                 if isinstance(instr, _Instr):
@@ -675,6 +675,30 @@ def step(
                         [{"timestamp": int(ts[-1]), "equity": float(bal), "returns": 0.0}]
                     )
                     save_equity(db_path, run_id, eq_df)
+                    # §10: refresh the persisted strategy statistics on a trade close. The
+                    # equity point above was just written, so the snapshot reads it; the
+                    # closed-trade count is what makes the refresh idempotent for steps
+                    # that book nothing new. An earlier snapshot taken on a one-point grid
+                    # has no returns tier, so it is retried until the grid grows past it.
+                    # Failures stay inside this try/except like the rest of the block.
+                    closed_trades = len(tlist)
+                    seen_trades = int(getattr(state, "stats_trade_count", 0) or 0)
+                    retry_partial = (
+                        seen_trades > 0
+                        and not bool(getattr(state, "stats_complete", True))
+                        and len(load_equity(db_path, run_id))
+                        > int(getattr(state, "stats_equity_points", 0) or 0)
+                    )
+                    if closed_trades > seen_trades or retry_partial:
+                        from ube.stats import save_stats as _save_stats
+
+                        snapshot = state.stats(data, config)
+                        _save_stats(db_path, run_id, snapshot, trade_count=closed_trades)
+                        state.stats_trade_count = closed_trades
+                        state.stats_complete = "returns" in snapshot.tiers
+                        state.stats_equity_points = int(
+                            snapshot.meta.get("n_equity_points", 0) or 0
+                        )
             except Exception:
                 pass
         except Exception:

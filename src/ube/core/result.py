@@ -39,10 +39,11 @@ Design notes:
   round-trips the full event ledger (parquet cannot carry the heterogeneous sealed event
   schema cleanly). Opt-in and user-driven (§7.3); results are never auto-stored.
 
-``metrics`` is left as ``None`` here: performance metrics are computed by an external
-library, not by ``ube`` (§10). The result still exposes the clean data the external
-metrics layer consumes — ``ledger``, ``trades``, ``trade_table``, ``positions``,
-``equity_curve`` (+ ``.returns`` / ``.resample``) and the (optional) benchmark curve.
+``metrics`` is left as ``None`` here: it is the §10 hand-off slot for an *external*
+metrics layer, which this engine does not fill (and several tests assert it). The
+statistics UBE does produce live in ``stats`` — computed eagerly by StratStat from the
+same clean data (:class:`~ube.stats.StatsResult`), so the result exposes both the raw
+views the external layer consumes and the four-tier numbers a caller actually reads.
 """
 
 from __future__ import annotations
@@ -77,6 +78,9 @@ from ube.core.ledger import (
     trade_table,
     trades,
 )
+from ube.stats import StatsResult
+from ube.stats import from_arrays as stats_from_arrays
+from ube.stats import is_enabled as stats_enabled
 
 __all__ = ["BacktestResult", "result_hash"]
 
@@ -102,10 +106,14 @@ class BacktestResult:
         equity_curve: The combined equity curve in ``base_currency`` (§4.6).
         equity_curve_by_instrument: The per-instrument equity breakdown, on the same
             combined grid (§4.6).
-        metrics: Performance metrics — always ``None`` here. Metrics are computed by an
-            external library (§10), not by ``ube``; this field is the hand-off slot the
-            external layer may populate.
+        metrics: Performance metrics — always ``None`` here. This is the §10 hand-off
+            slot for an external metrics layer, not by ``ube``; nothing in the engine
+            writes it.
         benchmark: The benchmark curve for this run (``None`` when not computed).
+        stats: The four-tier strategy statistics (§10), computed eagerly from the views
+            below by :func:`ube.stats.from_result` while the result is built, or ``None``
+            when statistics are disabled (:func:`ube.stats.set_enabled`). The benchmark
+            tier is merged in afterwards by :func:`ube.run` when a benchmark exists.
     """
 
     run_id: str
@@ -118,6 +126,7 @@ class BacktestResult:
     equity_curve_by_instrument: dict[str, EquityCurve]
     metrics: Any | None = None
     benchmark: BenchmarkCurve | None = None
+    stats: StatsResult | None = None
 
     def __post_init__(self) -> None:
         # Copy the per-instrument breakdown into a fresh dict so the frozen result never
@@ -233,6 +242,22 @@ class BacktestResult:
                 for iid, curve in by_instrument.items()
             }
 
+        # §10: the strategy statistics are computed once, here, from the same warm-up
+        # sliced views the result is about to expose — the equity grid, the closed trades,
+        # the ledger (position history) and the bars that price it. Failures never reach
+        # the caller: they are recorded inside the returned StatsResult.
+        stats_view: StatsResult | None = None
+        if stats_enabled():
+            stats_view = stats_from_arrays(
+                combined.index,
+                combined.equity,
+                trades=trades_view,
+                ledger=ledger,
+                market_data=market_data,
+                instruments=instruments,
+                benchmark=benchmark,
+            )
+
         return cls(
             run_id=run_id if run_id is not None else str(uuid.uuid4()),
             ledger=ledger,
@@ -244,6 +269,7 @@ class BacktestResult:
             equity_curve_by_instrument=by_instrument,
             metrics=None,
             benchmark=benchmark,
+            stats=stats_view,
         )
 
     # ------------------------------------------------------------------
