@@ -65,19 +65,18 @@ grid so they represent the requested longer period. Existing databases with the
 old `returns NOT NULL` placeholder column are migrated on access: their returns
 are reconstructed from adjacent equity values.
 
-`step()` also persists a snapshot on every trade close into two append-only
-tables in the session database:
-
-| Table | Columns |
-|---|---|
-| `stats` | `run_id`, `seq`, `metric`, `value`, `value_json`, `category`, `ref` |
-| `stats_meta` | `run_id`, `seq`, `as_of_ns`, `trade_count`, `n_equity_points`, `periods_per_year`, `tiers`, `errors_json` |
+`step()` persists the current statistics on each trade close in one `stats`
+table. It replaces the existing row for that `run_id`; historical snapshots
+are not retained. The row contains metadata columns and one column per metric:
+`run_id`, `as_of_ns`, `trade_count`, `n_equity_points`, `periods_per_year`,
+`tiers`, `errors_json`, `categories_json`, `refs_json`, and `json_metrics`.
+Scalar metric values are stored directly in their own columns; non-finite and
+non-scalar values are JSON-encoded in their metric columns.
 
 ```python
 from ube.stats import load_stats
 
-latest = load_stats("paper.db", "default")           # newest snapshot, one row per metric
-previous = load_stats("paper.db", "default", seq=1)  # an earlier snapshot
+current = load_stats("paper.db", "default")  # zero or one row; metrics are columns
 ```
 
 Snapshots are written only when the closed-trade count increases, or when an
@@ -97,8 +96,8 @@ the saved snapshot until another trade closes.
 | `compute(returns, trades=None, benchmark=None, exposure=None, *, periods_per_year=None, return_policy='truncate', rf=0.0, ...)` | Tiers from already-built inputs. |
 | `from_arrays(index, equity, *, trades, ledger=None, market_data=None, instruments=None, benchmark=None, ...)` | Build from an equity grid (used by `BacktestResult.from_ledger`). |
 | `from_result(result, **kwargs)` | Recompute from a result's cached views. |
-| `save_stats(db_path, run_id, stats, *, trade_count=0) -> int` | Persist a snapshot, returns its `seq`. |
-| `load_stats(db_path, run_id='default', *, seq=None) -> pd.DataFrame` | Read a snapshot. |
+| `save_stats(db_path, run_id, stats, *, trade_count=0) -> None` | Replace the current stats row for a run. |
+| `load_stats(db_path, run_id='default') -> pd.DataFrame` | Read the current row; metric names are columns. |
 | `set_enabled(bool)` / `is_enabled()` | Global switch; disabled runs leave `result.stats is None`. |
 
 ## Conventions and caveats

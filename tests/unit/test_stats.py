@@ -225,24 +225,42 @@ def test_save_and_load_round_trip(tmp_path) -> None:
     first = stats.compute(_returns(n=80), periods_per_year=252, computed_at_ns=111)
     second = stats.compute(_returns(n=90), periods_per_year=252, computed_at_ns=222)
 
-    assert stats.save_stats(db, "run", first, trade_count=1) == 1
-    assert stats.save_stats(db, "run", second, trade_count=2) == 2
+    assert stats.save_stats(db, "run", first, trade_count=1) is None
+    assert stats.save_stats(db, "run", second, trade_count=2) is None
 
     latest = stats.load_stats(db, "run")
-    assert len(latest) == second.n_metrics
-    assert set(latest["seq"]) == {2}
-    assert set(latest["trade_count"]) == {2}
-    assert set(latest["as_of_ns"]) == {222}
-    row = latest[latest["metric"] == "sharpe_ratio"].iloc[0]
-    assert row["value"] == pytest.approx(second.values["sharpe_ratio"])
-    assert row["ref"]
-
-    old = stats.load_stats(db, "run", seq=1)
-    assert set(old["as_of_ns"]) == {111}
+    assert len(latest) == 1
+    assert latest.loc[0, "trade_count"] == 2
+    assert latest.loc[0, "as_of_ns"] == 222
+    assert latest.loc[0, "sharpe_ratio"] == pytest.approx(second.values["sharpe_ratio"])
+    assert json.loads(latest.loc[0, "refs_json"])["sharpe_ratio"]
+    removed_metrics = set(first.values) - set(second.values)
+    assert all(pd.isna(latest.loc[0, metric]) for metric in removed_metrics)
 
     assert stats.load_stats(tmp_path / "missing.db", "run").empty
     with pytest.raises(TypeError, match="StatsResult"):
         stats.save_stats(db, "run", {"not": "a result"})  # type: ignore[arg-type]
+
+
+def test_wide_stats_stores_nonfinite_and_object_metrics(tmp_path) -> None:
+    db = tmp_path / "paper.db"
+    result = stats.StatsResult(
+        values={"finite_metric": 2.5, "infinite_metric": math.inf},
+        objects={"distribution": [1.0, 2.0]},
+        categories={"finite_metric": "test", "infinite_metric": "test", "distribution": "test"},
+        periods_per_year=252.0,
+        tiers=("returns",),
+        meta={"refs": {"finite_metric": "citation"}},
+        errors={},
+        computed_at_ns=10,
+    )
+
+    stats.save_stats(db, "run", result, trade_count=1)
+    loaded = stats.load_stats(db, "run")
+    assert loaded.loc[0, "finite_metric"] == 2.5
+    assert loaded.loc[0, "infinite_metric"] == math.inf
+    assert loaded.loc[0, "distribution"] == [1.0, 2.0]
+    assert json.loads(loaded.loc[0, "categories_json"])["finite_metric"] == "test"
 
 
 def test_save_and_load_persists_equity_point_count(tmp_path) -> None:
@@ -259,7 +277,7 @@ def test_save_and_load_persists_equity_point_count(tmp_path) -> None:
     assert set(loaded["n_equity_points"]) == {3}
 
 
-def test_load_stats_migrates_legacy_meta_schema(tmp_path) -> None:
+def test_load_stats_migrates_legacy_snapshot_tables(tmp_path) -> None:
     import sqlite3
 
     db = tmp_path / "legacy-stats.db"
@@ -280,12 +298,36 @@ def test_load_stats_migrates_legacy_meta_schema(tmp_path) -> None:
     conn.execute(
         "INSERT INTO stats VALUES ('run', 1, 'sharpe_ratio', 1.5, NULL, 'risk', NULL)"
     )
+    conn.execute(
+        "INSERT INTO stats_meta VALUES ('run', 2, 20, 3, 252, 'returns', '{}')"
+    )
+    conn.execute(
+        "INSERT INTO stats VALUES ('run', 2, 'sharpe_ratio', 2.5, NULL, 'risk', NULL)"
+    )
+    conn.execute(
+        "INSERT INTO stats_meta VALUES ('empty-run', 1, 30, 0, 252, 'returns', '{}')"
+    )
     conn.commit()
     conn.close()
 
     loaded = stats.load_stats(db, "run")
-    assert set(loaded["trade_count"]) == {2}
-    assert set(loaded["n_equity_points"]) == {0}
+    assert len(loaded) == 1
+    assert loaded.loc[0, "trade_count"] == 3
+    assert loaded.loc[0, "sharpe_ratio"] == pytest.approx(2.5)
+    empty_metrics = stats.load_stats(db, "empty-run")
+    assert len(empty_metrics) == 1
+    assert empty_metrics.loc[0, "trade_count"] == 0
+    conn = sqlite3.connect(db)
+    try:
+        table_names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert "stats_meta" not in table_names
 
 
 def test_enable_switch_round_trip(monkeypatch) -> None:

@@ -78,14 +78,14 @@ def test_step_persists_stats_snapshot_on_trade_close(tmp_path) -> None:
     assert set(first["trade_count"]) == {1}
     assert set(first["tiers"]) == {"returns,trades,exposure"}
     assert set(first["errors_json"]) == {"{}"}
-    assert "sharpe_ratio" in set(first["metric"])
+    assert "sharpe_ratio" in first.columns
 
     _drive(md, sig, cfg, state, until_trades=2, start=len(load_equity(db, "default")) + 1)
     assert state.stats_trade_count == 2
     latest = load_stats(db, "default")
+    assert len(latest) == 1
     assert set(latest["trade_count"]) == {2}
-    assert int(latest["seq"].iloc[0]) == 2  # append-only, newest wins
-    assert set(load_stats(db, "default", seq=1)["trade_count"]) == {1}
+    assert latest.loc[0, "as_of_ns"] > first.loc[0, "as_of_ns"]
 
 
 def test_stats_snapshot_equity_stops_at_latest_closed_trade(tmp_path) -> None:
@@ -125,10 +125,11 @@ def test_snapshot_is_not_rewritten_when_no_trade_closes(tmp_path) -> None:
     n = _drive(md, sig, cfg, state, until_trades=1)
     assert state.stats_trade_count == 1
 
-    # keep stepping bars that close nothing: the latest snapshot stays seq 1
+    before = load_stats(db, "default").loc[0, "as_of_ns"]
+    # Keep stepping bars that close nothing: the current snapshot stays unchanged.
     for k in range(n + 1, md.n_bars + 1):
         step(_slice_md(md, slice(k - 1, k)), _slice_signals(sig, slice(k - 1, k)), state, cfg)
-    assert int(load_stats(db, "default")["seq"].iloc[0]) == 1
+    assert load_stats(db, "default").loc[0, "as_of_ns"] == before
 
 
 def test_resume_does_not_write_duplicate_trade_count_snapshot(tmp_path) -> None:
@@ -150,7 +151,7 @@ def test_resume_does_not_write_duplicate_trade_count_snapshot(tmp_path) -> None:
         )
 
     latest = load_stats(db, "default")
-    assert int(latest["seq"].iloc[0]) == 1
+    assert len(latest) == 1
     assert set(latest["trade_count"]) == {1}
 
 

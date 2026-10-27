@@ -76,46 +76,32 @@ SECONDS_PER_YEAR = 365.25 * 24.0 * 3600.0
 #: Accepted values of the ``return_policy`` argument (§10 safety rule).
 RETURN_POLICIES = ("truncate", "zero", "drop")
 
-#: Columns of the persisted-latest snapshot returned by :func:`load_stats`.
+#: Fixed columns of the current-snapshot row returned by :func:`load_stats`.
 LOAD_COLUMNS = [
-    "metric",
-    "value",
-    "value_json",
-    "category",
-    "ref",
-    "seq",
+    "run_id",
     "as_of_ns",
     "trade_count",
     "n_equity_points",
     "periods_per_year",
     "tiers",
     "errors_json",
+    "categories_json",
+    "refs_json",
+    "json_metrics",
 ]
 
 _STATS_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS stats (
-    run_id     TEXT    NOT NULL,
-    seq        INTEGER NOT NULL,
-    metric     TEXT    NOT NULL,
-    value      REAL,
-    value_json TEXT,
-    category   TEXT,
-    ref        TEXT,
-    PRIMARY KEY (run_id, seq, metric)
-)
-"""
-
-_STATS_META_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS stats_meta (
-    run_id           TEXT    NOT NULL,
-    seq              INTEGER NOT NULL,
+    run_id           TEXT PRIMARY KEY,
     as_of_ns         INTEGER NOT NULL,
     trade_count      INTEGER NOT NULL,
     n_equity_points  INTEGER NOT NULL DEFAULT 0,
     periods_per_year REAL,
     tiers            TEXT,
     errors_json      TEXT,
-    PRIMARY KEY (run_id, seq)
+    categories_json  TEXT NOT NULL,
+    refs_json        TEXT NOT NULL,
+    json_metrics     TEXT NOT NULL
 )
 """
 
@@ -671,12 +657,12 @@ def from_result(
 
 def save_stats(
     db_path: str | Path, run_id: str, stats: StatsResult, *, trade_count: int = 0
-) -> int:
-    """Persist one statistics snapshot for ``run_id``; returns its ``seq``.
+) -> None:
+    """Replace the current statistics row for ``run_id``.
 
-    The snapshot is append-only: every call allocates the next ``seq`` for the run so
-    :func:`load_stats` can always answer "the latest refresh". Tables are created
-    idempotently, mirroring :func:`ube.papertrading.state.save_trades`.
+    Metric names are added as columns as needed; a run always has at most one row.
+    Legacy long-form ``stats``/``stats_meta`` tables are migrated, retaining each run's
+    latest snapshot.
     """
     if not isinstance(stats, StatsResult):
         raise TypeError(f"save_stats expects a StatsResult; got {type(stats).__name__}")
@@ -684,99 +670,265 @@ def save_stats(
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), isolation_level=None)
     try:
-        conn.execute(_STATS_SCHEMA_SQL)
-        conn.execute(_STATS_META_SCHEMA_SQL)
-        _ensure_stats_meta_equity_points(conn)
-        row = conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM stats_meta WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        seq = int(row[0]) if row else 1
+        _ensure_stats_schema(conn)
         ppy = stats.periods_per_year
-        conn.execute(
-            "INSERT INTO stats_meta (run_id, seq, as_of_ns, trade_count, n_equity_points, "
-            "periods_per_year, tiers, errors_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                run_id,
-                seq,
-                int(stats.computed_at_ns),
-                int(trade_count),
-                int(stats.meta.get("n_equity_points", 0) or 0),
-                float(ppy) if ppy is not None and math.isfinite(ppy) else None,
-                ",".join(stats.tiers),
-                json.dumps(stats.errors, sort_keys=True),
-            ),
+        metric_values: dict[str, Any] = {}
+        json_metrics: list[str] = []
+        for metric, value in stats.values.items():
+            if math.isfinite(value):
+                metric_values[metric] = float(value)
+            else:
+                metric_values[metric] = json.dumps(value)
+                json_metrics.append(metric)
+        for metric, value in stats.objects.items():
+            metric_values[metric] = json.dumps(value)
+            json_metrics.append(metric)
+
+        reserved = {column.lower() for column in _STATS_FIXED_COLUMNS}
+        collisions = [metric for metric in metric_values if metric.lower() in reserved]
+        if collisions:
+            raise ValueError(f"metric names conflict with stats columns: {collisions}")
+
+        conn.execute("BEGIN IMMEDIATE")
+        existing_columns = {
+            str(column[1]).lower()
+            for column in conn.execute("PRAGMA table_info(stats)").fetchall()
+        }
+        for metric in metric_values:
+            if metric.lower() not in existing_columns:
+                conn.execute(f"ALTER TABLE stats ADD COLUMN {_quote_identifier(metric)}")
+                existing_columns.add(metric.lower())
+
+        all_metrics = [
+            str(column[1])
+            for column in conn.execute("PRAGMA table_info(stats)").fetchall()
+            if str(column[1]).lower() not in reserved
+        ]
+        categories = dict(stats.categories)
+        refs = dict(stats.meta.get("refs", {}))
+        insert_columns = [*_STATS_FIXED_COLUMNS, *all_metrics]
+        insert_values = [
+            run_id,
+            int(stats.computed_at_ns),
+            int(trade_count),
+            int(stats.meta.get("n_equity_points", 0) or 0),
+            float(ppy) if ppy is not None and math.isfinite(ppy) else None,
+            ",".join(stats.tiers),
+            json.dumps(stats.errors, sort_keys=True),
+            json.dumps(categories, sort_keys=True),
+            json.dumps(refs, sort_keys=True),
+            json.dumps(json_metrics, sort_keys=True),
+            *(metric_values.get(metric) for metric in all_metrics),
+        ]
+        quoted_columns = ", ".join(_quote_identifier(column) for column in insert_columns)
+        placeholders = ", ".join("?" for _ in insert_columns)
+        updates = ", ".join(
+            f"{_quote_identifier(column)} = excluded.{_quote_identifier(column)}"
+            for column in insert_columns
+            if column != "run_id"
         )
-        for record in stats.to_records():
-            conn.execute(
-                "INSERT OR REPLACE INTO stats (run_id, seq, metric, value, value_json, "
-                "category, ref) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    run_id,
-                    seq,
-                    record["metric"],
-                    record["value"],
-                    record["value_json"],
-                    record["category"],
-                    record["ref"],
-                ),
-            )
-        return seq
+        conn.execute(
+            f"INSERT INTO stats ({quoted_columns}) VALUES ({placeholders}) "
+            f"ON CONFLICT(run_id) DO UPDATE SET {updates}",
+            insert_values,
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 
 
 def load_stats(
-    db_path: str | Path, run_id: str = "default", *, seq: int | None = None
+    db_path: str | Path, run_id: str = "default"
 ) -> pd.DataFrame:
-    """Load a persisted statistics snapshot as a DataFrame (empty when there is none).
+    """Load the current wide statistics row for ``run_id``.
 
     Args:
         db_path: The paper-trading sqlite file.
         run_id: The strategy run to read.
-        seq: Snapshot to read; the latest one when omitted.
 
     Returns:
-        One row per metric, joined with its snapshot metadata (``seq``, ``as_of_ns``,
-        ``trade_count``, ``periods_per_year``, ``tiers``, ``errors_json``). ``value`` is
-        the finite scalar; ``value_json`` carries ``inf``/``NaN`` scalars and non-scalar
-        metrics as JSON text.
+        A one-row DataFrame with snapshot metadata and one column per metric. Non-finite
+        scalars and non-scalar metrics are decoded from JSON.
     """
     if not Path(db_path).exists():
         return pd.DataFrame(columns=LOAD_COLUMNS)
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     try:
-        conn.execute(_STATS_SCHEMA_SQL)
-        conn.execute(_STATS_META_SCHEMA_SQL)
-        _ensure_stats_meta_equity_points(conn)
-        target = seq
-        if target is None:
-            row = conn.execute(
-                "SELECT MAX(seq) FROM stats_meta WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if row is None or row[0] is None:
-                return pd.DataFrame(columns=LOAD_COLUMNS)
-            target = int(row[0])
-        rows = conn.execute(
-            "SELECT s.metric, s.value, s.value_json, s.category, s.ref, m.seq, m.as_of_ns, "
-            "m.trade_count, m.n_equity_points, m.periods_per_year, m.tiers, m.errors_json "
-            "FROM stats AS s JOIN stats_meta AS m ON s.run_id = m.run_id AND s.seq = m.seq "
-            "WHERE s.run_id = ? AND s.seq = ? ORDER BY s.category, s.metric",
-            (run_id, int(target)),
-        ).fetchall()
-        if not rows:
+        _ensure_stats_schema(conn)
+        row = conn.execute("SELECT * FROM stats WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
             return pd.DataFrame(columns=LOAD_COLUMNS)
-        return pd.DataFrame(rows, columns=LOAD_COLUMNS)
+        columns = [str(column[1]) for column in conn.execute("PRAGMA table_info(stats)")]
+        record = dict(zip(columns, row, strict=True))
+        json_metrics = set(json.loads(record["json_metrics"]))
+        for metric in columns:
+            if metric in json_metrics and record[metric] is not None:
+                record[metric] = json.loads(record[metric])
+        return pd.DataFrame([record])
     finally:
         conn.close()
 
 
-def _ensure_stats_meta_equity_points(conn: sqlite3.Connection) -> None:
-    """Add the equity-grid size needed to resume incomplete snapshot retries."""
-    columns = conn.execute("PRAGMA table_info(stats_meta)").fetchall()
-    if not any(column[1] == "n_equity_points" for column in columns):
-        conn.execute(
-            "ALTER TABLE stats_meta ADD COLUMN n_equity_points INTEGER NOT NULL DEFAULT 0"
-        )
+_STATS_FIXED_COLUMNS = (
+    "run_id",
+    "as_of_ns",
+    "trade_count",
+    "n_equity_points",
+    "periods_per_year",
+    "tiers",
+    "errors_json",
+    "categories_json",
+    "refs_json",
+    "json_metrics",
+)
+
+
+def _quote_identifier(identifier: str) -> str:
+    """Quote a SQLite identifier, including metric names containing punctuation."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _ensure_stats_schema(conn: sqlite3.Connection) -> None:
+    """Create the wide stats table or migrate the legacy append-only layout."""
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+            "('stats', 'stats_meta')"
+        ).fetchall()
+    }
+    if "stats" in tables:
+        columns = {
+            str(row[1]).lower()
+            for row in conn.execute("PRAGMA table_info(stats)").fetchall()
+        }
+        if "metric" in columns:
+            _migrate_legacy_stats(conn, "stats_meta" in tables)
+        elif "categories_json" not in columns:
+            raise sqlite3.DatabaseError("unrecognized stats table schema")
+        elif "stats_meta" in tables:
+            conn.execute("DROP TABLE stats_meta")
+    else:
+        conn.execute(_STATS_SCHEMA_SQL)
+        if "stats_meta" in tables:
+            conn.execute("DROP TABLE stats_meta")
+
+
+def _migrate_legacy_stats(conn: sqlite3.Connection, has_meta: bool) -> None:
+    """Keep only each run's latest legacy snapshot and store it in wide form."""
+    conn.execute("SAVEPOINT stats_wide_migration")
+    try:
+        meta_rows: dict[str, dict[str, Any]] = {}
+        if has_meta:
+            meta_column_names = [
+                str(column[1])
+                for column in conn.execute("PRAGMA table_info(stats_meta)").fetchall()
+            ]
+            for row in conn.execute("SELECT * FROM stats_meta").fetchall():
+                values = dict(zip(meta_column_names, row, strict=True))
+                run_id = str(values["run_id"])
+                if (
+                    run_id not in meta_rows
+                    or int(values["seq"]) > int(meta_rows[run_id]["seq"])
+                ):
+                    meta_rows[run_id] = values
+
+        legacy_columns = [
+            str(row[1]) for row in conn.execute("PRAGMA table_info(stats)").fetchall()
+        ]
+        metric_rows: dict[str, list[dict[str, Any]]] = {}
+        for row in conn.execute("SELECT * FROM stats").fetchall():
+            record = dict(zip(legacy_columns, row, strict=True))
+            run_id = str(record["run_id"])
+            latest = meta_rows.get(run_id)
+            if latest is not None and int(record["seq"]) != int(latest["seq"]):
+                continue
+            if latest is None:
+                current = metric_rows.get(run_id, [])
+                if current and int(record["seq"]) < int(current[0]["seq"]):
+                    continue
+                if current and int(record["seq"]) > int(current[0]["seq"]):
+                    current.clear()
+            metric_rows.setdefault(run_id, []).append(record)
+
+        conn.execute("ALTER TABLE stats RENAME TO stats_legacy")
+        if has_meta:
+            conn.execute("ALTER TABLE stats_meta RENAME TO stats_meta_legacy")
+        conn.execute(_STATS_SCHEMA_SQL)
+        for run_id in sorted(set(meta_rows) | set(metric_rows)):
+            records = metric_rows.get(run_id, [])
+            latest = meta_rows.get(run_id, {})
+            values: dict[str, Any] = {}
+            json_metrics: list[str] = []
+            categories: dict[str, str] = {}
+            refs: dict[str, str] = {}
+            for record in records:
+                metric = str(record["metric"])
+                if record.get("value_json") is not None:
+                    values[metric] = str(record["value_json"])
+                    json_metrics.append(metric)
+                elif record.get("value") is not None:
+                    values[metric] = record["value"]
+                else:
+                    values[metric] = None
+                categories[metric] = str(record.get("category") or "")
+                if record.get("ref") is not None:
+                    refs[metric] = str(record["ref"])
+            snapshot = {
+                "run_id": run_id,
+                "as_of_ns": int(latest.get("as_of_ns", 0)),
+                "trade_count": int(latest.get("trade_count", 0)),
+                "n_equity_points": int(latest.get("n_equity_points", 0) or 0),
+                "periods_per_year": latest.get("periods_per_year"),
+                "tiers": latest.get("tiers"),
+                "errors_json": latest.get("errors_json") or "{}",
+                "categories_json": json.dumps(categories, sort_keys=True),
+                "refs_json": json.dumps(refs, sort_keys=True),
+                "json_metrics": json.dumps(json_metrics, sort_keys=True),
+            }
+            _upsert_wide_stats_row(conn, snapshot, values)
+        conn.execute("DROP TABLE stats_legacy")
+        if has_meta:
+            conn.execute("DROP TABLE stats_meta_legacy")
+        conn.execute("RELEASE SAVEPOINT stats_wide_migration")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT stats_wide_migration")
+        conn.execute("RELEASE SAVEPOINT stats_wide_migration")
+        raise
+
+
+def _upsert_wide_stats_row(
+    conn: sqlite3.Connection, snapshot: Mapping[str, Any], metric_values: Mapping[str, Any]
+) -> None:
+    """Insert a wide snapshot during migration."""
+    existing_columns = {
+        str(column[1]).lower()
+        for column in conn.execute("PRAGMA table_info(stats)").fetchall()
+    }
+    reserved = {column.lower() for column in _STATS_FIXED_COLUMNS}
+    for metric in metric_values:
+        if metric.lower() in reserved:
+            raise sqlite3.DatabaseError(f"legacy metric conflicts with stats column: {metric}")
+        if metric.lower() not in existing_columns:
+            conn.execute(f"ALTER TABLE stats ADD COLUMN {_quote_identifier(metric)}")
+            existing_columns.add(metric.lower())
+    metric_columns = [
+        str(column[1])
+        for column in conn.execute("PRAGMA table_info(stats)").fetchall()
+        if str(column[1]).lower() not in reserved
+    ]
+    columns = [*_STATS_FIXED_COLUMNS, *metric_columns]
+    values = [snapshot[column] for column in _STATS_FIXED_COLUMNS]
+    values.extend(metric_values.get(column) for column in metric_columns)
+    conn.execute(
+        f"INSERT INTO stats ({', '.join(_quote_identifier(c) for c in columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        values,
+    )
 
 
 # ---------------------------------------------------------------------------

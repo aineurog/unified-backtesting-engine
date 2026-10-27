@@ -293,15 +293,17 @@ exposure tier; `extra_meta` adds provenance to `StatsResult.meta`.
 
 Recompute from a result's cached views (no ledger re-derivation).
 
-### `ube.stats.save_stats(db_path, run_id, stats, *, trade_count=0) -> int`
+### `ube.stats.save_stats(db_path, run_id, stats, *, trade_count=0) -> None`
 
-Persist one append-only snapshot; returns its `seq`.
+Replace the current statistics row for the run. The table stores one row per
+`run_id`, with metadata columns and one column per metric.
 
-### `ube.stats.load_stats(db_path, run_id='default', *, seq=None) -> pd.DataFrame`
+### `ube.stats.load_stats(db_path, run_id='default') -> pd.DataFrame`
 
-Read a snapshot as one row per metric (latest when `seq` is omitted). Columns:
-`metric`, `value`, `value_json`, `category`, `ref`, `seq`, `as_of_ns`,
-`trade_count`, `n_equity_points`, `periods_per_year`, `tiers`, `errors_json`.
+Read the current row for the run (zero or one row). The DataFrame has metadata
+columns (`as_of_ns`, `trade_count`, `n_equity_points`, `periods_per_year`,
+`tiers`, `errors_json`, `categories_json`, `refs_json`, `json_metrics`) and
+one column per metric.
 
 ### `ube.stats.set_enabled(enabled) -> None` / `is_enabled() -> bool`
 
