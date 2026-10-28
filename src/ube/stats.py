@@ -51,6 +51,7 @@ import pandas as pd
 
 from ube.core.benchmark import BenchmarkCurve
 from ube.core.data import MarketData, derive_bar_period_ns
+from ube.core.errors import ConfigError
 from ube.core.ledger import EquityCurve, EventLedger, Positions, Trade, positions
 
 if TYPE_CHECKING:
@@ -223,11 +224,12 @@ class StatsResult:
         return out
 
     def to_records(self) -> list[dict[str, Any]]:
-        """Metric rows shaped like the ``stats`` table, ready for :func:`save_stats`.
+        """One long-form row per metric, for tabular export.
 
         Finite scalars go to ``value``; everything else (``inf``/``NaN`` scalars and
         non-scalar metrics) goes to ``value_json``, which round-trips through Python's
-        ``json`` module.
+        ``json`` module. Persistence is via :func:`save_stats`, which stores one wide row
+        per run rather than these records.
         """
         refs: dict[str, str] = dict(self.meta.get("refs", {}))
         rows: list[dict[str, Any]] = []
@@ -402,10 +404,13 @@ def compute(
         extra_errors: Extra entries merged into :attr:`StatsResult.errors`.
 
     Returns:
-        A frozen :class:`StatsResult`; failures are recorded in ``errors``, never raised.
+        A frozen :class:`StatsResult`; per-tier failures are recorded in ``errors``
+        instead of raised. Invalid arguments raise :class:`~ube.core.errors.ConfigError`.
     """
     if return_policy not in RETURN_POLICIES:
-        raise ValueError(f"return_policy must be one of {RETURN_POLICIES}; got {return_policy!r}")
+        raise ConfigError(
+            f"return_policy must be one of {RETURN_POLICIES}; got {return_policy!r}"
+        )
 
     errors: dict[str, str] = dict(extra_errors or {})
     meta: dict[str, Any] = {"return_policy": return_policy}
@@ -528,7 +533,7 @@ def from_arrays(
     equity: np.ndarray,
     *,
     trades: Sequence[Trade],
-    equity_returns: Sequence[float] | None = None,
+    equity_returns: np.ndarray | Sequence[float] | None = None,
     ledger: EventLedger | None = None,
     market_data: Mapping[str, MarketData] | None = None,
     instruments: Mapping[str, Any] | None = None,
@@ -665,7 +670,7 @@ def save_stats(
     latest snapshot.
     """
     if not isinstance(stats, StatsResult):
-        raise TypeError(f"save_stats expects a StatsResult; got {type(stats).__name__}")
+        raise ConfigError(f"save_stats expects a StatsResult; got {type(stats).__name__}")
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), isolation_level=None)
@@ -687,7 +692,7 @@ def save_stats(
         reserved = {column.lower() for column in _STATS_FIXED_COLUMNS}
         collisions = [metric for metric in metric_values if metric.lower() in reserved]
         if collisions:
-            raise ValueError(f"metric names conflict with stats columns: {collisions}")
+            raise ConfigError(f"metric names conflict with stats columns: {collisions}")
 
         conn.execute("BEGIN IMMEDIATE")
         existing_columns = {
@@ -829,13 +834,13 @@ def _migrate_legacy_stats(conn: sqlite3.Connection, has_meta: bool) -> None:
                 for column in conn.execute("PRAGMA table_info(stats_meta)").fetchall()
             ]
             for row in conn.execute("SELECT * FROM stats_meta").fetchall():
-                values = dict(zip(meta_column_names, row, strict=True))
-                run_id = str(values["run_id"])
+                meta_values = dict(zip(meta_column_names, row, strict=True))
+                run_id = str(meta_values["run_id"])
                 if (
                     run_id not in meta_rows
-                    or int(values["seq"]) > int(meta_rows[run_id]["seq"])
+                    or int(meta_values["seq"]) > int(meta_rows[run_id]["seq"])
                 ):
-                    meta_rows[run_id] = values
+                    meta_rows[run_id] = meta_values
 
         legacy_columns = [
             str(row[1]) for row in conn.execute("PRAGMA table_info(stats)").fetchall()
@@ -1010,7 +1015,7 @@ def _clean_returns(series: pd.Series, policy: str) -> tuple[pd.Series, int]:
     (dropped, or replaced with ``0.0`` under ``"zero"``).
     """
     if policy not in RETURN_POLICIES:
-        raise ValueError(f"return_policy must be one of {RETURN_POLICIES}; got {policy!r}")
+        raise ConfigError(f"return_policy must be one of {RETURN_POLICIES}; got {policy!r}")
     raw = series.to_numpy(dtype=np.float64, copy=True)
     finite = np.isfinite(raw)
     if finite.all():

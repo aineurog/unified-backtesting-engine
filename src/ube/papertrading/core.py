@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import logging
 import time
 import warnings
 from collections.abc import Callable, Mapping
@@ -43,7 +44,7 @@ from ube.core.errors import (
     InvalidSignalError,
 )
 from ube.core.instrument import Instrument, allows_short
-from ube.core.ledger import EventLedger, EventType, LedgerEvent
+from ube.core.ledger import EventLedger, EventType, LedgerEvent, Trade
 from ube.core.signals import Signals, from_target, validate_long_only
 
 from .config import PaperConfig
@@ -435,6 +436,52 @@ def init(
     )
 
 
+def _refresh_stats_snapshot(
+    db_path: str,
+    run_id: str,
+    data: MarketData,
+    config: PaperConfig,
+    state: PaperState,
+    closed: list[Trade],
+) -> None:
+    """Persist the §10 statistics snapshot for the current paper session.
+
+    Refreshes only when the closed-trade count grows, or when a prior snapshot lacked the
+    returns tier and the equity grid has since grown past it.
+    """
+    from ube.stats import load_stats, save_stats
+
+    closed_trades = len(closed)
+    latest_closed_trade_ns = (
+        max(int(trade.exit_timestamp) for trade in closed) if closed else None
+    )
+    latest_stats = load_stats(db_path, run_id)
+    if latest_stats.empty:
+        seen_trades = 0
+        seen_equity_points = 0
+        stats_complete = True
+    else:
+        latest_meta = latest_stats.iloc[0]
+        seen_trades = int(latest_meta["trade_count"])
+        seen_equity_points = int(latest_meta["n_equity_points"])
+        stats_complete = "returns" in str(latest_meta["tiers"]).split(",")
+    from ube.papertrading.state import load_equity
+
+    equity_history = load_equity(db_path, run_id)
+    if latest_closed_trade_ns is None:
+        equity_points_through_close = 0
+    else:
+        equity_points_through_close = int(
+            (equity_history["timestamp"].astype("int64") <= latest_closed_trade_ns).sum()
+        )
+    retry_partial = not stats_complete and equity_points_through_close > seen_equity_points
+    if not (closed_trades > seen_trades or (closed_trades == seen_trades and retry_partial)):
+        return
+    snapshot = state.stats(data, config, through_ns=latest_closed_trade_ns)
+    save_stats(db_path, run_id, snapshot, trade_count=closed_trades)
+    state.stats_trade_count = closed_trades
+
+
 def step(
     data: MarketData,
     signals: Signals,
@@ -613,7 +660,7 @@ def step(
                 # we need instrument for trades()
                 from ube.core.instrument import Instrument as _Instr
                 from ube.core.ledger import trades as _trades
-                from ube.papertrading.state import load_equity, save_equity, save_trades
+                from ube.papertrading.state import save_equity, save_trades
 
                 instr = config.base.instrument
                 if isinstance(instr, _Instr):
@@ -675,53 +722,13 @@ def step(
                         [{"timestamp": int(ts[-1]), "equity": float(bal), "returns": 0.0}]
                     )
                     save_equity(db_path, run_id, eq_df)
-                    # §10: refresh statistics only when new trades exist, or when a prior
-                    # incomplete snapshot can be retried against a larger equity grid.
-                    closed_trades = len(tlist)
-                    latest_closed_trade_ns = (
-                        max(int(trade.exit_timestamp) for trade in tlist) if tlist else None
-                    )
-                    from ube.stats import load_stats as _load_stats
-
-                    latest_stats = _load_stats(db_path, run_id)
-                    if latest_stats.empty:
-                        seen_trades = 0
-                        seen_equity_points = 0
-                        stats_complete = True
-                    else:
-                        latest_meta = latest_stats.iloc[0]
-                        seen_trades = int(latest_meta["trade_count"])
-                        seen_equity_points = int(latest_meta["n_equity_points"])
-                        stats_complete = "returns" in str(latest_meta["tiers"]).split(",")
-                    equity_history = load_equity(db_path, run_id)
-                    if latest_closed_trade_ns is not None:
-                        equity_points_through_close = int(
-                            (
-                                equity_history["timestamp"].astype("int64")
-                                <= latest_closed_trade_ns
-                            ).sum()
-                        )
-                    else:
-                        equity_points_through_close = 0
-                    retry_partial = (
-                        not stats_complete
-                        and equity_points_through_close > seen_equity_points
-                    )
-                    if closed_trades > seen_trades or (
-                        closed_trades == seen_trades and retry_partial
-                    ):
-                        from ube.stats import save_stats as _save_stats
-
-                        snapshot = state.stats(
-                            data,
-                            config,
-                            through_ns=latest_closed_trade_ns,
-                        )
-                        _save_stats(db_path, run_id, snapshot, trade_count=closed_trades)
-                        state.stats_trade_count = closed_trades
-                        state.stats_complete = "returns" in snapshot.tiers
-                        state.stats_equity_points = int(
-                            snapshot.meta.get("n_equity_points", 0) or 0
+                    # §10: statistics are auxiliary — a snapshot failure is logged (§15
+                    # diagnostic logging) and never fails the step or the persisted ledger.
+                    try:
+                        _refresh_stats_snapshot(db_path, run_id, data, config, state, tlist)
+                    except Exception:  # noqa: BLE001 — auxiliary; surface via logging
+                        logging.getLogger("ube").warning(
+                            "statistics snapshot failed for run %r", run_id, exc_info=True
                         )
             except Exception:
                 pass

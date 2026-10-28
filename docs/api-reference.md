@@ -440,7 +440,7 @@ the cursor.
 | `trade_table` | `(config, db_path, run_id) -> pd.DataFrame` | Build trade table. |
 | `window_start_ns` | `() -> int` | Replay window start. |
 | `get_config_dict` | `() -> dict` | Export config as dict. |
-| `stats` | `(data, config, *, periods_per_year=None, resample_to=None, return_policy='truncate', rf=0.0) -> StatsResult` | Four-tier statistics; `config` may be a `PaperConfig` or its inner `BacktestConfig`. |
+| `stats` | `(data, config, *, through_ns=None, periods_per_year=None, resample_to=None, return_policy='truncate', rf=0.0) -> StatsResult` | Four-tier statistics; `config` may be a `PaperConfig` or its inner `BacktestConfig`. |
 
 ### `OpenPosition`
 

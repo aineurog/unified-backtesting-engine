@@ -15,6 +15,7 @@ pytest.importorskip("nautilus_trader")
 import ube.papertrading.state as paper_state_module  # noqa: E402
 from ube.core.config import BacktestConfig, SignalConfig  # noqa: E402
 from ube.core.data import MarketData  # noqa: E402
+from ube.core.errors import ConfigError  # noqa: E402
 from ube.core.ledger import trades as ledger_trades  # noqa: E402
 from ube.core.signals import Signals, from_target  # noqa: E402
 from ube.papertrading import init, step  # noqa: E402
@@ -185,6 +186,12 @@ def test_state_stats_uses_returns_persisted_with_equity(tmp_path, monkeypatch) -
     # the inner BacktestConfig is accepted too
     inner = state.stats(md, cfg.base)
     assert inner.n_metrics == snapshot.n_metrics
+
+
+def test_state_stats_rejects_wrong_config_type(tmp_path) -> None:
+    md, _, _, state = _setup(tmp_path)
+    with pytest.raises(ConfigError):
+        state.stats(md, object())  # type: ignore[arg-type]
 
 
 def test_state_stats_without_history_degrades(tmp_path) -> None:

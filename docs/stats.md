@@ -45,7 +45,7 @@ result.stats.table()              # metric / value / category DataFrame
 | `computed_at_ns` | UTC timestamp of the computation (ns). |
 
 Methods: `get(name, default=None)`, `category(name)`, `table()`, `to_dict()`,
-`to_records()` (sqlite rows), `with_benchmark(curve, returns=..., index=...)`.
+`to_records()` (long-form rows for export), `with_benchmark(curve, returns=..., index=...)`.
 
 ## Paper trading
 

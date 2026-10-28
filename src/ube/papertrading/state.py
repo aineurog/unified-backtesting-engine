@@ -26,7 +26,7 @@ import pandas as pd
 
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
-from ube.core.errors import StateCorruptionError
+from ube.core.errors import ConfigError, StateCorruptionError
 from ube.core.instrument import Instrument, resolve_settlement_currency
 from ube.core.ledger import (
     EquityCurve,
@@ -542,8 +542,6 @@ class PaperState:
         stats_trade_count: Closed trades as of the last snapshot written during this
             process. Informational only; resume-safe snapshot idempotency is determined
             from the database.
-        stats_complete: Whether the last in-process snapshot contained the returns tier.
-        stats_equity_points: Equity-grid length used by the last in-process snapshot.
     """
 
     def __init__(
@@ -562,8 +560,6 @@ class PaperState:
         run_id: str | None = None,
         db_path: str | None = None,
         stats_trade_count: int = 0,
-        stats_complete: bool = True,
-        stats_equity_points: int = 0,
     ) -> None:
         self.instrument_id = instrument_id
         self.ledger = ledger
@@ -581,8 +577,6 @@ class PaperState:
         self.run_id: str | None = run_id
         self.db_path: str | None = db_path
         self.stats_trade_count = int(stats_trade_count)
-        self.stats_complete = bool(stats_complete)
-        self.stats_equity_points = int(stats_equity_points)
 
     def window_start_ns(self, *, warmup_ns: int = 0) -> int:
         """The int64-ns start of the context window this engine needs to resume (§6.1).
@@ -671,13 +665,14 @@ class PaperState:
             rf: Risk-free rate passed through to stratstat.
 
         Returns:
-            A frozen :class:`~ube.stats.StatsResult` — every failure lands in its
-            ``errors`` mapping instead of raising, exactly like the backtest path.
+            A frozen :class:`~ube.stats.StatsResult` — every tier failure lands in its
+            ``errors`` mapping instead of raising, exactly like the backtest path. An
+            invalid ``config`` type raises :class:`~ube.core.errors.ConfigError`.
         """
         inner = getattr(config, "base", None)
         base: BacktestConfig | PaperConfig = inner if isinstance(inner, BacktestConfig) else config
         if not isinstance(base, BacktestConfig):
-            raise TypeError("stats() needs a BacktestConfig or a PaperConfig carrying one")
+            raise ConfigError("stats() needs a BacktestConfig or a PaperConfig carrying one")
         instrument = getattr(base, "instrument", None)
         instr = instrument if isinstance(instrument, Instrument) else None
         instruments = {self.instrument_id: instr} if instr is not None else {}
@@ -711,7 +706,8 @@ class PaperState:
             curve, reason = self._ledger_equity(data, base, instr)
             if curve is not None:
                 if through_ns is not None:
-                    keep = curve.index.asi8 <= int(through_ns)
+                    index_ns = curve.index.asi8  # type: ignore[attr-defined, unused-ignore]
+                    keep = index_ns <= int(through_ns)
                     index, equity = curve.index[keep], curve.equity[keep]
                 else:
                     index, equity = curve.index, curve.equity

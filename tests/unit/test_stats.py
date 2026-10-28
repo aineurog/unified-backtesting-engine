@@ -18,6 +18,7 @@ import pytest
 
 import ube.stats as stats
 from ube.core.benchmark import BenchmarkCurve
+from ube.core.errors import ConfigError
 from ube.core.ledger import Trade
 
 
@@ -108,7 +109,7 @@ def test_return_policies_handle_insolvent_points() -> None:
     assert dropped.meta["input"]["returns"] == 8
     assert dropped.meta["dropped_returns"] == 2
 
-    with pytest.raises(ValueError, match="return_policy"):
+    with pytest.raises(ConfigError, match="return_policy"):
         stats.compute(raw, return_policy="keep")
 
 
@@ -238,8 +239,23 @@ def test_save_and_load_round_trip(tmp_path) -> None:
     assert all(pd.isna(latest.loc[0, metric]) for metric in removed_metrics)
 
     assert stats.load_stats(tmp_path / "missing.db", "run").empty
-    with pytest.raises(TypeError, match="StatsResult"):
+    with pytest.raises(ConfigError, match="StatsResult"):
         stats.save_stats(db, "run", {"not": "a result"})  # type: ignore[arg-type]
+
+
+def test_save_stats_rejects_metric_names_that_collide_with_columns(tmp_path) -> None:
+    clashing = stats.StatsResult(
+        values={"trade_count": 1.0},
+        objects={},
+        categories={},
+        periods_per_year=252.0,
+        tiers=(),
+        meta={},
+        errors={},
+        computed_at_ns=0,
+    )
+    with pytest.raises(ConfigError, match="conflict"):
+        stats.save_stats(tmp_path / "paper.db", "run", clashing)
 
 
 def test_wide_stats_stores_nonfinite_and_object_metrics(tmp_path) -> None:
