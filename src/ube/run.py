@@ -372,9 +372,18 @@ def run(
         benchmark_md = _warmup_slice_market_data(md, config.warmup_bars)
         benchmark = build_benchmark(config.benchmark, benchmark_md)
         # Attach the benchmark to the result. Benchmark and strategy curves are
-        # positionally aligned (both warm-up / date-range sliced), so the external
-        # metrics layer can compare them (§10); ``ube`` computes no metrics itself.
-        result = replace(result, benchmark=benchmark)
+        # positionally aligned (both warm-up / date-range sliced), so the strategy
+        # statistics can compare them (§10); ``ube`` computes no metrics of its own.
+        # The adapter-built result already carries the return/trade/exposure tiers, so the
+        # benchmark tier is computed now and merged — no ledger work is repeated.
+        stats_view = result.stats
+        if stats_view is not None:
+            stats_view = stats_view.with_benchmark(
+                benchmark,
+                returns=result.equity_curve.returns,
+                index=result.equity_curve.index,
+            )
+        result = replace(result, benchmark=benchmark, stats=stats_view)
         data_reference = DataReference.from_market_data(md, config.instrument)
 
     # §4.8: unconditional, every run — single-instrument or portfolio. This is reached on

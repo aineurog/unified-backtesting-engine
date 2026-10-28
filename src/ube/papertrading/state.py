@@ -19,14 +19,28 @@ import json
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 
+from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
-from ube.core.errors import StateCorruptionError
-from ube.core.ledger import EventLedger, EventType, LedgerEvent
+from ube.core.errors import ConfigError, StateCorruptionError
+from ube.core.instrument import Instrument, resolve_settlement_currency
+from ube.core.ledger import (
+    EquityCurve,
+    EventLedger,
+    EventType,
+    LedgerEvent,
+    equity_curve,
+    trades,
+)
+from ube.stats import StatsResult
+from ube.stats import from_arrays as stats_from_arrays
+
+if TYPE_CHECKING:
+    from ube.papertrading.config import PaperConfig
 
 __all__ = [
     "ExitSeed",
@@ -205,7 +219,7 @@ CREATE TABLE IF NOT EXISTS equity (
     run_id    TEXT NOT NULL,
     timestamp INTEGER NOT NULL,
     equity    REAL NOT NULL,
-    returns   REAL NOT NULL,
+    returns   REAL,
     PRIMARY KEY (run_id, timestamp)
 )
 """
@@ -226,6 +240,10 @@ def _ensure_all_tables(conn: sqlite3.Connection) -> None:
     conn.execute(_STRATEGIES_SCHEMA_SQL)
     conn.execute(_TRADES_SCHEMA_SQL)
     conn.execute(_EQUITY_SCHEMA_SQL)
+    equity_columns = conn.execute("PRAGMA table_info(equity)").fetchall()
+    returns_column = next(column for column in equity_columns if column[1] == "returns")
+    if returns_column[3]:
+        _migrate_equity_returns(conn)
     # migrations for old DBs that predate new tables
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE paper_state ADD COLUMN aux_data TEXT")
@@ -233,6 +251,40 @@ def _ensure_all_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE paper_state ADD COLUMN exit_seed TEXT")
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE paper_state ADD COLUMN last_funding_ns INTEGER")
+
+
+def _return_between(current: float, previous: float) -> float | None:
+    """Return the simple period return, or ``None`` when it is undefined."""
+    if not np.isfinite(current) or not np.isfinite(previous) or previous <= 0.0:
+        return None
+    return current / previous - 1.0
+
+
+def _migrate_equity_returns(conn: sqlite3.Connection) -> None:
+    """Make legacy equity returns nullable and replace their placeholder values."""
+    conn.execute("SAVEPOINT equity_returns_migration")
+    try:
+        rows = conn.execute(
+            "SELECT run_id, timestamp, equity FROM equity ORDER BY run_id, timestamp"
+        ).fetchall()
+        conn.execute("ALTER TABLE equity RENAME TO equity_legacy")
+        conn.execute(_EQUITY_SCHEMA_SQL)
+        previous_by_run: dict[str, float] = {}
+        for run_id, timestamp, equity_value in rows:
+            equity = float(equity_value)
+            previous = previous_by_run.get(str(run_id))
+            period_return = 0.0 if previous is None else _return_between(equity, previous)
+            conn.execute(
+                "INSERT INTO equity (run_id, timestamp, equity, returns) VALUES (?, ?, ?, ?)",
+                (run_id, timestamp, equity, period_return),
+            )
+            previous_by_run[str(run_id)] = equity
+        conn.execute("DROP TABLE equity_legacy")
+        conn.execute("RELEASE SAVEPOINT equity_returns_migration")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT equity_returns_migration")
+        conn.execute("RELEASE SAVEPOINT equity_returns_migration")
+        raise
 
 
 def get_or_create_run_id(
@@ -313,13 +365,14 @@ def save_trades(
 def save_equity(
     db_path: str, run_id: str, equity_df: Any
 ) -> None:
-    """Append equity points for run_id (expects DataFrame with timestamp/equity/returns)."""
+    """Append equity points and calculate returns from adjacent persisted equity values."""
     if equity_df is None or len(equity_df) == 0:
         return
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     try:
         _ensure_all_tables(conn)
+        points: list[tuple[int, float]] = []
         for _, r in equity_df.iterrows():
             # timestamp may be int ns or datetime
             raw_ts = r["timestamp"] if "timestamp" in r else r.get("timestamp")
@@ -327,11 +380,42 @@ def save_equity(
                 ts = int(pd.to_datetime(raw_ts, utc=True).value)  # ns
             except Exception:
                 ts = int(raw_ts)  # already int
+            points.append((ts, float(r["equity"])))
+        points.sort(key=lambda point: point[0])
+
+        conn.execute("BEGIN IMMEDIATE")
+        for ts, equity_value in points:
+            previous_row = conn.execute(
+                "SELECT equity FROM equity WHERE run_id = ? AND timestamp < ? "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (run_id, ts),
+            ).fetchone()
+            period_return = (
+                0.0
+                if previous_row is None
+                else _return_between(equity_value, float(previous_row[0]))
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO equity (run_id, timestamp, equity, returns) "
                 "VALUES (?, ?, ?, ?)",
-                (run_id, int(ts), float(r["equity"]), float(r["returns"])),
+                (run_id, ts, equity_value, period_return),
             )
+            next_row = conn.execute(
+                "SELECT timestamp, equity FROM equity WHERE run_id = ? AND timestamp > ? "
+                "ORDER BY timestamp LIMIT 1",
+                (run_id, ts),
+            ).fetchone()
+            if next_row is not None:
+                following_return = _return_between(float(next_row[1]), equity_value)
+                conn.execute(
+                    "UPDATE equity SET returns = ? WHERE run_id = ? AND timestamp = ?",
+                    (following_return, run_id, int(next_row[0])),
+                )
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 
@@ -455,6 +539,9 @@ class PaperState:
             the backend at the end of each ``execute`` and re-applied on resume so trailing /
             ATR exits are not degenerate after a restart (issue C). ``None`` when flat or no
             path-dependent exit needs it.
+        stats_trade_count: Closed trades as of the last snapshot written during this
+            process. Informational only; resume-safe snapshot idempotency is determined
+            from the database.
     """
 
     def __init__(
@@ -472,6 +559,7 @@ class PaperState:
         last_funding_ns: int | None = None,
         run_id: str | None = None,
         db_path: str | None = None,
+        stats_trade_count: int = 0,
     ) -> None:
         self.instrument_id = instrument_id
         self.ledger = ledger
@@ -488,6 +576,7 @@ class PaperState:
         self.last_funding_ns: int | None = last_funding_ns
         self.run_id: str | None = run_id
         self.db_path: str | None = db_path
+        self.stats_trade_count = int(stats_trade_count)
 
     def window_start_ns(self, *, warmup_ns: int = 0) -> int:
         """The int64-ns start of the context window this engine needs to resume (§6.1).
@@ -533,6 +622,159 @@ class PaperState:
         if not isinstance(data, dict):
             raise StateCorruptionError("config_ref YAML must be a mapping")
         return data
+
+    # ------------------------------------------------------------------
+    # Statistics (§10 — StratStat, same four tiers as a backtest).
+    # ------------------------------------------------------------------
+
+    def stats(
+        self,
+        data: MarketData,
+        config: BacktestConfig | PaperConfig,
+        *,
+        through_ns: int | None = None,
+        periods_per_year: float | None = None,
+        resample_to: str | None = None,
+        return_policy: str = "truncate",
+        rf: float = 0.0,
+    ) -> StatsResult:
+        """Compute the four-tier strategy statistics for this session (§10).
+
+        The paper path differs from the backtest one only in where the equity comes from:
+        bars are never stored (§9.5), so its returns tier uses the period returns persisted
+        by :func:`save_equity`. If no persisted curve is available, it falls back to a
+        ledger-derived curve when ``data`` covers the whole ledger.
+
+        Args:
+            data: Bars for the current window, used to price the exposure tier. A live
+                slice that starts after the run began cannot represent full-history
+                exposure, so the tier is skipped and recorded in ``errors`` rather than
+                silently reporting a partial book.
+            config: The run's :class:`~ube.papertrading.config.PaperConfig` (or its inner
+                :class:`~ube.core.config.BacktestConfig`) — the state carries no
+                ``Instrument``, so the caller must supply the config.
+            through_ns: Optional inclusive UTC nanosecond cutoff for the equity grid.
+                Paper snapshots pass the latest closed trade's exit timestamp so later
+                open-position mark-to-market is excluded.
+            periods_per_year: Annualisation override; inferred from the equity grid
+                otherwise (§4.9).
+            resample_to: Optional pandas offset alias (e.g. ``"1D"``) applied before
+                annualisation.
+            return_policy: How insolvent ``NaN`` returns are handled; see
+                :func:`ube.stats.compute`.
+            rf: Risk-free rate passed through to stratstat.
+
+        Returns:
+            A frozen :class:`~ube.stats.StatsResult` — every tier failure lands in its
+            ``errors`` mapping instead of raising, exactly like the backtest path. An
+            invalid ``config`` type raises :class:`~ube.core.errors.ConfigError`.
+        """
+        inner = getattr(config, "base", None)
+        base: BacktestConfig | PaperConfig = inner if isinstance(inner, BacktestConfig) else config
+        if not isinstance(base, BacktestConfig):
+            raise ConfigError("stats() needs a BacktestConfig or a PaperConfig carrying one")
+        instrument = getattr(base, "instrument", None)
+        instr = instrument if isinstance(instrument, Instrument) else None
+        instruments = {self.instrument_id: instr} if instr is not None else {}
+        market_data = {self.instrument_id: data} if instr is not None else {}
+        run_id = self.run_id or "default"
+
+        equity_source = "none"
+        equity_note = "no persisted equity points and no ledger-covered bars"
+        index: pd.Index = pd.DatetimeIndex([])
+        equity: np.ndarray = np.zeros(0, dtype=np.float64)
+        persisted_index: pd.Index = pd.DatetimeIndex([])
+        persisted_equity: np.ndarray = np.zeros(0, dtype=np.float64)
+        persisted_returns: np.ndarray = np.zeros(0, dtype=np.float64)
+        if self.db_path:
+            persisted = load_equity(self.db_path, run_id)
+            if through_ns is not None and len(persisted):
+                persisted = persisted.loc[
+                    persisted["timestamp"].astype("int64") <= int(through_ns)
+                ]
+            if len(persisted):
+                persisted_index = pd.DatetimeIndex(persisted["timestamp"])
+                persisted_equity = np.asarray(persisted["equity"], dtype=np.float64)
+                persisted_returns = np.asarray(persisted["returns"], dtype=np.float64)
+        if len(persisted_index) >= 2:
+            index, equity = persisted_index, persisted_equity
+            equity_source = "persisted"
+            equity_note = "equity and period returns written by step()"
+        else:
+            # A one-point grid cannot produce returns. Try the ledger instead — possible
+            # whenever the caller supplied the whole history (a one-shot step or a test).
+            curve, reason = self._ledger_equity(data, base, instr)
+            if curve is not None:
+                if through_ns is not None:
+                    index_ns = curve.index.asi8  # type: ignore[attr-defined, unused-ignore]
+                    keep = index_ns <= int(through_ns)
+                    index, equity = curve.index[keep], curve.equity[keep]
+                else:
+                    index, equity = curve.index, curve.equity
+                equity_source = "ledger"
+                equity_note = "derived from the ledger + supplied bars (no db equity)"
+            elif len(persisted_index):
+                index, equity = persisted_index, persisted_equity
+                equity_source = "persisted_partial"
+                equity_note = (
+                    f"only {len(persisted_index)} equity point(s) persisted and the supplied "
+                    "bars do not span the ledger, so the returns tier is unavailable"
+                )
+            else:
+                equity_note = reason
+
+        return stats_from_arrays(
+            index,
+            equity,
+            trades=trades(self.ledger, instruments=instruments) if instruments else (),
+            ledger=self.ledger,
+            market_data=market_data,
+            instruments=instruments,
+            equity_returns=persisted_returns if equity_source == "persisted" else None,
+            periods_per_year=periods_per_year,
+            resample_to=resample_to,
+            return_policy=return_policy,
+            rf=rf,
+            extra_meta={
+                "equity_source": equity_source,
+                "equity_note": equity_note,
+                "instrument_resolved": instr is not None,
+                "n_equity_points": int(len(index)),
+            },
+        )
+
+    def _ledger_equity(
+        self, data: MarketData, base: BacktestConfig, instr: Instrument | None
+    ) -> tuple[EquityCurve | None, str]:
+        """Derive the equity curve from the ledger + ``data`` when no db points exist.
+
+        Only possible when ``data`` spans the whole ledger: mark-to-market needs a bar for
+        every event, and a live ``step()`` window never has one. Returns the curve, or
+        ``(None, reason)`` when that is impossible.
+        """
+        if instr is None:
+            return None, "config did not resolve to an Instrument"
+        if not self.ledger.events:
+            return None, "the ledger is empty"
+        ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
+        first = min(int(e.timestamp) for e in self.ledger.events)
+        last = max(int(e.timestamp) for e in self.ledger.events)
+        if int(ts[0]) > first or int(ts[-1]) < last:
+            return None, (
+                "the supplied bars do not span the ledger "
+                f"({int(ts[0])}..{int(ts[-1])} vs {first}..{last})"
+            )
+        base_currency = base.base_currency or resolve_settlement_currency(instr)
+        try:
+            curve = equity_curve(
+                self.ledger,
+                {self.instrument_id: data},
+                {self.instrument_id: instr},
+                base_currency=base_currency,
+            )
+        except Exception as exc:  # noqa: BLE001 — a derivable curve is a bonus, not a contract
+            return None, f"ledger equity derivation failed: {type(exc).__name__}: {exc}"
+        return curve, ""
 
     # ------------------------------------------------------------------
     # Persistence.

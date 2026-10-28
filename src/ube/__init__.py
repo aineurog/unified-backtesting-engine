@@ -8,6 +8,7 @@ core types/functions needed to compose a :class:`~ube.core.config.BacktestConfig
 
 import sys
 
+from ube import stats
 from ube.adapters import (
     AUTO_ENGINE_ORDER,
     EngineAdapter,
@@ -80,4 +81,5 @@ __all__ = [
     "resolve_engine_name",
     "run",
     "signals",
+    "stats",
 ]

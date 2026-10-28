@@ -247,7 +247,7 @@ Sizing primitives (`fixed_fraction_size`, `fixed_units_size`,
 
 ## Results
 
-### `BacktestResult(run_id, ledger, config, trades, trade_table, positions, equity_curve, equity_curve_by_instrument, metrics=None, benchmark=None)`
+### `BacktestResult(run_id, ledger, config, trades, trade_table, positions, equity_curve, equity_curve_by_instrument, metrics=None, benchmark=None, stats=None)`
 
 | Attribute | Type | Description |
 |---|---|---|
@@ -261,6 +261,7 @@ Sizing primitives (`fixed_fraction_size`, `fixed_units_size`,
 | `equity_curve_by_instrument` | `dict[str, EquityCurve]` | Per-instrument equity. |
 | `metrics` | `Any \| None` | Currently `None`. |
 | `benchmark` | `BenchmarkCurve \| None` | Benchmark curve if configured. |
+| `stats` | `StatsResult \| None` | Four-tier statistics, computed eagerly (`None` when disabled). |
 
 **Methods:**
 
@@ -269,6 +270,50 @@ Sizing primitives (`fixed_fraction_size`, `fixed_units_size`,
 | `save` | `(path) -> None` | Pickle the full result. |
 | `load` | `(path) -> BacktestResult` | Load a pickled result (trusted sources only). |
 | `from_ledger` | `(run_id, ledger, config, ...) -> BacktestResult` | Rebuild from a ledger. |
+
+---
+
+## Statistics
+
+See [Statistics](stats.md) for the tiers, conventions, and sqlite schema.
+
+### `ube.stats.compute(returns, trades=None, benchmark=None, exposure=None, *, periods_per_year=None, rf=0.0, return_policy='truncate', ...) -> StatsResult`
+
+Assemble the tiers from already-built inputs. `returns` is a `pd.Series` (its
+index drives inference); `trades` is a sequence of `Trade` or a stratstat trade
+log; `benchmark` is a `BenchmarkCurve`, array, or series; `exposure` is a
+position-weight DataFrame.
+
+### `ube.stats.from_arrays(index, equity, *, trades, ledger=None, market_data=None, instruments=None, benchmark=None, ...) -> StatsResult`
+
+Build from an equity grid. `ledger` + `market_data` + `instruments` enable the
+exposure tier; `extra_meta` adds provenance to `StatsResult.meta`.
+
+### `ube.stats.from_result(result, **kwargs) -> StatsResult`
+
+Recompute from a result's cached views (no ledger re-derivation).
+
+### `ube.stats.save_stats(db_path, run_id, stats, *, trade_count=0) -> None`
+
+Replace the current statistics row for the run. The table stores one row per
+`run_id`, with metadata columns and one column per metric.
+
+### `ube.stats.load_stats(db_path, run_id='default') -> pd.DataFrame`
+
+Read the current row for the run (zero or one row). The DataFrame has metadata
+columns (`as_of_ns`, `trade_count`, `n_equity_points`, `periods_per_year`,
+`tiers`, `errors_json`, `categories_json`, `refs_json`, `json_metrics`) and
+one column per metric.
+
+### `ube.stats.set_enabled(enabled) -> None` / `is_enabled() -> bool`
+
+Global switch; when disabled, `ube.run()` leaves `result.stats is None`.
+
+### `StatsResult`
+
+Fields: `values`, `objects`, `categories`, `periods_per_year`, `tiers`, `meta`,
+`errors`, `computed_at_ns`. Methods: `get`, `category`, `table`, `to_dict`,
+`to_records`, `with_benchmark`.
 
 ---
 
@@ -395,6 +440,7 @@ the cursor.
 | `trade_table` | `(config, db_path, run_id) -> pd.DataFrame` | Build trade table. |
 | `window_start_ns` | `() -> int` | Replay window start. |
 | `get_config_dict` | `() -> dict` | Export config as dict. |
+| `stats` | `(data, config, *, through_ns=None, periods_per_year=None, resample_to=None, return_policy='truncate', rf=0.0) -> StatsResult` | Four-tier statistics; `config` may be a `PaperConfig` or its inner `BacktestConfig`. |
 
 ### `OpenPosition`
 

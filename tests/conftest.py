@@ -35,6 +35,8 @@ ENGINE_TESTS: dict[str, tuple[str, ...]] = {
     "integration/test_backtrader_adapter.py": ("backtrader",),
     "integration/test_papertrading_backtrader.py": ("backtrader",),
     "integration/test_run.py": ("vectorbt", "nautilus"),
+    "integration/test_run_stats.py": ("nautilus",),
+    "integration/test_papertrading_stats.py": ("nautilus",),
     "integration/test_nautilus_adapter.py": ("nautilus",),
     "integration/test_nautilus_atr.py": ("nautilus",),
     "integration/test_nautilus_vol_target.py": ("nautilus",),
