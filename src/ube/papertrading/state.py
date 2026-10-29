@@ -564,7 +564,7 @@ class PaperState:
         stats_trade_count: int = 0,
     ) -> None:
         self.instrument_id = instrument_id
-        self.ledger = ledger
+        self._ledger = ledger
         self.last_processed_ns = last_processed_ns
         self.last_price = last_price
         self.open_position = open_position
@@ -579,6 +579,10 @@ class PaperState:
         self.run_id: str | None = run_id
         self.db_path: str | None = db_path
         self.stats_trade_count = int(stats_trade_count)
+
+    @property
+    def ledger(self) -> EventLedger:
+        return self._ledger
 
     def window_start_ns(self, *, warmup_ns: int = 0) -> int:
         """The int64-ns start of the context window this engine needs to resume (§6.1).
@@ -631,7 +635,7 @@ class PaperState:
 
     def stats(
         self,
-        data: MarketData,
+        data: MarketData | Mapping[str, MarketData],
         config: BacktestConfig | PaperConfig,
         *,
         through_ns: int | None = None,
@@ -675,6 +679,8 @@ class PaperState:
         base: BacktestConfig | PaperConfig = inner if isinstance(inner, BacktestConfig) else config
         if not isinstance(base, BacktestConfig):
             raise ConfigError("stats() needs a BacktestConfig or a PaperConfig carrying one")
+        if not isinstance(data, MarketData):
+            raise ConfigError("PaperState.stats expects a MarketData")
         instrument = getattr(base, "instrument", None)
         instr = instrument if isinstance(instrument, Instrument) else None
         instruments = {self.instrument_id: instr} if instr is not None else {}
@@ -1126,7 +1132,7 @@ class PortfolioPaperState(PaperState):
 
     def stats(
         self,
-        data: Mapping[str, MarketData],
+        data: MarketData | Mapping[str, MarketData],
         config: Any,
         *,
         through_ns: int | None = None,

@@ -74,7 +74,10 @@ def run_single_asset(engine: str) -> None:
     result = ube.run(data, make_signals(), base_config(engine, btc))
 
     print(f"  single asset  [{engine}]")
-    print(f"    start/end equity : {result.equity_curve.equity[0]:,.2f} -> {result.equity_curve.equity[-1]:,.2f}")
+    print(
+        f"    start/end equity : {result.equity_curve.equity[0]:,.2f} -> "
+        f"{result.equity_curve.equity[-1]:,.2f}"
+    )
     print(f"    trades           : {len(result.trades)}")
 
 
@@ -105,7 +108,10 @@ def run_multi_asset(engine: str, allocation: ube.AllocationPolicy) -> None:
         for symbol in result.equity_curve_by_instrument
     )
     print(f"  multi asset   [{engine}] {type(allocation).__name__}")
-    print(f"    combined equity  : {result.equity_curve.equity[0]:,.2f} -> {result.equity_curve.equity[-1]:,.2f}")
+    print(
+        f"    combined equity  : {result.equity_curve.equity[0]:,.2f} -> "
+        f"{result.equity_curve.equity[-1]:,.2f}"
+    )
     print(f"    per instrument   : {by_instrument}")
     print(f"    trades (total)   : {len(result.trades)}")
 

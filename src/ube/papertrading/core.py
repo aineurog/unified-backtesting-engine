@@ -1094,6 +1094,22 @@ def run(
         else:
             raise
 
+    if config.is_portfolio:
+        if not isinstance(state, PortfolioPaperState):
+            raise ConfigError("portfolio paper run requires a PortfolioPaperState")
+        return step_portfolio(
+            data,
+            signals,
+            state,
+            config,
+            aux_data=aux_data,
+            start_from_ns=start_from_ns,
+        )
+    if not isinstance(data, MarketData):
+        raise ConfigError("paper run expects a MarketData")
+    if not isinstance(signals, Signals):
+        raise ConfigError("paper run expects Signals")
+
     # delegate to step (which now auto-saves and persists trades/equity)
     return step(data, signals, state, config, aux_data=aux_data, start_from_ns=start_from_ns)
 
@@ -1240,7 +1256,7 @@ def _run_auto_portfolio(
 
     if not slices_data:
         return []
-    _, events = step(slices_data, slices_signals, state, config)
+    _, events = step_portfolio(slices_data, slices_signals, state, config)
     return events
 
 

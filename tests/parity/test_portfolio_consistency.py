@@ -67,7 +67,10 @@ def _run(engine: str, allocation):
     return ube.run(data, signals, config)
 
 
-@pytest.mark.parametrize("allocation", [EqualWeight(), FixedWeight({"BTC-USDT": 0.75, "ETH-USDT": 0.25})])
+@pytest.mark.parametrize(
+    "allocation",
+    [EqualWeight(), FixedWeight({"BTC-USDT": 0.75, "ETH-USDT": 0.25})],
+)
 def test_portfolio_equity_is_comparable_across_engines(allocation):
     results = {engine: _run(engine, allocation) for engine in ENGINES}
     finals = {engine: float(result.equity_curve.equity[-1]) for engine, result in results.items()}
@@ -77,6 +80,6 @@ def test_portfolio_equity_is_comparable_across_engines(allocation):
         assert final == pytest.approx(reference, rel=1e-3), (engine, final, reference)
         assert len(results[engine].trades) == len(results["vectorbt"].trades)
 
-    for engine, result in results.items():
+    for _engine, result in results.items():
         assert set(result.equity_curve_by_instrument) == {"BTC-USDT", "ETH-USDT"}
         assert result.equity_curve.equity[0] == pytest.approx(100_000.0)

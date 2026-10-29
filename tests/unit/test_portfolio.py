@@ -180,7 +180,8 @@ def test_portfolio_validate_data_missing_and_extra():
 
 
 def test_portfolio_metadata_is_json_safe():
-    meta = portfolio_metadata(_portfolio(allocation=FixedWeight(weights={"BTC-USDT": 1.0, "ETH-USDT": 0.0})))
+    allocation = FixedWeight(weights={"BTC-USDT": 1.0, "ETH-USDT": 0.0})
+    meta = portfolio_metadata(_portfolio(allocation=allocation))
     assert meta["instruments"] == ["BTC-USDT", "ETH-USDT"]
     assert meta["base_currency"] == "USDT"
     assert meta["allocation"] == {

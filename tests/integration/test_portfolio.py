@@ -17,7 +17,8 @@ from ube.core.instrument import Instrument
 from ube.core.ledger import trades
 from ube.core.portfolio import EqualWeight, FixedWeight, PortfolioConfig
 from ube.core.risk import RiskConfig, SizeModel
-from ube.papertrading import PaperConfig, PortfolioPaperState, run as paper_run
+from ube.papertrading import PaperConfig, PortfolioPaperState
+from ube.papertrading import run as paper_run
 
 ENGINES = ("vectorbt", "backtrader", "nautilus")
 

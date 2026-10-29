@@ -235,8 +235,9 @@ def _portfolio_aux_for(
     """Select one leg's aux map, accepting either a flat map or ``symbol -> map``."""
     if aux_data is None:
         return None
-    if symbol in aux_data and isinstance(aux_data[symbol], Mapping):
-        return aux_data[symbol]
+    nested = aux_data.get(symbol)
+    if isinstance(nested, Mapping):
+        return dict(nested)
     return aux_data
 
 
@@ -258,7 +259,7 @@ def _portfolio_fx_rates(
     grid = np.unique(
         np.concatenate(
             [
-                np.asarray(md.timestamps.as_unit("ns").asi8, dtype=np.int64)
+                md.timestamps.as_unit("ns").to_numpy(dtype=np.int64)
                 for md in market_data.values()
             ]
         )

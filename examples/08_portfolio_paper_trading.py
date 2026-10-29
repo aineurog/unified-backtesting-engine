@@ -118,7 +118,10 @@ def run_multi_asset(engine: str, allocation: ube.AllocationPolicy) -> None:
     print(f"  multi asset   [{engine}] {type(allocation).__name__}")
     print(f"    state / events   : {type(state).__name__} / {len(events)}")
     print(f"    open positions   : {state.open_positions}")
-    print(f"    combined stats   : {snapshot.n_metrics} metrics, equity_source={snapshot.meta['equity_source']}")
+    print(
+        f"    combined stats   : {snapshot.n_metrics} metrics, "
+        f"equity_source={snapshot.meta['equity_source']}"
+    )
 
 
 def main() -> None:
