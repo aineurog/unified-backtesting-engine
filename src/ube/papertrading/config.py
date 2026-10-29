@@ -10,11 +10,14 @@ engine overrides.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 from ube.core.calendar import TradingCalendar, resolve_calendar
 from ube.core.config import BacktestConfig
+from ube.core.errors import ConfigError
+from ube.core.portfolio import PortfolioConfig
 
 __all__ = ["PaperConfig"]
 
@@ -46,6 +49,9 @@ class PaperConfig:
             :class:`~ube.core.errors.CalendarMismatchError` (``True``, backtest parity)
             instead of skipping the bar and warning (``False``, the paper default so one
             bad bar never kills a long-running session).
+        portfolio: Optional :class:`~ube.core.portfolio.PortfolioConfig`. When set, the
+            session is multi-asset and shares one pool of capital. ``None`` keeps the
+            original single-instrument contract untouched.
     """
 
     base: BacktestConfig
@@ -59,14 +65,56 @@ class PaperConfig:
     # are a no-op either way.
     calendar_validate: bool = True
     calendar_strict: bool = False
+    portfolio: PortfolioConfig | None = None
 
     def __post_init__(self) -> None:
-        if self.starting_balance is not None and self.starting_balance <= 0:
-            raise ValueError("starting_balance must be > 0")
+        portfolio = self.portfolio if self.portfolio is not None else self.base.portfolio
+        if portfolio is not None:
+            if not isinstance(portfolio, PortfolioConfig):
+                raise ConfigError("portfolio must be a PortfolioConfig or None")
+            if (
+                self.portfolio is not None
+                and self.base.portfolio is not None
+                and self.base.portfolio != self.portfolio
+            ):
+                raise ConfigError(
+                    "PaperConfig.portfolio and base.portfolio disagree; declare it once"
+                )
+            if self.base.instrument.symbol not in portfolio.instrument_ids:
+                raise ConfigError(
+                    "base.instrument must be one of the portfolio instruments; got "
+                    f"{self.base.instrument.symbol!r}"
+                )
+            if self.base.base_currency is None and portfolio.base_currency:
+                import dataclasses
+
+                object.__setattr__(
+                    self,
+                    "base",
+                    dataclasses.replace(self.base, base_currency=portfolio.base_currency),
+                )
+            # The combined equity is denominated in one base currency; a disagreement
+            # would silently mis-scale every leg (§4.7 — never assume a currency).
+            if (
+                self.base.base_currency is not None
+                and self.base.base_currency.strip().upper()
+                != portfolio.base_currency.strip().upper()
+            ):
+                raise ConfigError(
+                    "base.base_currency and portfolio.base_currency disagree "
+                    f"({self.base.base_currency!r} vs {portfolio.base_currency!r})"
+                )
+        if self.starting_balance is not None and (
+            isinstance(self.starting_balance, bool)
+            or not isinstance(self.starting_balance, int | float)
+            or not math.isfinite(self.starting_balance)
+            or self.starting_balance <= 0
+        ):
+            raise ConfigError("starting_balance must be a finite number > 0")
         if not isinstance(self.calendar_validate, bool):
-            raise ValueError("calendar_validate must be a bool")
+            raise ConfigError("calendar_validate must be a bool")
         if not isinstance(self.calendar_strict, bool):
-            raise ValueError("calendar_strict must be a bool")
+            raise ConfigError("calendar_strict must be a bool")
         # Fold the convenience balance into the engine overrides so the backend sees a
         # single canonical config (no second source of truth for the balance).
         if self.starting_balance is not None:
@@ -78,6 +126,16 @@ class PaperConfig:
 
             new_base = dataclasses.replace(self.base, engine_overrides=overrides)
             object.__setattr__(self, "base", new_base)
+
+    @property
+    def portfolio_config(self) -> PortfolioConfig | None:
+        """The effective portfolio config (``PaperConfig`` field or ``base.portfolio``)."""
+        return self.portfolio if self.portfolio is not None else self.base.portfolio
+
+    @property
+    def is_portfolio(self) -> bool:
+        """Whether this session trades several instruments from one shared pool."""
+        return self.portfolio_config is not None
 
     @property
     def overrides(self) -> dict[str, Any]:

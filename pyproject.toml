@@ -96,6 +96,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]
 # The test tree shares helpers across directories (``tests/parity/_parity.py``,
 # ``tests/_engines.py``) and imports them as ``tests.<...>``, which needs the repository
 # root importable. Without this the parity modules only collect when the caller happens to

@@ -37,6 +37,7 @@ from ube.core.benchmark import BenchmarkConfig
 from ube.core.cost import CostModel
 from ube.core.errors import ConfigError, UndeclaredConfigError
 from ube.core.instrument import Instrument
+from ube.core.portfolio import PortfolioConfig
 from ube.core.risk import RiskConfig
 
 __all__ = [
@@ -109,6 +110,10 @@ class BacktestConfig:
             runs (§7.1). Never silently defaulted.
         warmup_bars: Number of leading bars to exclude from the derived views and
             metrics (indicator lookback, §7.2). Non-negative integer; default ``0``.
+        portfolio: Optional :class:`~ube.core.portfolio.PortfolioConfig`. When set, a
+            ``{instrument_id: MarketData}`` run uses the shared-capital portfolio path
+            (one combined equity curve, one pool) instead of forwarding the mapping to a
+            single adapter. ``None`` keeps the single-instrument contract unchanged.
     """
 
     instrument: Instrument
@@ -121,6 +126,7 @@ class BacktestConfig:
     date_range: tuple[Any, Any] | None = None
     base_currency: str | None = None
     warmup_bars: int = 0
+    portfolio: PortfolioConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.instrument, Instrument):
@@ -183,6 +189,27 @@ class BacktestConfig:
             raise ConfigError(
                 f"warmup_bars must be a non-negative integer; got {self.warmup_bars!r}"
             )
+        if self.portfolio is not None:
+            if not isinstance(self.portfolio, PortfolioConfig):
+                raise ConfigError(
+                    "portfolio must be a PortfolioConfig or None; "
+                    f"got {type(self.portfolio).__name__}"
+                )
+            if (
+                self.base_currency is not None
+                and self.base_currency.strip().upper()
+                != self.portfolio.base_currency.strip().upper()
+            ):
+                raise ConfigError(
+                    "base_currency and portfolio.base_currency disagree "
+                    f"({self.base_currency!r} vs {self.portfolio.base_currency!r})"
+                )
+            if self.instrument.symbol not in self.portfolio.instrument_ids:
+                raise ConfigError(
+                    "config.instrument must be one of the portfolio instruments; "
+                    f"got {self.instrument.symbol!r}, expected one of "
+                    f"{list(self.portfolio.instrument_ids)}"
+                )
 
     def validate(self, *, portfolio: bool = False, paper_trading: bool = False) -> None:
         """Validate cross-field constraints for a run mode (§4.7).
@@ -207,7 +234,7 @@ class BacktestConfig:
         Raises:
             UndeclaredConfigError: A required explicit-over-default field is unset.
         """
-        if portfolio and self.base_currency is None:
+        if portfolio and self.base_currency is None and self.portfolio is None:
             raise UndeclaredConfigError(
                 "base_currency is required for a portfolio run but was not declared "
                 "(§4.7 — never silently assume a base currency)"
