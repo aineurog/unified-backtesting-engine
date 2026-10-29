@@ -7,6 +7,8 @@ Backtrader, over the same canonical inputs.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -19,6 +21,7 @@ from ube.core.portfolio import EqualWeight, FixedWeight, PortfolioConfig
 from ube.core.risk import RiskConfig, SizeModel
 from ube.papertrading import PaperConfig, PortfolioPaperState
 from ube.papertrading import run as paper_run
+from ube.papertrading.state import load_equity
 
 ENGINES = ("vectorbt", "backtrader", "nautilus")
 
@@ -124,6 +127,117 @@ def test_fixed_weight_portfolio_runs(engine: str):
 
     assert {trade.instrument_id for trade in result.trades} == set(data)
     assert result.equity_curve.equity[0] == pytest.approx(100_000.0)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_fixed_weight_cash_remainder_is_preserved(engine: str):
+    # 0.5 + 0.3 leaves 20% of the pool unallocated; it must be held as base-currency
+    # cash, not silently dropped, so the combined curve starts at the full balance.
+    allocation = FixedWeight(weights={"BTC-USDT": 0.5, "ETH-USDT": 0.3})
+    data = _data()
+    signals = {symbol: ube.from_target(_targets()) for symbol in data}
+
+    result = ube.run(data, signals, _config(engine, _portfolio(allocation)))
+
+    assert result.equity_curve.equity[0] == pytest.approx(100_000.0)
+    assert {trade.instrument_id for trade in result.trades} == set(data)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_portfolio_benchmark_is_equal_weight(engine: str):
+    data = _data()
+    signals = {symbol: ube.from_target(_targets()) for symbol in data}
+
+    result = ube.run(data, signals, _config(engine))
+
+    assert result.benchmark is not None
+    assert "benchmark" in result.stats.tiers
+    assert len(result.benchmark.equity) == len(result.equity_curve.equity)
+    expected = 0.5 * (
+        data["BTC-USDT"].close[-1] / data["BTC-USDT"].close[0]
+    ) + 0.5 * (data["ETH-USDT"].close[-1] / data["ETH-USDT"].close[0])
+    assert result.benchmark.equity[-1] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_date_range_slices_portfolio_data_and_signals(engine: str):
+    data = _data()
+    signals = {symbol: ube.from_target(_targets()) for symbol in data}
+    # Inclusive window over hourly bars from 2025-01-01 00:00 => 11 points.
+    config = replace(
+        _config(engine),
+        date_range=("2025-01-01 05:00", "2025-01-01 15:00"),
+    )
+
+    result = ube.run(data, signals, config)
+
+    assert len(result.equity_curve.equity) == 11
+    assert result.benchmark is not None
+    assert len(result.benchmark.equity) == 11
+
+
+def test_starting_balance_is_converted_from_base_currency():
+    # A EUR-settling leg must be seeded with the base-currency share divided by the
+    # declared EUR->USD rate, so the combined equity still starts at the full pool.
+    btc = Instrument("BTC-USDT", asset_class="crypto_perp", settlement_currency="USDT")
+    eth = Instrument("ETH-EUR", asset_class="crypto_perp", settlement_currency="EUR")
+    portfolio = PortfolioConfig(
+        instruments=(btc, eth), base_currency="USD", allocation=EqualWeight()
+    )
+    data = {
+        "BTC-USDT": ube.MarketData.from_dataframe(_bars(12.0), timestamp_col="timestamp"),
+        "ETH-EUR": ube.MarketData.from_dataframe(_bars(22.0), timestamp_col="timestamp"),
+    }
+    signals = {symbol: ube.from_target(_targets()) for symbol in data}
+    config = BacktestConfig(
+        instrument=btc,
+        base_currency="USD",
+        portfolio=portfolio,
+        risk=RiskConfig(sizing=SizeModel(kind="all_in")),
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        engine="vectorbt",
+        engine_overrides={
+            "starting_balance": 100_000.0,
+            "fx_rates": {"EURUSD": 1.25},
+        },
+    )
+
+    result = ube.run(data, signals, config)
+
+    assert result.equity_curve.equity[0] == pytest.approx(100_000.0)
+    assert set(result.equity_curve_by_instrument) == set(data)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_fixed_weight_paper_rollup_keeps_cash_remainder(engine: str, tmp_path):
+    # With no signals the legs stay in cash, so the persisted combined equity is exactly
+    # the allocated seeds plus the retained remainder.
+    portfolio = _portfolio(FixedWeight(weights={"BTC-USDT": 0.5, "ETH-USDT": 0.3}))
+    data = _data()
+    flat = ube.from_target(np.zeros(24, dtype=np.int64))
+    base = BacktestConfig(
+        instrument=portfolio.instruments[0],
+        base_currency=portfolio.base_currency,
+        portfolio=portfolio,
+        risk=RiskConfig(sizing=SizeModel(kind="all_in")),
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        engine_overrides={"starting_balance": 100_000.0},
+    )
+    config = PaperConfig(
+        base=base,
+        engine=engine,
+        starting_balance=100_000.0,
+        state_path=str(tmp_path / f"{engine}-cash.db"),
+    )
+    db = str(tmp_path / f"{engine}-cash.db")
+
+    state, events = paper_run(
+        "cash", data, {symbol: flat for symbol in data}, config
+    )
+
+    assert state.unallocated_cash == pytest.approx(20_000.0)
+    equity = load_equity(db, "cash")
+    assert equity["equity"].iloc[-1] == pytest.approx(100_000.0)
 
 
 @pytest.mark.parametrize("engine", ENGINES)

@@ -28,11 +28,13 @@ import pandas as pd
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, StateCorruptionError
+from ube.core.fx import declared_fx_rates, resolve_fx_rate
 from ube.core.instrument import Instrument, resolve_settlement_currency
 from ube.core.ledger import (
     EquityCurve,
     EventLedger,
     EventType,
+    FXSeries,
     LedgerEvent,
     equity_curve,
     trades,
@@ -951,6 +953,43 @@ class PaperState:
         raise NotImplementedError("Use load_trades(db_path, run_id) instead")
 
 
+def _portfolio_fx_series(
+    data: Mapping[str, MarketData],
+    instruments: Mapping[str, Instrument],
+    base_currency: str,
+    overrides: Mapping[str, Any] | None,
+) -> dict[str, FXSeries]:
+    """Constant FX curves converting each leg's settlement currency into the base (§4.6)."""
+    declared = declared_fx_rates(overrides)
+    non_empty = [md for md in data.values() if md.n_bars > 0]
+    if not non_empty:
+        return {}
+    grid = np.unique(
+        np.concatenate(
+            [
+                md.timestamps.as_unit("ns").to_numpy(dtype=np.int64)
+                for md in non_empty
+            ]
+        )
+    )
+    fx: dict[str, FXSeries] = {}
+    for instrument in instruments.values():
+        settlement = instrument.settlement_currency or resolve_settlement_currency(
+            instrument
+        )
+        if settlement.strip().upper() == base_currency.strip().upper():
+            continue
+        rate = resolve_fx_rate(settlement, base_currency, declared)
+        for key in (
+            settlement + base_currency,
+            settlement.upper() + base_currency.upper(),
+        ):
+            fx.setdefault(
+                key, FXSeries(index=grid, rate=np.full(grid.shape[0], rate))
+            )
+    return fx
+
+
 class PortfolioPaperState(PaperState):
     """A resumable multi-asset paper session sharing one pool of capital.
 
@@ -970,6 +1009,9 @@ class PortfolioPaperState(PaperState):
         run_id / db_path: The *parent* session identity. Sub-states persist under
             ``"<run_id>::<symbol>"`` so a portfolio session occupies one logical run
             without one row per instrument.
+        unallocated_cash: The base-currency part of the shared pool that the allocation
+            policy leaves uninvested (a FixedWeight split below 100%). It is carried in
+            the combined equity but never handed to a leg.
     """
 
     def __init__(
@@ -980,6 +1022,7 @@ class PortfolioPaperState(PaperState):
         run_id: str | None = None,
         db_path: str | None = None,
         stats_trade_count: int = 0,
+        unallocated_cash: float = 0.0,
     ) -> None:
         ids = tuple(instrument_ids)
         if not ids:
@@ -992,6 +1035,17 @@ class PortfolioPaperState(PaperState):
                 f"missing={sorted(set(ids) - set(states))}, "
                 f"extra={sorted(set(states) - set(ids))}"
             )
+        if (
+            isinstance(unallocated_cash, bool)
+            or not isinstance(unallocated_cash, int | float)
+            or not np.isfinite(unallocated_cash)
+            or unallocated_cash < 0.0
+        ):
+            raise ConfigError(
+                "unallocated_cash must be a finite non-negative number; "
+                f"got {unallocated_cash!r}"
+            )
+        self.unallocated_cash = float(unallocated_cash)
         self.instrument_ids = ids
         self.states: dict[str, PaperState] = dict(states)
         # Base-class compatibility attributes. Portfolio-wide values are derived from the
@@ -1070,12 +1124,14 @@ class PortfolioPaperState(PaperState):
                         manifest,
                         self.last_processed_ns,
                         None,
-                        _ledger_to_json(self.ledger),
+                        # The manifest ledger is derived from the per-leg rows on load;
+                        # persisting the combined copy would duplicate every event.
+                        _json([]),
                         None,
                         _json({}),
                         _json({}),
                         self.config_ref,
-                        None,
+                        _json({"unallocated_cash": self.unallocated_cash}),
                         None,
                         None,
                     ),
@@ -1109,7 +1165,8 @@ class PortfolioPaperState(PaperState):
         try:
             _ensure_all_tables(conn)
             row = conn.execute(
-                "SELECT instrument_id FROM paper_state WHERE run_id = ?", (run_id,)
+                "SELECT instrument_id, aux_data FROM paper_state WHERE run_id = ?",
+                (run_id,),
             ).fetchone()
         finally:
             conn.close()
@@ -1124,7 +1181,31 @@ class PortfolioPaperState(PaperState):
         states = {
             symbol: state_cls.load(path, run_id=f"{run_id}::{symbol}") for symbol in ids
         }
-        return cls(ids, states, run_id=run_id, db_path=path)
+        unallocated = 0.0
+        if row[1]:
+            try:
+                aux = json.loads(row[1])
+            except (TypeError, ValueError) as exc:
+                raise StateCorruptionError(
+                    f"portfolio manifest aux_data is not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(aux, Mapping):
+                raise StateCorruptionError("portfolio manifest aux_data must be a mapping")
+            raw_cash = aux.get("unallocated_cash", 0.0)
+            if (
+                isinstance(raw_cash, bool)
+                or not isinstance(raw_cash, int | float)
+                or not np.isfinite(raw_cash)
+                or raw_cash < 0.0
+            ):
+                raise StateCorruptionError(
+                    "portfolio manifest unallocated_cash must be finite and >= 0; "
+                    f"got {raw_cash!r}"
+                )
+            unallocated = float(raw_cash)
+        return cls(
+            ids, states, run_id=run_id, db_path=path, unallocated_cash=unallocated
+        )
 
     # ------------------------------------------------------------------
     # Statistics across the whole portfolio.
@@ -1178,14 +1259,18 @@ class PortfolioPaperState(PaperState):
                 persisted_returns = np.asarray(persisted["returns"], dtype=np.float64)
                 equity_source = "persisted"
                 equity_note = "combined portfolio equity written by step()"
+        merged = self.ledger
+        base_currency = base.base_currency or portfolio.base_currency
         if equity_source == "none":
-            merged = self.ledger
             try:
                 curve = equity_curve(
                     merged,
                     data,
                     instruments,
-                    base_currency=base.base_currency or portfolio.base_currency,
+                    base_currency=base_currency,
+                    fx_rates=_portfolio_fx_series(
+                        data, instruments, base_currency, base.engine_overrides
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 — a derivable curve is a bonus
                 equity_note = f"combined equity derivation failed: {type(exc).__name__}: {exc}"
@@ -1195,14 +1280,17 @@ class PortfolioPaperState(PaperState):
                     index, equity = curve.index[keep], curve.equity[keep]
                 else:
                     index, equity = curve.index, curve.equity
+                # The unallocated share is base-currency cash, not a leg's mark, so the
+                # ledger-derived curve must add it back to start at the shared balance.
+                equity = np.asarray(equity, dtype=np.float64) + self.unallocated_cash
                 equity_source = "ledger"
                 equity_note = "derived from the combined ledger + supplied bars"
 
         return stats_from_arrays(
             index,
             equity,
-            trades=trades(self.ledger, instruments=instruments),
-            ledger=self.ledger,
+            trades=trades(merged, instruments=instruments),
+            ledger=merged,
             market_data=data,
             instruments=instruments,
             equity_returns=persisted_returns,

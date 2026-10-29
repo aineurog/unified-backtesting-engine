@@ -7,13 +7,15 @@ any optional engine.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
 
 import ube
 from ube.core.config import BacktestConfig, SignalConfig
-from ube.core.errors import ConfigError, DuplicateBarError
+from ube.core.errors import ConfigError, DuplicateBarError, FXRateUnavailableError
 from ube.core.instrument import Instrument
 from ube.core.ledger import trades
 from ube.core.portfolio import EqualWeight, FixedWeight, PortfolioConfig
@@ -26,6 +28,7 @@ from ube.papertrading import (
     run_auto,
     step,
 )
+from ube.papertrading.core import _refresh_portfolio_stats_snapshot
 from ube.papertrading.state import load_equity, load_trades
 
 
@@ -146,6 +149,111 @@ def test_fixed_weight_zero_allocation_skips_that_leg(tmp_path):
     assert state.states["ETH-USDT"].ledger.events == ()
 
 
+def test_fixed_weight_init_tracks_unallocated_cash(tmp_path):
+    config, _, _ = _setup(
+        allocation=FixedWeight(weights={"BTC-USDT": 0.5, "ETH-USDT": 0.3})
+    )
+    state = init(config, run_id="p1", db_path=str(tmp_path / "paper.db"))
+
+    assert state.unallocated_cash == pytest.approx(20_000.0)
+
+
+def test_paper_config_rejects_currency_disagreement():
+    btc = Instrument("BTC-USDT", asset_class="crypto_perp", settlement_currency="USDT")
+    eth = Instrument("ETH-USDT", asset_class="crypto_perp", settlement_currency="USDT")
+    base_portfolio = PortfolioConfig(instruments=(btc, eth), base_currency="USDT")
+    base = BacktestConfig(
+        instrument=btc,
+        base_currency="USDT",
+        portfolio=base_portfolio,
+        engine_overrides={"starting_balance": 100_000.0},
+    )
+    # Only the paper-level portfolio disagrees, so BacktestConfig alone cannot catch it.
+    paper_portfolio = PortfolioConfig(instruments=(btc, eth), base_currency="USD")
+
+    with pytest.raises(ConfigError):
+        PaperConfig(base=base, portfolio=paper_portfolio)
+
+
+def test_portfolio_init_rejects_unconvertible_settlement(tmp_path):
+    btc = Instrument("BTC-USDT", asset_class="crypto_perp", settlement_currency="USDT")
+    eth = Instrument("ETH-EUR", asset_class="crypto_perp", settlement_currency="EUR")
+    portfolio = PortfolioConfig(instruments=(btc, eth), base_currency="USDT")
+    base = BacktestConfig(
+        instrument=btc,
+        portfolio=portfolio,
+        engine_overrides={"starting_balance": 100_000.0},
+    )
+    config = PaperConfig(base=base, engine="recording")
+
+    with pytest.raises(FXRateUnavailableError):
+        init(config, run_id="p1", db_path=str(tmp_path / "paper.db"))
+
+
+def test_portfolio_stats_uses_stablecoin_peg_for_usd_base(tmp_path):
+    btc = Instrument("BTC-USDT", asset_class="crypto_perp", settlement_currency="USDT")
+    eth = Instrument("ETH-USDT", asset_class="crypto_perp", settlement_currency="USDT")
+    portfolio = PortfolioConfig(instruments=(btc, eth), base_currency="USD")
+    base = BacktestConfig(
+        instrument=btc,
+        base_currency="USD",
+        portfolio=portfolio,
+        risk=RiskConfig(sizing=SizeModel(kind="all_in")),
+        signal=SignalConfig(on_opposite_signal="reverse"),
+        engine_overrides={"starting_balance": 100_000.0},
+    )
+    config = PaperConfig(base=base, engine="recording")
+    db = str(tmp_path / "paper.db")
+    state = init(config, run_id="p1", db_path=db)
+    data = {"BTC-USDT": _market(10.0), "ETH-USDT": _market(20.0)}
+    signals = {"BTC-USDT": ube.from_target(_targets()), "ETH-USDT": ube.from_target(_targets())}
+
+    state, _ = step(data, signals, state, config)
+    stats = state.stats(data, config)
+
+    # USDT -> USD is the documented peg, so the combined curve derives without raising.
+    assert stats.meta["equity_source"] == "ledger"
+    assert stats.meta["is_portfolio"] is True
+
+
+def test_portfolio_snapshot_skipped_when_trade_count_unchanged(tmp_path, monkeypatch):
+    config, _, _ = _setup()
+    db = str(tmp_path / "paper.db")
+    state = init(config, run_id="p1", db_path=db)
+    data = {"BTC-USDT": _market(10.0), "ETH-USDT": _market(20.0)}
+    first_bar_ns = int(_market(10.0).timestamps.as_unit("ns").asi8[0])
+    saved: list[int] = []
+    monkeypatch.setattr("ube.stats.save_stats", lambda *a, **k: saved.append(1))
+
+    # No snapshot yet: the first closed trade triggers a recompute.
+    monkeypatch.setattr("ube.stats.load_stats", lambda *a, **k: pd.DataFrame())
+    _refresh_portfolio_stats_snapshot(
+        db,
+        "p1",
+        data,
+        config,
+        state,
+        [SimpleNamespace(exit_timestamp=first_bar_ns)],
+    )
+    assert saved == [1]
+    assert state.stats_trade_count == 1
+
+    # A snapshot already covering that trade count is not recomputed.
+    snapshot = pd.DataFrame(
+        [{"trade_count": 1, "n_equity_points": 0, "tiers": "returns,trades"}]
+    )
+    monkeypatch.setattr("ube.stats.load_stats", lambda *a, **k: snapshot)
+    _refresh_portfolio_stats_snapshot(
+        db,
+        "p1",
+        data,
+        config,
+        state,
+        [SimpleNamespace(exit_timestamp=first_bar_ns)],
+    )
+    assert saved == [1]
+
+
 def test_portfolio_state_round_trips_through_sqlite(tmp_path):
     config, _, signals = _setup()
     db = str(tmp_path / "paper.db")
@@ -160,6 +268,7 @@ def test_portfolio_state_round_trips_through_sqlite(tmp_path):
     loaded = PortfolioPaperState.load(db, "p1")
     assert loaded.instrument_ids == state.instrument_ids
     assert loaded.last_processed_ns == state.last_processed_ns
+    assert loaded.unallocated_cash == pytest.approx(state.unallocated_cash)
     assert len(list(trades(loaded.ledger))) == len(list(trades(state.ledger)))
 
 

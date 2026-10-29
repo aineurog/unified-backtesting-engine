@@ -40,15 +40,20 @@ import numpy as np
 import pandas as pd
 
 from ube.adapters import get_engine, register_engine, resolve_engine_name
-from ube.core.benchmark import build_benchmark
+from ube.core.benchmark import BenchmarkConfig, BenchmarkCurve, build_benchmark
 from ube.core.calendar import resolve_calendar, validate_in_session, validate_timestamps
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidInstrumentError, InvalidSignalError
 from ube.core.experiment_log import DataReference, ExperimentLog, PortfolioDataReference
-from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
+from ube.core.fx import (
+    declared_fx_rates,
+    resolve_fx_rate,
+    stablecoin_peg_rate,
+    warn_stablecoin_peg,
+)
 from ube.core.instrument import resolve_settlement_currency
-from ube.core.ledger import EventLedger, FXSeries
+from ube.core.ledger import EventLedger, EventType, FXSeries, LedgerEvent
 from ube.core.portfolio import (
     DEFAULT_PORTFOLIO_BALANCE,
     PortfolioConfig,
@@ -156,13 +161,10 @@ def _warmup_slice_market_data(md: MarketData, n: int) -> MarketData:
 
 __all__ = ["run", "ensure_builtin_engines_registered"]
 
-#: The FX override aliases every adapter accepts, first-declared wins (§4.7).
-_FX_ALIASES: tuple[str, ...] = (
-    "synthetic_rates",
-    "fixed_conversions",
-    "currency_fx",
-    "fx_rates",
-)
+#: Instrument id for the synthetic cash event booking an allocation's unspent share.
+#: It carries no fills, so it never appears in trades or positions — only in the
+#: combined-equity cash term.
+_PORTFOLIO_CASH_ID = "__portfolio_cash__"
 
 
 def _portfolio_key(key: object) -> str:
@@ -241,21 +243,52 @@ def _portfolio_aux_for(
     return aux_data
 
 
+def _portfolio_rates(
+    portfolio: PortfolioConfig,
+    base_currency: str,
+    declared: Mapping[str, float],
+) -> dict[str, float]:
+    """``symbol -> rate`` converting each leg's settlement currency into the base.
+
+    The rate comes from the caller's declared FX overrides, else the documented
+    stablecoin peg (warned once per pair). An undeclared, unpegged pair raises
+    :class:`~ube.core.errors.FXRateUnavailableError` — it is never assumed (§4.7).
+    """
+    rates: dict[str, float] = {}
+    warned: set[str] = set()
+    for instrument in portfolio.instruments:
+        settlement = instrument.settlement_currency
+        if settlement is None:  # pragma: no cover — resolved before the legs run
+            raise ConfigError(
+                f"portfolio instrument {instrument.symbol!r} has no settlement currency"
+            )
+        rate = resolve_fx_rate(settlement, base_currency, declared)
+        pair_keys = {
+            settlement + base_currency,
+            settlement.upper() + base_currency.upper(),
+        }
+        if (
+            stablecoin_peg_rate(settlement, base_currency) is not None
+            and settlement.upper() != base_currency.upper()
+            and not pair_keys & set(declared)
+            and settlement.upper() not in warned
+        ):
+            warn_stablecoin_peg(settlement, base_currency, engine="portfolio")
+            warned.add(settlement.upper())
+        rates[instrument.symbol] = rate
+    return rates
+
+
 def _portfolio_fx_rates(
     config: BacktestConfig,
     market_data: Mapping[str, MarketData],
     instruments: Mapping[str, Any],
 ) -> dict[str, FXSeries] | None:
     """Build the constant FX series needed to combine several settlement currencies."""
-    overrides = dict(config.engine_overrides or {})
-    declared: dict[str, float] = {}
-    for alias in _FX_ALIASES:
-        value = overrides.get(alias)
-        if value is not None:
-            declared = {str(key): float(rate) for key, rate in dict(value).items()}
-            break
     if not market_data:
         return None
+    declared = declared_fx_rates(config.engine_overrides)
+    base_currency = str(config.base_currency or "")
     grid = np.unique(
         np.concatenate(
             [
@@ -264,31 +297,22 @@ def _portfolio_fx_rates(
             ]
         )
     )
-    base_currency = str(config.base_currency or "")
     fx: dict[str, FXSeries] = {
         pair: FXSeries(index=grid, rate=np.full(len(grid), rate))
         for pair, rate in declared.items()
     }
-    seeded = False
     for instrument in instruments.values():
         settlement = getattr(instrument, "settlement_currency", None)
-        peg = stablecoin_peg_rate(settlement, base_currency)
-        if peg is None:
+        if settlement is None:
             continue
-        for pair in (str(settlement) + base_currency, base_currency + str(settlement)):
-            if pair not in fx:
-                fx[pair] = FXSeries(index=grid, rate=np.full(len(grid), peg))
-                seeded = True
-    if seeded:
-        currencies = sorted(
-            {
-                str(getattr(instrument, "settlement_currency", ""))
-                for instrument in instruments.values()
-            }
-            - {base_currency}
-        )
-        for settlement in currencies:
-            warn_stablecoin_peg(settlement, base_currency, engine="portfolio")
+        for pair in (
+            str(settlement) + base_currency,
+            str(settlement).upper() + base_currency.upper(),
+        ):
+            if pair in fx:
+                continue
+            rate = resolve_fx_rate(settlement, base_currency, declared)
+            fx[pair] = FXSeries(index=grid, rate=np.full(len(grid), rate))
     return fx or None
 
 
@@ -304,6 +328,72 @@ def _merge_portfolio_ledgers(
     return EventLedger(event for _ts, _leg, _seq, event in rows)
 
 
+def _aligned_close(md: MarketData, grid: np.ndarray) -> np.ndarray:
+    """Each union-grid point's latest close on/before it (first close before the start).
+
+    This mirrors the ledger's mark-to-market forward fill (§4.6 step 2), but backfills
+    the leading gap with the instrument's first close so a benchmark curve that starts
+    before that instrument's history does not read a spurious zero price.
+    """
+    ts = md.timestamps.as_unit("ns").to_numpy(dtype=np.int64)
+    idx = np.searchsorted(ts, grid, side="right") - 1
+    valid = idx >= 0
+    close = np.where(valid, md.close[np.clip(idx, 0, None)], md.close[0])
+    return close.astype(np.float64, copy=True)
+
+
+def _portfolio_benchmark(
+    config: BacktestConfig,
+    portfolio: PortfolioConfig,
+    market_data: Mapping[str, MarketData],
+) -> BenchmarkCurve:
+    """Build the §10 benchmark for a portfolio over its combined bar grid.
+
+    ``buy_and_hold`` is the single-instrument default; for a multi-instrument portfolio
+    it is interpreted as the portfolio default, equal weight across instruments.
+    ``equal_weight`` and ``custom`` apply as declared, with custom ``weights`` ordered
+    like :attr:`PortfolioConfig.instrument_ids`. Each instrument's close is aligned to
+    the union grid (forward-filled, leading-backfilled), then the first
+    ``warmup_bars`` points are dropped so the curve lines up with the strategy.
+    """
+    ids = tuple(portfolio.instrument_ids)
+    available = [iid for iid in ids if iid in market_data and market_data[iid].n_bars > 0]
+    if not available:
+        raise ConfigError("portfolio benchmark requires at least one instrument with bars")
+    grid = np.unique(
+        np.concatenate(
+            [
+                market_data[iid].timestamps.as_unit("ns").to_numpy(dtype=np.int64)
+                for iid in available
+            ]
+        )
+    )
+    index = pd.DatetimeIndex(pd.to_datetime(grid, unit="ns", utc=True)).as_unit("ns")
+    aligned: list[MarketData] = []
+    for iid in available:
+        close = _aligned_close(market_data[iid], grid)
+        aligned.append(
+            MarketData(
+                open=close,
+                high=close,
+                low=close,
+                close=close,
+                volume=np.ones(grid.shape[0], dtype=np.float64),
+                index=index,
+            )
+        )
+    if config.warmup_bars > 0:
+        aligned = [_warmup_slice_market_data(md, config.warmup_bars) for md in aligned]
+
+    requested = config.benchmark
+    if requested.kind == "buy_and_hold" and len(aligned) > 1:
+        # §10 portfolio default: equal-weight across instruments.
+        requested = BenchmarkConfig(kind="equal_weight")
+    if requested.kind == "buy_and_hold":
+        return build_benchmark(requested, aligned[0])
+    return build_benchmark(requested, aligned)
+
+
 def _run_portfolio_backtest(
     data: Mapping[object, Any],
     signals: object,
@@ -311,14 +401,21 @@ def _run_portfolio_backtest(
     *,
     aux_data: Mapping[str, Any] | None,
     adapter_cls: type[Any],
-) -> BacktestResult:
+) -> tuple[BacktestResult, dict[str, MarketData]]:
     """Run one shared-capital portfolio backtest across every configured instrument.
 
     Each leg is delegated to the engine adapter exactly as a single-instrument run, but
     receives its precomputed share of the *one* shared account as its starting balance
-    (``shared_balance * weight``). The legs are then folded into one combined ledger and
-    one :class:`~ube.core.result.BacktestResult`, so the reported equity curve is the
-    portfolio's, and every fill stays traceable to its instrument.
+    (``shared_balance * weight``, converted into the leg's settlement currency). The legs
+    are then folded into one combined ledger and one
+    :class:`~ube.core.result.BacktestResult`, so the reported equity curve is the
+    portfolio's, and every fill stays traceable to its instrument. A FixedWeight split
+    that does not allocate the whole pool leaves the remainder as base-currency cash, so
+    the combined equity starts at the full shared balance rather than only the invested
+    part.
+
+    Returns the result and the standardized, ``date_range``-sliced market data used, so
+    the caller records the same bars the legs actually ran on.
     """
     portfolio = config.portfolio
     if portfolio is None:  # pragma: no cover — caller guarantees this
@@ -330,6 +427,31 @@ def _run_portfolio_backtest(
         symbol: _standardize_data(value) for symbol, value in keyed_data.items()
     }
     signal_map = _standardize_portfolio_signals(signals, portfolio)
+    instruments = portfolio.instrument_map
+
+    # §7.2: restrict every leg to the date_range window before the adapter sees it, and
+    # slice its signals/aux by the same bar mask — slicing only the data silently
+    # misaligns the signal columns (an InvalidSignalError at best, wrong bars at worst).
+    start = end = None
+    if config.date_range is not None:
+        start, end = config.date_range
+    sliced_data: dict[str, MarketData] = {}
+    sliced_signals: dict[str, Signals] = {}
+    sliced_aux: dict[str, Mapping[str, Any] | None] = {}
+    for symbol in portfolio.instrument_ids:
+        md = market_data[symbol]
+        sig = signal_map[symbol]
+        aux = _portfolio_aux_for(aux_data, symbol)
+        if config.date_range is not None:
+            md, mask = _slice_market_data(md, start, end)
+            sig = _slice_signals(sig, mask)
+            if aux:
+                aux = _slice_aux_data(aux, mask, start, end)
+        # §4.4: each leg is checked against *its own* declared calendar after slicing.
+        validate_timestamps(md.timestamps, resolve_calendar(instruments[symbol]))
+        sliced_data[symbol] = md
+        sliced_signals[symbol] = sig
+        sliced_aux[symbol] = aux
 
     weights = allocation_weights(portfolio.allocation, portfolio.instrument_ids)
     overrides = dict(config.engine_overrides or {})
@@ -347,14 +469,17 @@ def _run_portfolio_backtest(
             "volatility_target, or set PortfolioConfig.sizing explicitly."
         )
 
-    instruments = portfolio.instrument_map
+    base_currency = str(config.base_currency or portfolio.base_currency)
+    rates = _portfolio_rates(portfolio, base_currency, declared_fx_rates(overrides))
     legs: list[tuple[str, EventLedger]] = []
     for symbol in portfolio.instrument_ids:
         weight = float(weights[symbol])
         if weight <= 0.0:
             continue
         leg_overrides = dict(overrides)
-        leg_overrides["starting_balance"] = shared_balance * weight
+        # The engine books ``starting_balance`` in the leg's settlement currency, so
+        # divide by the rate to hand it exactly ``shared_balance * weight`` in base.
+        leg_overrides["starting_balance"] = shared_balance * weight / rates[symbol]
         leg_config = replace(
             config,
             instrument=instruments[symbol],
@@ -363,10 +488,10 @@ def _run_portfolio_backtest(
             portfolio=None,
         )
         result = adapter_cls().run(
-            market_data[symbol],
-            signal_map[symbol],
+            sliced_data[symbol],
+            sliced_signals[symbol],
             leg_config,
-            aux_data=_portfolio_aux_for(aux_data, symbol),
+            aux_data=sliced_aux[symbol],
         )
         legs.append((symbol, result.ledger))
 
@@ -376,13 +501,36 @@ def _run_portfolio_backtest(
         )
 
     merged = _merge_portfolio_ledgers(legs)
-    return BacktestResult.from_ledger(
+    unallocated = shared_balance * max(0.0, 1.0 - float(sum(weights.values())))
+    if unallocated > 0.0:
+        # A FixedWeight split need not allocate the whole pool; the remainder is held as
+        # base-currency cash so the combined equity starts at the full shared balance.
+        first_timestamps = [
+            int(md.timestamps.as_unit("ns").to_numpy(dtype=np.int64)[0])
+            for md in sliced_data.values()
+            if md.n_bars > 0
+        ]
+        if first_timestamps:
+            merged.append(
+                LedgerEvent(
+                    EventType.CASH_MOVEMENT,
+                    min(first_timestamps),
+                    _PORTFOLIO_CASH_ID,
+                    amount=unallocated,
+                    currency=base_currency,
+                )
+            )
+
+    benchmark = _portfolio_benchmark(config, portfolio, sliced_data)
+    result = BacktestResult.from_ledger(
         merged,
         config,
-        market_data=market_data,
+        market_data=sliced_data,
         instruments=instruments,
-        fx_rates=_portfolio_fx_rates(config, market_data, instruments),
+        fx_rates=_portfolio_fx_rates(config, sliced_data, instruments),
+        benchmark=benchmark,
     )
+    return result, sliced_data
 
 
 def _optional_dependency_installed(module: str) -> bool:
@@ -490,19 +638,21 @@ def run(
     Orchestrates the Phase-1 pipeline in order:
 
     1. Validate ``config`` and default any omitted settlement currency.
-    2. Apply ``config.date_range`` (§7.2): restrict the bars (and aligned ``aux_data``)
-       to the declared ``(start, end)`` window before the engine sees them — a window
-       that excludes every bar raises ``DataShapeError``. The full dataset is never
-       silently run when a ``date_range`` is set.
+    2. Apply ``config.date_range`` (§7.2): restrict the bars (and aligned signals and
+       ``aux_data``) to the declared ``(start, end)`` window before the engine sees them
+       — a window that excludes every bar raises ``DataShapeError``. The full dataset is
+       never silently run when a ``date_range`` is set.
     3. For a single-instrument run, standardize ``data``/``signals`` to the canonical
-       containers; a portfolio (dict-keyed) run is forwarded to the adapter as-is.
-    3. Lazily register the installed built-in engine, then resolve ``config.engine``
+       containers; a portfolio (dict-keyed) run is delegated per instrument to the
+       adapter from one shared capital pool.
+    4. Lazily register the installed built-in engine, then resolve ``config.engine``
        (``"auto"`` → first installed) to the adapter class.
-    4. Run the adapter, producing a :class:`~ube.core.result.BacktestResult`.
-    5. For a single-instrument run, compute and attach the
-       :class:`~ube.core.benchmark.BenchmarkCurve` (§10) engine-agnostically and record
-       the run to the experiment log (§4.8) — unconditional — with the
-       :func:`~ube.core.result.result_hash` fingerprint.
+    5. Run the adapter(s), producing a :class:`~ube.core.result.BacktestResult`.
+    6. Compute and attach the :class:`~ube.core.benchmark.BenchmarkCurve` (§10) — the
+       instrument's buy-and-hold for a single run, the equal-weight (or declared)
+       portfolio curve for a portfolio — and record the run to the experiment log
+       (§4.8) — unconditional — with the :func:`~ube.core.result.result_hash`
+       fingerprint.
 
     Args:
         data: The single-instrument OHLCV bars (any :meth:`MarketData.standardize`
@@ -521,7 +671,7 @@ def run(
 
     Returns:
         The frozen :class:`~ube.core.result.BacktestResult` with the benchmark attached
-        (single-instrument runs).
+        (single-instrument and portfolio runs alike).
 
     Raises:
         ConfigError: ``config`` is not a :class:`~ube.core.config.BacktestConfig`, or
@@ -542,40 +692,26 @@ def run(
     config = _default_settlement_currency(config)
     if isinstance(data, Mapping) and config.portfolio is not None:
         config = _resolve_portfolio_config(config)
+    if config.portfolio is not None and not isinstance(data, Mapping):
+        raise ConfigError(
+            "config.portfolio requires data as {instrument_id: MarketData}; got "
+            f"{type(data).__name__} — declare one key per portfolio instrument"
+        )
 
-    # Portfolio (dict-keyed) inputs are forwarded as-is; the adapter decides support
-    # (§7.1). Benchmark comparison is a single-instrument concept (it lines up two
-    # curves bar-for-bar), so it is only attached on the single-asset path below. The
-    # experiment log, however, is unconditional (§4.8) and must record BOTH branches.
+    # The experiment log is unconditional (§4.8) and must record BOTH branches.
     data_reference: DataReference | PortfolioDataReference
     if isinstance(data, Mapping):
-        # §7.2: restrict each instrument's bars to the declared date_range window before
-        # the adapter sees them. A window that excludes every bar raises DataShapeError.
-        if config.date_range is not None:
-            start, end = config.date_range
-            data = {k: _slice_market_data(v, start, end)[0] for k, v in data.items()}
-        # Calendar validation (§4.4): each portfolio leg is checked against its *own*
-        # declared calendar — keys that are Instruments (or bare calendar names) resolve
-        # to their calendar; any other label carries no calendar and is skipped (no
-        # declared calendar ⇒ no calendar constraint, the §4.5 "24/7"/None reading).
-        for key, md in data.items():
-            try:
-                calendar = resolve_calendar(key)
-            except InvalidInstrumentError:
-                continue
-            if calendar.is_always_open:
-                continue
-            validate_timestamps(md.timestamps, calendar)
         ensure_builtin_engines_registered()
         engine_name = resolve_engine_name(config.engine)
         adapter_cls = get_engine(engine_name)
         if config.portfolio is not None:
             # Shared-capital portfolio path: every leg is delegated to the adapter, but
             # sized from one pre-split pool, and the ledgers fold into one combined result.
-            result = _run_portfolio_backtest(
+            # The helper applies date_range + calendar validation per leg and returns the
+            # sliced bars it actually ran on.
+            result, reference_data = _run_portfolio_backtest(
                 data, signals, config, aux_data=aux_data, adapter_cls=adapter_cls
             )
-            reference_data = _normalize_portfolio_mapping(data)
             data_reference = PortfolioDataReference.from_market_data_mapping(
                 reference_data, config.portfolio.instrument_map
             )
@@ -583,6 +719,22 @@ def run(
             # Legacy mapping path: forwarded as-is to a portfolio-capable adapter. The
             # single-instrument adapter contract types ``data``/``signals`` as
             # MarketData/Signals, so the adapter validates the mapping at runtime (§7.1).
+            # §7.2: restrict each instrument's bars to the date_range window first; a
+            # window that excludes every bar raises DataShapeError.
+            if config.date_range is not None:
+                start, end = config.date_range
+                data = {k: _slice_market_data(v, start, end)[0] for k, v in data.items()}
+            # Calendar validation (§4.4): each leg is checked against its *own* declared
+            # calendar — keys that are Instruments (or bare calendar names) resolve to
+            # their calendar; any other label carries no calendar and is skipped.
+            for key, md in data.items():
+                try:
+                    calendar = resolve_calendar(key)
+                except InvalidInstrumentError:
+                    continue
+                if calendar.is_always_open:
+                    continue
+                validate_timestamps(md.timestamps, calendar)
             result = adapter_cls().run(data, signals, config, aux_data=aux_data)  # type: ignore[arg-type]
             # §4.8: a multi-instrument run is still a run — log it so the true attempt
             # count (PBO/DSR honesty, §11) is complete. Build the portfolio fingerprint.

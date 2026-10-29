@@ -10,11 +10,13 @@ engine overrides.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 from ube.core.calendar import TradingCalendar, resolve_calendar
 from ube.core.config import BacktestConfig
+from ube.core.errors import ConfigError
 from ube.core.portfolio import PortfolioConfig
 
 __all__ = ["PaperConfig"]
@@ -69,17 +71,17 @@ class PaperConfig:
         portfolio = self.portfolio if self.portfolio is not None else self.base.portfolio
         if portfolio is not None:
             if not isinstance(portfolio, PortfolioConfig):
-                raise ValueError("portfolio must be a PortfolioConfig or None")
+                raise ConfigError("portfolio must be a PortfolioConfig or None")
             if (
                 self.portfolio is not None
                 and self.base.portfolio is not None
                 and self.base.portfolio != self.portfolio
             ):
-                raise ValueError(
+                raise ConfigError(
                     "PaperConfig.portfolio and base.portfolio disagree; declare it once"
                 )
             if self.base.instrument.symbol not in portfolio.instrument_ids:
-                raise ValueError(
+                raise ConfigError(
                     "base.instrument must be one of the portfolio instruments; got "
                     f"{self.base.instrument.symbol!r}"
                 )
@@ -91,12 +93,28 @@ class PaperConfig:
                     "base",
                     dataclasses.replace(self.base, base_currency=portfolio.base_currency),
                 )
-        if self.starting_balance is not None and self.starting_balance <= 0:
-            raise ValueError("starting_balance must be > 0")
+            # The combined equity is denominated in one base currency; a disagreement
+            # would silently mis-scale every leg (§4.7 — never assume a currency).
+            if (
+                self.base.base_currency is not None
+                and self.base.base_currency.strip().upper()
+                != portfolio.base_currency.strip().upper()
+            ):
+                raise ConfigError(
+                    "base.base_currency and portfolio.base_currency disagree "
+                    f"({self.base.base_currency!r} vs {portfolio.base_currency!r})"
+                )
+        if self.starting_balance is not None and (
+            isinstance(self.starting_balance, bool)
+            or not isinstance(self.starting_balance, int | float)
+            or not math.isfinite(self.starting_balance)
+            or self.starting_balance <= 0
+        ):
+            raise ConfigError("starting_balance must be a finite number > 0")
         if not isinstance(self.calendar_validate, bool):
-            raise ValueError("calendar_validate must be a bool")
+            raise ConfigError("calendar_validate must be a bool")
         if not isinstance(self.calendar_strict, bool):
-            raise ValueError("calendar_strict must be a bool")
+            raise ConfigError("calendar_strict must be a bool")
         # Fold the convenience balance into the engine overrides so the backend sees a
         # single canonical config (no second source of truth for the balance).
         if self.starting_balance is not None:

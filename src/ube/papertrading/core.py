@@ -43,6 +43,12 @@ from ube.core.errors import (
     EngineError,
     InvalidSignalError,
 )
+from ube.core.fx import (
+    declared_fx_rates,
+    resolve_fx_rate,
+    stablecoin_peg_rate,
+    warn_stablecoin_peg,
+)
 from ube.core.instrument import Instrument, allows_short, resolve_settlement_currency
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, Trade, trades
 from ube.core.portfolio import (
@@ -450,6 +456,58 @@ def init(
     )
 
 
+def _portfolio_shared_balance(config: PaperConfig) -> float:
+    """The one shared pool's starting balance, denominated in the base currency."""
+    value = config.starting_balance
+    if value is None:
+        value = config.overrides.get("starting_balance", DEFAULT_PORTFOLIO_BALANCE)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConfigError(
+            f"portfolio starting_balance must be a number; got {value!r}"
+        )
+    balance = float(value)
+    if not np.isfinite(balance) or balance <= 0.0:
+        raise ConfigError(
+            f"portfolio starting_balance must be finite and > 0; got {balance!r}"
+        )
+    return balance
+
+
+def _portfolio_currency_rates(
+    portfolio: PortfolioConfig, base_currency: str, overrides: Mapping[str, Any]
+) -> dict[str, float]:
+    """``symbol -> rate`` converting each leg's settlement currency into the base (§4.7).
+
+    The ledger and the paper rollup both sum base-currency values, so a leg in another
+    currency must be convertible at a declared rate (or the documented stablecoin peg).
+    Anything else raises :class:`~ube.core.errors.FXRateUnavailableError`.
+    """
+    declared = declared_fx_rates(overrides)
+    rates: dict[str, float] = {}
+    warned: set[str] = set()
+    for instrument in portfolio.instruments:
+        settlement = instrument.settlement_currency
+        if settlement is None:  # pragma: no cover — PortfolioConfig may omit it
+            settlement = resolve_settlement_currency(instrument)
+        rate = resolve_fx_rate(settlement, base_currency, declared)
+        pair_keys = {settlement + base_currency, settlement.upper() + base_currency.upper()}
+        if (
+            stablecoin_peg_rate(settlement, base_currency) is not None
+            and settlement.upper() != base_currency.upper()
+            and not pair_keys & set(declared)
+            and settlement.upper() not in warned
+        ):
+            warn_stablecoin_peg(settlement, base_currency, engine="paper")
+            warned.add(settlement.upper())
+        rates[instrument.symbol] = rate
+    return rates
+
+
+def _portfolio_unallocated(weights: Mapping[str, float], shared_balance: float) -> float:
+    """The part of the shared pool a FixedWeight split leaves as base-currency cash."""
+    return shared_balance * max(0.0, 1.0 - float(sum(weights.values())))
+
+
 def init_portfolio(
     config: PaperConfig, *, run_id: str = "default", db_path: str | None = None
 ) -> PortfolioPaperState:
@@ -466,6 +524,12 @@ def init_portfolio(
         db_path = config.state_path
     state_cls = get_state_class(config.engine)
     config_ref = yaml.safe_dump(dataclasses.asdict(config.base))
+    # Resolve every leg's settlement currency and validate it converts into the base;
+    # an unconvertible pair fails here, not on the first equity snapshot.
+    base_currency = config.base.base_currency or portfolio.base_currency
+    _portfolio_currency_rates(portfolio, base_currency, config.overrides)
+    shared_balance = _portfolio_shared_balance(config)
+    weights = allocation_weights(portfolio.allocation, portfolio.instrument_ids)
     states: dict[str, PaperState] = {}
     for instrument in portfolio.instruments:
         resolved = (
@@ -489,6 +553,7 @@ def init_portfolio(
         states,
         run_id=run_id,
         db_path=db_path,
+        unallocated_cash=_portfolio_unallocated(weights, shared_balance),
     )
 
 
@@ -822,8 +887,10 @@ def _portfolio_aux(
     return aux_data
 
 
-def _leg_equity(state: PaperState, instrument: Instrument) -> float:
-    """Cash + open-position mark for one leg (the paper rollup's equity component)."""
+def _leg_equity(
+    state: PaperState, instrument: Instrument, fx_rate: float = 1.0
+) -> float:
+    """Cash + open-position mark for one leg, converted into the base currency."""
     total_cash = 0.0
     has_cash = False
     for event in state.ledger.events:
@@ -846,7 +913,53 @@ def _leg_equity(state: PaperState, instrument: Instrument) -> float:
             * float(state.last_price)
             * multiplier
         )
-    return float(balance)
+    return float(balance) * float(fx_rate)
+
+
+def _refresh_portfolio_stats_snapshot(
+    db_path: str,
+    run_id: str,
+    data: Mapping[str, MarketData],
+    config: PaperConfig,
+    state: PortfolioPaperState,
+    closed: list[Trade],
+) -> None:
+    """Persist the §10 statistics snapshot for the combined portfolio.
+
+    Mirrors the single-instrument guard: recompute only when the closed-trade count grows
+    (or a prior snapshot's returns tier can be retried once the equity grid has grown).
+    """
+    from ube.stats import load_stats, save_stats
+
+    closed_trades = len(closed)
+    latest_closed_trade_ns = (
+        max(int(trade.exit_timestamp) for trade in closed) if closed else None
+    )
+    latest_stats = load_stats(db_path, run_id)
+    if latest_stats.empty:
+        seen_trades = 0
+        seen_equity_points = 0
+        stats_complete = True
+    else:
+        latest_meta = latest_stats.iloc[0]
+        seen_trades = int(latest_meta["trade_count"])
+        seen_equity_points = int(latest_meta["n_equity_points"])
+        stats_complete = "returns" in str(latest_meta["tiers"]).split(",")
+    from ube.papertrading.state import load_equity
+
+    equity_history = load_equity(db_path, run_id)
+    if latest_closed_trade_ns is None:
+        equity_points_through_close = 0
+    else:
+        equity_points_through_close = int(
+            (equity_history["timestamp"].astype("int64") <= latest_closed_trade_ns).sum()
+        )
+    retry_partial = not stats_complete and equity_points_through_close > seen_equity_points
+    if not (closed_trades > seen_trades or (closed_trades == seen_trades and retry_partial)):
+        return
+    snapshot = state.stats(data, config, through_ns=latest_closed_trade_ns)
+    save_stats(db_path, run_id, snapshot, trade_count=closed_trades)
+    state.stats_trade_count = closed_trades
 
 
 def _save_portfolio_rollup(
@@ -865,11 +978,16 @@ def _save_portfolio_rollup(
     combined_trades = list(trades(state.ledger, instruments=instruments))
     save_trades(db_path, run_id, combined_trades)
 
+    base_currency = config.base.base_currency or portfolio.base_currency
+    rates = _portfolio_currency_rates(portfolio, base_currency, config.overrides)
     cursor = state.last_processed_ns
     if cursor is not None:
-        total = sum(
-            _leg_equity(state.states[symbol], instruments[symbol])
-            for symbol in state.instrument_ids
+        total = (
+            sum(
+                _leg_equity(state.states[symbol], instruments[symbol], rates[symbol])
+                for symbol in state.instrument_ids
+            )
+            + state.unallocated_cash
         )
         equity_df = pd.DataFrame(
             [{"timestamp": int(cursor), "equity": float(total), "returns": 0.0}]
@@ -879,11 +997,9 @@ def _save_portfolio_rollup(
 
     # The stats snapshot remains auxiliary: never fail a step because of it.
     try:
-        from ube.stats import save_stats
-
-        snapshot = state.stats(market_data, config)
-        save_stats(db_path, run_id, snapshot, trade_count=len(combined_trades))
-        state.stats_trade_count = len(combined_trades)
+        _refresh_portfolio_stats_snapshot(
+            db_path, run_id, market_data, config, state, combined_trades
+        )
     except Exception:  # noqa: BLE001 — auxiliary
         logging.getLogger("ube").debug("portfolio statistics snapshot skipped", exc_info=True)
 
@@ -920,15 +1036,10 @@ def step_portfolio(
 
     weights = allocation_weights(portfolio.allocation, portfolio.instrument_ids)
     overrides = config.overrides
-    shared_balance = float(
-        config.starting_balance
-        if config.starting_balance is not None
-        else overrides.get("starting_balance", DEFAULT_PORTFOLIO_BALANCE)
-    )
-    if not np.isfinite(shared_balance) or shared_balance <= 0.0:
-        raise ConfigError(
-            f"portfolio starting_balance must be finite and > 0; got {shared_balance!r}"
-        )
+    shared_balance = _portfolio_shared_balance(config)
+    base_currency = config.base.base_currency or portfolio.base_currency
+    rates = _portfolio_currency_rates(portfolio, base_currency, overrides)
+    state.unallocated_cash = _portfolio_unallocated(weights, shared_balance)
     sizing = portfolio.sizing or config.base.risk.sizing
     if sizing.kind == "fixed_units":
         raise ConfigError(
@@ -949,7 +1060,9 @@ def step_portfolio(
             raise ConfigError(
                 f"portfolio signals[{symbol!r}] must be Signals; got {type(sig).__name__}"
             )
-        share = shared_balance * float(weights[symbol])
+        # The leg is funded in its settlement currency, so divide the base-currency share
+        # by the conversion rate; the combined equity then sums to the shared balance.
+        share = shared_balance * float(weights[symbol]) / rates[symbol]
         if share <= 0.0:
             # A zero allocation means this instrument gets none of the pool. Skipping
             # keeps zero-balance legs out of engines that reject them, and matches the

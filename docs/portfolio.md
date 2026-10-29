@@ -84,24 +84,45 @@ result = ube.run(data, signals, config)
 result.equity_curve                    # one combined portfolio curve
 result.equity_curve_by_instrument      # per-instrument mark-to-market breakdown
 result.trades                          # every leg, tagged by instrument_id
+result.benchmark                       # equal-weight buy-and-hold by default (§10)
 result.stats                           # statistics over the combined curve
 ```
 
 What happens internally:
 
 1. The shared account balance comes from `engine_overrides["starting_balance"]`
-   (default `100_000.0`).
+   (default `100_000.0`) and is denominated in `base_currency`.
 2. Each leg is delegated to the selected engine adapter exactly as a single-instrument
-   run, with `starting_balance = shared_balance * weight`.
-3. The per-leg ledgers are merged chronologically into one ledger.
-4. `BacktestResult.from_ledger` derives the combined curve, per-instrument breakdown,
+   run. Its seed is that leg's share, converted from `base_currency` into the leg's
+   settlement currency: `starting_balance = shared_balance * weight / rate`.
+3. When `FixedWeight` leaves part of the pool unallocated, that remainder is booked as
+   a base-currency cash position on the first bar, so the combined equity starts at the
+   full shared balance rather than the sum of the leg seeds.
+4. The per-leg ledgers are merged chronologically into one ledger.
+5. `BacktestResult.from_ledger` derives the combined curve, per-instrument breakdown,
    trades and statistics from that merged ledger. Settlement currencies are converted to
-   `base_currency`; the documented USD/USDT stablecoin peg applies when no explicit FX
-   rate is declared.
+   `base_currency` using declared FX rates (`fx_rates` / `synthetic_rates` /
+   `fixed_conversions` / `currency_fx` in `engine_overrides`); the documented USD/USDT
+   stablecoin peg applies when no explicit rate is declared. Any other undeclared pair
+   raises `FXRateUnavailableError` — a rate is never guessed.
+6. A portfolio benchmark is attached to the result. `result.benchmark` defaults to an
+   equal-weight buy-and-hold of the configured instruments (each leg bought on its first
+   bar, held to the end); pass a `BenchmarkConfig` to override it. Custom weights are
+   ordered by `PortfolioConfig.instrument_ids` and normalized to sum to one.
 
 Because each leg receives only its share of the pool, aggregate open commitments cannot
 exceed the shared balance. The allocation is static for the life of the run — this is a
 shared *capital pool*, not a rebalancing or cross-instrument risk model.
+
+### Benchmark
+
+`result.benchmark` is a `BenchmarkCurve` over the same timestamp grid as
+`result.equity_curve`, so `result.stats` reports benchmark-relative metrics
+(alpha, beta, information ratio, …) alongside the portfolio's own. The default is
+equal-weight buy-and-hold; `BenchmarkConfig(kind="custom", weights=(0.6, 0.4))` selects
+an explicit weight vector ordered by `PortfolioConfig.instrument_ids`, and
+`kind="buy_and_hold"` is only meaningful for a single-instrument portfolio (it is
+rewritten to equal-weight when several instruments are configured).
 
 ### Single-asset vs multi-asset on each engine
 
@@ -204,15 +225,23 @@ Key properties:
 - An all-zero allocation leg is skipped rather than run with zero capital.
 
 The same static allocation rule as the backtest applies: each leg is seeded with
-`shared_balance * weight`. `rebalance` remains reserved, and no cross-instrument netting
-or hedging is performed.
+`shared_balance * weight / rate`, where `rate` converts `base_currency` into that leg's
+settlement currency. Unallocated `FixedWeight` cash is tracked on the session and folded
+back into the combined equity and statistics snapshot. `rebalance` remains reserved, and
+no cross-instrument netting or hedging is performed.
+
+**Currency limitation.** A leg whose settlement currency differs from `base_currency`
+needs a declared FX rate in `engine_overrides` (the same `fx_rates` family as the
+backtest) unless the pair is the documented 1:1 USD/USDT stablecoin peg. Any other
+undeclared pair raises `FXRateUnavailableError` when the session is created. `base.base_currency`
+and `PortfolioConfig.base_currency` must agree; a disagreement raises `ConfigError`.
 
 ## Engine notes
 
 | Engine | Portfolio behavior |
 |---|---|
 | **VectorBT** | Each leg is a normal VectorBT run seeded with its share; the merged ledger drives the portfolio curve. Paper trading keeps the window-replay resume semantics per leg. |
-| **Backtrader** | `size_portfolio_entry` is the gate: legs receive their pre-split share before the event-driven broker sees an order, so one asset cannot silently starve another. Paper trading keeps the replay/checkpoint semantics per leg. |
+| **Backtrader** | Each leg runs as a single-instrument adapter instance seeded with its pre-split, FX-converted share, so one asset cannot silently starve another; the merged ledger drives the portfolio curve. Paper trading keeps the replay/checkpoint semantics per leg. |
 | **NautilusTrader** | Each leg runs through the Nautilus adapter with its share and the standard sandbox execution model. Paper trading reuses the incremental per-instrument backend and existing resume behavior. |
 
 Details: [VectorBT](engines/vectorbt.md), [Backtrader](engines/backtrader.md),
