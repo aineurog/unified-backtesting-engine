@@ -46,7 +46,14 @@ from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError, InvalidInstrumentError, InvalidSignalError
 from ube.core.experiment_log import DataReference, ExperimentLog, PortfolioDataReference
+from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
 from ube.core.instrument import resolve_settlement_currency
+from ube.core.ledger import EventLedger, FXSeries
+from ube.core.portfolio import (
+    DEFAULT_PORTFOLIO_BALANCE,
+    PortfolioConfig,
+    allocation_weights,
+)
 from ube.core.result import BacktestResult, result_hash
 from ube.core.signals import Signals
 
@@ -148,6 +155,233 @@ def _warmup_slice_market_data(md: MarketData, n: int) -> MarketData:
 
 
 __all__ = ["run", "ensure_builtin_engines_registered"]
+
+#: The FX override aliases every adapter accepts, first-declared wins (§4.7).
+_FX_ALIASES: tuple[str, ...] = (
+    "synthetic_rates",
+    "fixed_conversions",
+    "currency_fx",
+    "fx_rates",
+)
+
+
+def _portfolio_key(key: object) -> str:
+    """Normalize a portfolio data/signal key to its instrument symbol."""
+    symbol = getattr(key, "symbol", None)
+    if isinstance(symbol, str) and symbol.strip():
+        return symbol
+    return str(key)
+
+
+def _normalize_portfolio_mapping(mapping: Mapping[object, Any]) -> dict[str, Any]:
+    """Key a portfolio mapping by instrument symbol, rejecting collisions."""
+    out: dict[str, Any] = {}
+    for key, value in mapping.items():
+        symbol = _portfolio_key(key)
+        if symbol in out:
+            raise ConfigError(
+                f"duplicate portfolio key {symbol!r} (instrument labels must be unique)"
+            )
+        out[symbol] = value
+    return out
+
+
+def _resolve_portfolio_config(config: BacktestConfig) -> BacktestConfig:
+    """Resolve settlement currencies and the base currency for a portfolio config."""
+    portfolio = config.portfolio
+    if portfolio is None:
+        return config
+    instruments = tuple(
+        instrument
+        if instrument.settlement_currency is not None
+        else replace(
+            instrument,
+            settlement_currency=resolve_settlement_currency(instrument),
+        )
+        for instrument in portfolio.instruments
+    )
+    resolved = replace(portfolio, instruments=instruments)
+    base_currency = config.base_currency or resolved.base_currency
+    instrument = resolved.instrument_map[config.instrument.symbol]
+    return replace(
+        config,
+        instrument=instrument,
+        base_currency=base_currency,
+        portfolio=resolved,
+    )
+
+
+def _standardize_portfolio_signals(
+    signals: object, portfolio: PortfolioConfig
+) -> dict[str, Signals]:
+    """Standardize the per-instrument signal inputs for a portfolio run."""
+    if isinstance(signals, Mapping):
+        keyed = _normalize_portfolio_mapping(signals)
+        portfolio.validate_data(list(keyed))
+        return {symbol: _standardize_signals(value) for symbol, value in keyed.items()}
+    if len(portfolio.instrument_ids) == 1:
+        only = portfolio.instrument_ids[0]
+        return {only: _standardize_signals(signals)}
+    raise InvalidSignalError(
+        "a multi-asset portfolio run expects signals as a "
+        "{instrument_id: Signals} mapping; got "
+        f"{type(signals).__name__}"
+    )
+
+
+def _portfolio_aux_for(
+    aux_data: Mapping[str, Any] | None, symbol: str
+) -> Mapping[str, Any] | None:
+    """Select one leg's aux map, accepting either a flat map or ``symbol -> map``."""
+    if aux_data is None:
+        return None
+    if symbol in aux_data and isinstance(aux_data[symbol], Mapping):
+        return aux_data[symbol]
+    return aux_data
+
+
+def _portfolio_fx_rates(
+    config: BacktestConfig,
+    market_data: Mapping[str, MarketData],
+    instruments: Mapping[str, Any],
+) -> dict[str, FXSeries] | None:
+    """Build the constant FX series needed to combine several settlement currencies."""
+    overrides = dict(config.engine_overrides or {})
+    declared: dict[str, float] = {}
+    for alias in _FX_ALIASES:
+        value = overrides.get(alias)
+        if value is not None:
+            declared = {str(key): float(rate) for key, rate in dict(value).items()}
+            break
+    if not market_data:
+        return None
+    grid = np.unique(
+        np.concatenate(
+            [
+                np.asarray(md.timestamps.as_unit("ns").asi8, dtype=np.int64)
+                for md in market_data.values()
+            ]
+        )
+    )
+    base_currency = str(config.base_currency or "")
+    fx: dict[str, FXSeries] = {
+        pair: FXSeries(index=grid, rate=np.full(len(grid), rate))
+        for pair, rate in declared.items()
+    }
+    seeded = False
+    for instrument in instruments.values():
+        settlement = getattr(instrument, "settlement_currency", None)
+        peg = stablecoin_peg_rate(settlement, base_currency)
+        if peg is None:
+            continue
+        for pair in (str(settlement) + base_currency, base_currency + str(settlement)):
+            if pair not in fx:
+                fx[pair] = FXSeries(index=grid, rate=np.full(len(grid), peg))
+                seeded = True
+    if seeded:
+        currencies = sorted(
+            {
+                str(getattr(instrument, "settlement_currency", ""))
+                for instrument in instruments.values()
+            }
+            - {base_currency}
+        )
+        for settlement in currencies:
+            warn_stablecoin_peg(settlement, base_currency, engine="portfolio")
+    return fx or None
+
+
+def _merge_portfolio_ledgers(
+    legs: list[tuple[str, EventLedger]],
+) -> EventLedger:
+    """Merge per-instrument ledgers into one chronologically ordered ledger."""
+    rows: list[tuple[int, int, int, Any]] = []
+    for leg_index, (_symbol, ledger) in enumerate(legs):
+        for seq, event in enumerate(ledger.events):
+            rows.append((int(event.timestamp), leg_index, seq, event))
+    rows.sort(key=lambda row: (row[0], row[1], row[2]))
+    return EventLedger(event for _ts, _leg, _seq, event in rows)
+
+
+def _run_portfolio_backtest(
+    data: Mapping[object, Any],
+    signals: object,
+    config: BacktestConfig,
+    *,
+    aux_data: Mapping[str, Any] | None,
+    adapter_cls: type[Any],
+) -> BacktestResult:
+    """Run one shared-capital portfolio backtest across every configured instrument.
+
+    Each leg is delegated to the engine adapter exactly as a single-instrument run, but
+    receives its precomputed share of the *one* shared account as its starting balance
+    (``shared_balance * weight``). The legs are then folded into one combined ledger and
+    one :class:`~ube.core.result.BacktestResult`, so the reported equity curve is the
+    portfolio's, and every fill stays traceable to its instrument.
+    """
+    portfolio = config.portfolio
+    if portfolio is None:  # pragma: no cover — caller guarantees this
+        raise ConfigError("_run_portfolio_backtest requires config.portfolio")
+
+    keyed_data = _normalize_portfolio_mapping(data)
+    portfolio.validate_data(list(keyed_data))
+    market_data = {
+        symbol: _standardize_data(value) for symbol, value in keyed_data.items()
+    }
+    signal_map = _standardize_portfolio_signals(signals, portfolio)
+
+    weights = allocation_weights(portfolio.allocation, portfolio.instrument_ids)
+    overrides = dict(config.engine_overrides or {})
+    shared_balance = float(overrides.get("starting_balance", DEFAULT_PORTFOLIO_BALANCE))
+    if not np.isfinite(shared_balance) or shared_balance <= 0.0:
+        raise ConfigError(
+            f"portfolio starting_balance must be finite and > 0; got {shared_balance!r}"
+        )
+
+    sizing = portfolio.sizing or config.risk.sizing
+    if sizing.kind == "fixed_units":
+        raise ConfigError(
+            "portfolio runs cannot use fixed_units sizing: units are not scaled by the "
+            "shared-capital allocation. Use all_in / equal_weight / fixed_fraction / "
+            "volatility_target, or set PortfolioConfig.sizing explicitly."
+        )
+
+    instruments = portfolio.instrument_map
+    legs: list[tuple[str, EventLedger]] = []
+    for symbol in portfolio.instrument_ids:
+        weight = float(weights[symbol])
+        if weight <= 0.0:
+            continue
+        leg_overrides = dict(overrides)
+        leg_overrides["starting_balance"] = shared_balance * weight
+        leg_config = replace(
+            config,
+            instrument=instruments[symbol],
+            risk=replace(config.risk, sizing=sizing),
+            engine_overrides=leg_overrides,
+            portfolio=None,
+        )
+        result = adapter_cls().run(
+            market_data[symbol],
+            signal_map[symbol],
+            leg_config,
+            aux_data=_portfolio_aux_for(aux_data, symbol),
+        )
+        legs.append((symbol, result.ledger))
+
+    if not legs:
+        raise ConfigError(
+            "every portfolio instrument has a zero allocation; nothing to run"
+        )
+
+    merged = _merge_portfolio_ledgers(legs)
+    return BacktestResult.from_ledger(
+        merged,
+        config,
+        market_data=market_data,
+        instruments=instruments,
+        fx_rates=_portfolio_fx_rates(config, market_data, instruments),
+    )
 
 
 def _optional_dependency_installed(module: str) -> bool:
@@ -305,6 +539,8 @@ def run(
     config.validate(portfolio=isinstance(data, Mapping))
 
     config = _default_settlement_currency(config)
+    if isinstance(data, Mapping) and config.portfolio is not None:
+        config = _resolve_portfolio_config(config)
 
     # Portfolio (dict-keyed) inputs are forwarded as-is; the adapter decides support
     # (§7.1). Benchmark comparison is a single-instrument concept (it lines up two
@@ -332,13 +568,24 @@ def run(
         ensure_builtin_engines_registered()
         engine_name = resolve_engine_name(config.engine)
         adapter_cls = get_engine(engine_name)
-        # Forwarded as-is: the single-instrument adapter contract types ``data``/``signals``
-        # as MarketData/Signals, but a portfolio run passes dict-keyed inputs that only a
-        # portfolio-capable adapter understands (it validates at runtime, §7.1).
-        result = adapter_cls().run(data, signals, config, aux_data=aux_data)  # type: ignore[arg-type]
-        # §4.8: a multi-instrument run is still a run — log it so the true attempt count
-        # (PBO/DSR honesty, §11) is complete. Build the portfolio fingerprint.
-        data_reference = PortfolioDataReference.from_market_data_mapping(data)
+        if config.portfolio is not None:
+            # Shared-capital portfolio path: every leg is delegated to the adapter, but
+            # sized from one pre-split pool, and the ledgers fold into one combined result.
+            result = _run_portfolio_backtest(
+                data, signals, config, aux_data=aux_data, adapter_cls=adapter_cls
+            )
+            reference_data = _normalize_portfolio_mapping(data)
+            data_reference = PortfolioDataReference.from_market_data_mapping(
+                reference_data, config.portfolio.instrument_map
+            )
+        else:
+            # Legacy mapping path: forwarded as-is to a portfolio-capable adapter. The
+            # single-instrument adapter contract types ``data``/``signals`` as
+            # MarketData/Signals, so the adapter validates the mapping at runtime (§7.1).
+            result = adapter_cls().run(data, signals, config, aux_data=aux_data)  # type: ignore[arg-type]
+            # §4.8: a multi-instrument run is still a run — log it so the true attempt
+            # count (PBO/DSR honesty, §11) is complete. Build the portfolio fingerprint.
+            data_reference = PortfolioDataReference.from_market_data_mapping(data)
     else:
         md = _standardize_data(data)
         sig = _standardize_signals(signals)

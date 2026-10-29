@@ -37,6 +37,7 @@ ENGINE_TESTS: dict[str, tuple[str, ...]] = {
     "integration/test_run.py": ("vectorbt", "nautilus"),
     "integration/test_run_stats.py": ("nautilus",),
     "integration/test_papertrading_stats.py": ("nautilus",),
+    "integration/test_portfolio.py": ("vectorbt", "backtrader", "nautilus"),
     "integration/test_nautilus_adapter.py": ("nautilus",),
     "integration/test_nautilus_atr.py": ("nautilus",),
     "integration/test_nautilus_vol_target.py": ("nautilus",),
@@ -47,6 +48,7 @@ ENGINE_TESTS: dict[str, tuple[str, ...]] = {
     "parity/test_nautilus_parity.py": ("nautilus",),
     "parity/test_paper_nautilus_consistency.py": ("nautilus",),
     "parity/test_cross_engine_parity.py": ("vectorbt", "backtrader", "nautilus"),
+    "parity/test_portfolio_consistency.py": ("vectorbt", "backtrader", "nautilus"),
     "unit/test_nautilus_fold_order.py": ("nautilus",),
 }
 

@@ -16,11 +16,13 @@ from ube.papertrading.core import (
     get_paper_engine,
     get_state_class,
     init,
+    init_portfolio,
     register_paper_engine,
     register_state_class,
     run,
     run_auto,
     step,
+    step_portfolio,
 )
 from ube.papertrading.errors import (
     DuplicateBarError,
@@ -28,7 +30,7 @@ from ube.papertrading.errors import (
     PaperTradingError,
     StateCorruptionError,
 )
-from ube.papertrading.state import OpenPosition, PaperState
+from ube.papertrading.state import OpenPosition, PaperState, PortfolioPaperState
 
 # Register the dependency-free test backend (plan T2).
 register_paper_engine("recording", RecordingBackend)
@@ -41,14 +43,17 @@ __all__ = [
     "PaperEngine",
     "PaperState",
     "PaperTradingError",
+    "PortfolioPaperState",
     "RecordingBackend",
     "StateCorruptionError",
     "get_paper_engine",
     "get_state_class",
     "init",
+    "init_portfolio",
     "register_paper_engine",
     "register_state_class",
     "run",
     "run_auto",
     "step",
+    "step_portfolio",
 ]

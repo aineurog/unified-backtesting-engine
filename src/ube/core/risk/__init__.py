@@ -4,6 +4,14 @@ Re-exports the sizing models/sizers and the exit configs/level functions from th
 :mod:`ube.core.risk.sizing` and :mod:`ube.core.risk.exits` submodules.
 """
 
+from ube.core.portfolio import (
+    AllocationPolicy,
+    EqualWeight,
+    FixedWeight,
+    PortfolioConfig,
+    allocation_weights,
+    size_portfolio_entry,
+)
 from ube.core.risk.aux import (
     atr_from_aux,
     atr_series_for_exit,
@@ -55,6 +63,12 @@ __all__ = [
     "SizeKind",
     "SizeModel",
     "size_position",
+    "AllocationPolicy",
+    "EqualWeight",
+    "FixedWeight",
+    "PortfolioConfig",
+    "allocation_weights",
+    "size_portfolio_entry",
     "fixed_fraction_size",
     "fixed_units_size",
     "volatility_target_size",

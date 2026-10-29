@@ -15,6 +15,7 @@ from typing import Any
 
 from ube.core.calendar import TradingCalendar, resolve_calendar
 from ube.core.config import BacktestConfig
+from ube.core.portfolio import PortfolioConfig
 
 __all__ = ["PaperConfig"]
 
@@ -46,6 +47,9 @@ class PaperConfig:
             :class:`~ube.core.errors.CalendarMismatchError` (``True``, backtest parity)
             instead of skipping the bar and warning (``False``, the paper default so one
             bad bar never kills a long-running session).
+        portfolio: Optional :class:`~ube.core.portfolio.PortfolioConfig`. When set, the
+            session is multi-asset and shares one pool of capital. ``None`` keeps the
+            original single-instrument contract untouched.
     """
 
     base: BacktestConfig
@@ -59,8 +63,34 @@ class PaperConfig:
     # are a no-op either way.
     calendar_validate: bool = True
     calendar_strict: bool = False
+    portfolio: PortfolioConfig | None = None
 
     def __post_init__(self) -> None:
+        portfolio = self.portfolio if self.portfolio is not None else self.base.portfolio
+        if portfolio is not None:
+            if not isinstance(portfolio, PortfolioConfig):
+                raise ValueError("portfolio must be a PortfolioConfig or None")
+            if (
+                self.portfolio is not None
+                and self.base.portfolio is not None
+                and self.base.portfolio != self.portfolio
+            ):
+                raise ValueError(
+                    "PaperConfig.portfolio and base.portfolio disagree; declare it once"
+                )
+            if self.base.instrument.symbol not in portfolio.instrument_ids:
+                raise ValueError(
+                    "base.instrument must be one of the portfolio instruments; got "
+                    f"{self.base.instrument.symbol!r}"
+                )
+            if self.base.base_currency is None and portfolio.base_currency:
+                import dataclasses
+
+                object.__setattr__(
+                    self,
+                    "base",
+                    dataclasses.replace(self.base, base_currency=portfolio.base_currency),
+                )
         if self.starting_balance is not None and self.starting_balance <= 0:
             raise ValueError("starting_balance must be > 0")
         if not isinstance(self.calendar_validate, bool):
@@ -78,6 +108,16 @@ class PaperConfig:
 
             new_base = dataclasses.replace(self.base, engine_overrides=overrides)
             object.__setattr__(self, "base", new_base)
+
+    @property
+    def portfolio_config(self) -> PortfolioConfig | None:
+        """The effective portfolio config (``PaperConfig`` field or ``base.portfolio``)."""
+        return self.portfolio if self.portfolio is not None else self.base.portfolio
+
+    @property
+    def is_portfolio(self) -> bool:
+        """Whether this session trades several instruments from one shared pool."""
+        return self.portfolio_config is not None
 
     @property
     def overrides(self) -> dict[str, Any]:

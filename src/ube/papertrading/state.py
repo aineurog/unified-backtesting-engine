@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -46,6 +47,7 @@ __all__ = [
     "ExitSeed",
     "OpenPosition",
     "PaperState",
+    "PortfolioPaperState",
     "get_or_create_run_id",
     "save_trades",
     "save_equity",
@@ -941,6 +943,275 @@ class PaperState:
 
         # run_id is not stored on the instance; caller must supply db_path + run_id via load
         raise NotImplementedError("Use load_trades(db_path, run_id) instead")
+
+
+class PortfolioPaperState(PaperState):
+    """A resumable multi-asset paper session sharing one pool of capital.
+
+    The state keeps one ordinary :class:`PaperState` per instrument (so each backend's
+    proven resume logic is reused unchanged) plus a *manifest* row under ``run_id``. The
+    combined ledger is the union of the per-instrument ledgers, sorted chronologically —
+    which is exactly the shape :func:`~ube.core.ledger.equity_curve`,
+    :func:`~ube.core.ledger.trades` and the statistics pipeline already accept.
+
+    The one genuinely new durable concept is ``instrument_ids``: everything else is
+    derived from the sub-states, following the same "no new durable fields beyond what
+    is derivable from the ledger" philosophy as the single-instrument state.
+
+    Attributes:
+        instrument_ids: The traded instrument symbols, in declaration order.
+        states: ``symbol -> PaperState`` for each instrument.
+        run_id / db_path: The *parent* session identity. Sub-states persist under
+            ``"<run_id>::<symbol>"`` so a portfolio session occupies one logical run
+            without one row per instrument.
+    """
+
+    def __init__(
+        self,
+        instrument_ids: tuple[str, ...] | list[str],
+        states: Mapping[str, PaperState],
+        *,
+        run_id: str | None = None,
+        db_path: str | None = None,
+        stats_trade_count: int = 0,
+    ) -> None:
+        ids = tuple(instrument_ids)
+        if not ids:
+            raise ConfigError("PortfolioPaperState needs at least one instrument")
+        if len(set(ids)) != len(ids):
+            raise ConfigError(f"PortfolioPaperState instrument ids must be unique; got {ids}")
+        if set(ids) != set(states):
+            raise ConfigError(
+                "PortfolioPaperState.states must cover exactly instrument_ids; "
+                f"missing={sorted(set(ids) - set(states))}, "
+                f"extra={sorted(set(states) - set(ids))}"
+            )
+        self.instrument_ids = ids
+        self.states: dict[str, PaperState] = dict(states)
+        # Base-class compatibility attributes. Portfolio-wide values are derived from the
+        # sub-states; ``open_position`` is deliberately None (there is no combined
+        # position across instruments, §4.6).
+        self.instrument_id = ",".join(ids)
+        self.last_processed_ns = self._max_cursor()
+        self.last_price = None
+        self.open_position = None
+        self.pending_levels = {}
+        self.signal_fn_state = {}
+        self.config_ref = next(
+            (state.config_ref for state in self.states.values() if state.config_ref),
+            None,
+        )
+        self.aux_data = {}
+        self.exit_seed = None
+        self.last_funding_ns = None
+        self.run_id = run_id
+        self.db_path = db_path
+        self.stats_trade_count = int(stats_trade_count)
+
+    def _max_cursor(self) -> int | None:
+        cursors = [
+            int(state.last_processed_ns)
+            for state in self.states.values()
+            if state.last_processed_ns is not None
+        ]
+        return max(cursors) if cursors else None
+
+    @property
+    def open_positions(self) -> dict[str, OpenPosition | None]:
+        """``instrument_id -> open position`` (``None`` when that leg is flat)."""
+        return {symbol: state.open_position for symbol, state in self.states.items()}
+
+    @property
+    def ledger(self) -> EventLedger:
+        """The combined ledger: every leg's events, in chronological order."""
+        rows: list[tuple[int, int, int, LedgerEvent]] = []
+        for leg_index, symbol in enumerate(self.instrument_ids):
+            for seq, event in enumerate(self.states[symbol].ledger.events):
+                rows.append((int(event.timestamp), leg_index, seq, event))
+        rows.sort(key=lambda row: (row[0], row[1], row[2]))
+        return EventLedger(event for _ts, _leg, _seq, event in rows)
+
+    def window_start_ns(self, *, warmup_ns: int = 0) -> int:
+        """Earliest context bar any leg needs (the portfolio runner's fetch bound)."""
+        starts = [
+            int(state.window_start_ns(warmup_ns=warmup_ns))
+            for state in self.states.values()
+        ]
+        return min(starts) if starts else 0
+
+    # ------------------------------------------------------------------
+    # Persistence: one manifest row + one row per leg.
+    # ------------------------------------------------------------------
+
+    def save(self, path: str, run_id: str = "default") -> None:
+        """Persist every leg under ``"<run_id>::<symbol>"`` plus a manifest row."""
+        for symbol, state in self.states.items():
+            state.db_path = path
+            state.run_id = f"{run_id}::{symbol}"
+            state.save(path, run_id=f"{run_id}::{symbol}")
+        self.db_path = path
+        self.run_id = run_id
+        manifest = f"|portfolio|{','.join(self.instrument_ids)}"
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path), isolation_level=None)
+            try:
+                _ensure_all_tables(conn)
+                conn.execute(
+                    _INSERT_SQL,
+                    (
+                        run_id,
+                        manifest,
+                        self.last_processed_ns,
+                        None,
+                        _ledger_to_json(self.ledger),
+                        None,
+                        _json({}),
+                        _json({}),
+                        self.config_ref,
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            raise StateCorruptionError(
+                f"could not save portfolio paper state to {path}: {exc}"
+            ) from exc
+
+    @classmethod
+    def load(
+        cls,
+        path: str,
+        run_id: str = "default",
+        *,
+        state_cls: type[PaperState] = PaperState,
+    ) -> PortfolioPaperState:
+        """Restore a portfolio session written by :meth:`save`.
+
+        Args:
+            path: The sqlite file.
+            run_id: The parent session id.
+            state_cls: The engine-specific :class:`PaperState` subclass to use for each
+                leg (e.g. ``VbtPaperState``); defaults to the base class.
+        """
+        if not Path(path).exists():
+            raise StateCorruptionError(f"paper state file {path} does not exist")
+        conn = sqlite3.connect(str(path), isolation_level=None)
+        try:
+            _ensure_all_tables(conn)
+            row = conn.execute(
+                "SELECT instrument_id FROM paper_state WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise StateCorruptionError(f"no paper state for run_id={run_id!r}")
+        manifest = str(row[0])
+        if not manifest.startswith("|portfolio|"):
+            raise StateCorruptionError(
+                f"run_id={run_id!r} is not a portfolio paper session"
+            )
+        ids = tuple(part for part in manifest.split("|portfolio|", 1)[1].split(",") if part)
+        states = {
+            symbol: state_cls.load(path, run_id=f"{run_id}::{symbol}") for symbol in ids
+        }
+        return cls(ids, states, run_id=run_id, db_path=path)
+
+    # ------------------------------------------------------------------
+    # Statistics across the whole portfolio.
+    # ------------------------------------------------------------------
+
+    def stats(
+        self,
+        data: Mapping[str, MarketData],
+        config: Any,
+        *,
+        through_ns: int | None = None,
+        periods_per_year: float | None = None,
+        resample_to: str | None = None,
+        return_policy: str = "truncate",
+        rf: float = 0.0,
+    ) -> StatsResult:
+        """Compute the four-tier statistics for the combined portfolio (§10)."""
+        from ube.core.portfolio import PortfolioConfig
+
+        inner = getattr(config, "base", None)
+        base: BacktestConfig = inner if isinstance(inner, BacktestConfig) else config
+        if not isinstance(base, BacktestConfig):
+            raise ConfigError("stats() needs a BacktestConfig or a PaperConfig carrying one")
+        portfolio = getattr(config, "portfolio_config", None) or base.portfolio
+        if not isinstance(portfolio, PortfolioConfig):
+            raise ConfigError("PortfolioPaperState.stats needs a portfolio config")
+        if not isinstance(data, Mapping):
+            raise ConfigError(
+                "PortfolioPaperState.stats expects {instrument_id: MarketData}"
+            )
+        instruments = portfolio.instrument_map
+        missing = [symbol for symbol in portfolio.instrument_ids if symbol not in data]
+        if missing:
+            raise ConfigError(f"stats data is missing instruments: {missing}")
+
+        run_id = self.run_id or "default"
+        equity_source = "none"
+        equity_note = "no persisted equity points and no ledger-covered bars"
+        index: pd.Index = pd.DatetimeIndex([])
+        equity: np.ndarray = np.zeros(0, dtype=np.float64)
+        persisted_returns: np.ndarray | None = None
+        if self.db_path:
+            persisted = load_equity(self.db_path, run_id)
+            if through_ns is not None and len(persisted):
+                persisted = persisted.loc[
+                    persisted["timestamp"].astype("int64") <= int(through_ns)
+                ]
+            if len(persisted) >= 2:
+                index = pd.DatetimeIndex(persisted["timestamp"])
+                equity = np.asarray(persisted["equity"], dtype=np.float64)
+                persisted_returns = np.asarray(persisted["returns"], dtype=np.float64)
+                equity_source = "persisted"
+                equity_note = "combined portfolio equity written by step()"
+        if equity_source == "none":
+            merged = self.ledger
+            try:
+                curve = equity_curve(
+                    merged,
+                    data,
+                    instruments,
+                    base_currency=base.base_currency or portfolio.base_currency,
+                )
+            except Exception as exc:  # noqa: BLE001 — a derivable curve is a bonus
+                equity_note = f"combined equity derivation failed: {type(exc).__name__}: {exc}"
+            else:
+                if through_ns is not None:
+                    keep = curve.index.asi8 <= int(through_ns)  # type: ignore[attr-defined]
+                    index, equity = curve.index[keep], curve.equity[keep]
+                else:
+                    index, equity = curve.index, curve.equity
+                equity_source = "ledger"
+                equity_note = "derived from the combined ledger + supplied bars"
+
+        return stats_from_arrays(
+            index,
+            equity,
+            trades=trades(self.ledger, instruments=instruments),
+            ledger=self.ledger,
+            market_data=data,
+            instruments=instruments,
+            equity_returns=persisted_returns,
+            periods_per_year=periods_per_year,
+            resample_to=resample_to,
+            return_policy=return_policy,
+            rf=rf,
+            extra_meta={
+                "equity_source": equity_source,
+                "equity_note": equity_note,
+                "is_portfolio": True,
+                "instruments": list(self.instrument_ids),
+                "n_equity_points": int(len(index)),
+            },
+        )
 
 
 def load_trades(db_path: str, run_id: str = "default") -> Any:

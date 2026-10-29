@@ -23,6 +23,13 @@ from ube.core.config import BacktestConfig, SignalConfig
 from ube.core.cost import CostModel
 from ube.core.data import MarketData
 from ube.core.instrument import Instrument
+from ube.core.portfolio import (
+    AllocationPolicy,
+    EqualWeight,
+    FixedWeight,
+    PortfolioConfig,
+    size_portfolio_entry,
+)
 from ube.core.risk import (
     ATRStop,
     ChandelierExit,
@@ -54,14 +61,18 @@ __version__ = "0.1.0"
 __all__ = [
     "AUTO_ENGINE_ORDER",
     "ATRStop",
+    "AllocationPolicy",
     "BacktestConfig",
     "BenchmarkConfig",
     "ChandelierExit",
     "CostModel",
     "EngineAdapter",
+    "EqualWeight",
     "Exit",
+    "FixedWeight",
     "Instrument",
     "MarketData",
+    "PortfolioConfig",
     "RiskConfig",
     "SignalConfig",
     "Signals",
@@ -81,5 +92,6 @@ __all__ = [
     "resolve_engine_name",
     "run",
     "signals",
+    "size_portfolio_entry",
     "stats",
 ]

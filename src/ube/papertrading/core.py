@@ -43,12 +43,24 @@ from ube.core.errors import (
     EngineError,
     InvalidSignalError,
 )
-from ube.core.instrument import Instrument, allows_short
-from ube.core.ledger import EventLedger, EventType, LedgerEvent, Trade
+from ube.core.instrument import Instrument, allows_short, resolve_settlement_currency
+from ube.core.ledger import EventLedger, EventType, LedgerEvent, Trade, trades
+from ube.core.portfolio import (
+    DEFAULT_PORTFOLIO_BALANCE,
+    PortfolioConfig,
+    allocation_weights,
+)
 from ube.core.signals import Signals, from_target, validate_long_only
 
 from .config import PaperConfig
-from .state import OpenPosition, PaperState, step_position_after_fill
+from .state import (
+    OpenPosition,
+    PaperState,
+    PortfolioPaperState,
+    save_equity,
+    save_trades,
+    step_position_after_fill,
+)
 
 #: A fresh session whose engine window ends within this wall-clock skew is a *live* launch
 #: (the last bar is the just-closed bar, seconds old), so bars before it are indicator
@@ -423,6 +435,8 @@ def init(
     # db_path may come from config.state_path if not explicitly passed
     if db_path is None:
         db_path = config.state_path
+    if config.is_portfolio:
+        return init_portfolio(config, run_id=run_id, db_path=db_path)
     state_cls = get_state_class(config.engine)
     return state_cls(
         instrument_id=instrument.symbol,
@@ -431,6 +445,48 @@ def init(
         # Persist the resolved canonical config as YAML (plan blocker #10) so a resumed
         # run is self-contained — the caller need not re-supply ``base`` (though it may).
         config_ref=yaml.safe_dump(dataclasses.asdict(config.base)),
+        run_id=run_id,
+        db_path=db_path,
+    )
+
+
+def init_portfolio(
+    config: PaperConfig, *, run_id: str = "default", db_path: str | None = None
+) -> PortfolioPaperState:
+    """Create a fresh multi-asset paper session sharing one capital pool.
+
+    Each instrument gets its own engine-specific :class:`PaperState` (so the proven
+    per-engine resume logic is reused verbatim); the parent
+    :class:`PortfolioPaperState` ties them together under one ``run_id``.
+    """
+    portfolio = config.portfolio_config
+    if not isinstance(portfolio, PortfolioConfig):
+        raise ConfigError("init_portfolio requires PaperConfig.portfolio")
+    if db_path is None:
+        db_path = config.state_path
+    state_cls = get_state_class(config.engine)
+    config_ref = yaml.safe_dump(dataclasses.asdict(config.base))
+    states: dict[str, PaperState] = {}
+    for instrument in portfolio.instruments:
+        resolved = (
+            instrument
+            if instrument.settlement_currency is not None
+            else dataclasses.replace(
+                instrument,
+                settlement_currency=resolve_settlement_currency(instrument),
+            )
+        )
+        states[resolved.symbol] = state_cls(
+            instrument_id=resolved.symbol,
+            ledger=EventLedger(),
+            last_processed_ns=None,
+            config_ref=config_ref,
+            run_id=f"{run_id}::{resolved.symbol}",
+            db_path=db_path,
+        )
+    return PortfolioPaperState(
+        portfolio.instrument_ids,
+        states,
         run_id=run_id,
         db_path=db_path,
     )
@@ -526,14 +582,17 @@ def step(
         InvalidSignalError: Signal/bar shape mismatch or a long-only asset asked to short.
         ConfigError: Malformed config.
     """
+    if not isinstance(config, PaperConfig):
+        raise ConfigError("step expects a PaperConfig for config")
+    if config.is_portfolio or isinstance(state, PortfolioPaperState):
+        return step_portfolio(data, signals, state, config, aux_data, start_from_ns)
+
     if not isinstance(data, MarketData):
         raise ConfigError("step expects a MarketData for data")
     if not isinstance(signals, Signals):
         raise ConfigError("step expects a Signals for signals")
     if not isinstance(state, PaperState):
         raise ConfigError("step expects a PaperState for state")
-    if not isinstance(config, PaperConfig):
-        raise ConfigError("step expects a PaperConfig for config")
 
     # Enforce the explicit-over-default position-change policy (§9.3/§4.7) before any
     # backend work. This is the single source of truth for ``on_opposite_signal`` (plan
@@ -737,10 +796,204 @@ def step(
     return state, new_events
 
 
+def _normalize_portfolio_inputs(mapping: object, name: str) -> dict[str, Any]:
+    """Key a paper-trading data/signal mapping by instrument symbol."""
+    if not isinstance(mapping, Mapping):
+        raise ConfigError(f"portfolio {name} must be a {{instrument_id: value}} mapping")
+    out: dict[str, Any] = {}
+    for key, value in mapping.items():
+        symbol = getattr(key, "symbol", None)
+        symbol = symbol if isinstance(symbol, str) and symbol.strip() else str(key)
+        if symbol in out:
+            raise ConfigError(f"duplicate portfolio {name} key {symbol!r}")
+        out[symbol] = value
+    return out
+
+
+def _portfolio_aux(
+    aux_data: Mapping[str, Any] | None, symbol: str
+) -> Mapping[str, Any] | None:
+    """Select a leg's aux map, accepting a flat map or ``symbol -> map``."""
+    if aux_data is None:
+        return None
+    value = aux_data.get(symbol)
+    if isinstance(value, Mapping):
+        return value
+    return aux_data
+
+
+def _leg_equity(state: PaperState, instrument: Instrument) -> float:
+    """Cash + open-position mark for one leg (the paper rollup's equity component)."""
+    total_cash = 0.0
+    has_cash = False
+    for event in state.ledger.events:
+        if event.event_type is EventType.CASH_MOVEMENT and event.amount is not None:
+            has_cash = True
+            total_cash += float(event.amount)
+        elif (
+            event.event_type in (EventType.COMMISSION, EventType.FUNDING_PAYMENT)
+            and event.amount is not None
+        ):
+            has_cash = True
+            total_cash -= float(event.amount)
+    balance = total_cash if has_cash else 0.0
+    if state.open_position is not None and state.last_price is not None:
+        multiplier = float(instrument.contract_multiplier or 1.0)
+        position = state.open_position
+        balance += (
+            float(position.quantity)
+            * float(position.side)
+            * float(state.last_price)
+            * multiplier
+        )
+    return float(balance)
+
+
+def _save_portfolio_rollup(
+    state: PortfolioPaperState,
+    market_data: Mapping[str, MarketData],
+    config: PaperConfig,
+    db_path: str,
+    run_id: str,
+) -> None:
+    """Persist the parent session's combined trades, equity point and manifest."""
+    portfolio = config.portfolio_config
+    if not isinstance(portfolio, PortfolioConfig):  # pragma: no cover — caller guarantees
+        raise ConfigError("_save_portfolio_rollup requires PaperConfig.portfolio")
+
+    instruments = portfolio.instrument_map
+    combined_trades = list(trades(state.ledger, instruments=instruments))
+    save_trades(db_path, run_id, combined_trades)
+
+    cursor = state.last_processed_ns
+    if cursor is not None:
+        total = sum(
+            _leg_equity(state.states[symbol], instruments[symbol])
+            for symbol in state.instrument_ids
+        )
+        equity_df = pd.DataFrame(
+            [{"timestamp": int(cursor), "equity": float(total), "returns": 0.0}]
+        )
+        save_equity(db_path, run_id, equity_df)
+    state.save(db_path, run_id=run_id)
+
+    # The stats snapshot remains auxiliary: never fail a step because of it.
+    try:
+        from ube.stats import save_stats
+
+        snapshot = state.stats(market_data, config)
+        save_stats(db_path, run_id, snapshot, trade_count=len(combined_trades))
+        state.stats_trade_count = len(combined_trades)
+    except Exception:  # noqa: BLE001 — auxiliary
+        logging.getLogger("ube").debug("portfolio statistics snapshot skipped", exc_info=True)
+
+
+def step_portfolio(
+    data: object,
+    signals: object,
+    state: PaperState,
+    config: PaperConfig,
+    aux_data: Mapping[str, Any] | None = None,
+    start_from_ns: int | None = None,
+) -> tuple[PaperState, list[LedgerEvent]]:
+    """Process one portfolio slice through the engine's per-instrument backends.
+
+    Every leg runs through the *existing* single-instrument :func:`step` with its own
+    engine-specific state; only the capital feeding each leg changes: the shared balance
+    is split by the configured :data:`~ube.core.portfolio.AllocationPolicy` and handed to
+    that leg as its ``starting_balance``. The parent session then persists one combined
+    equity point and one trade table under its own ``run_id``.
+    """
+    portfolio = config.portfolio_config
+    if not isinstance(portfolio, PortfolioConfig):
+        raise ConfigError("step_portfolio requires PaperConfig.portfolio")
+    if not isinstance(state, PortfolioPaperState):
+        raise ConfigError("step_portfolio requires a PortfolioPaperState")
+    if not isinstance(config, PaperConfig):
+        raise ConfigError("step_portfolio requires a PaperConfig")
+
+    data_map = _normalize_portfolio_inputs(data, "data")
+    signal_map = _normalize_portfolio_inputs(signals, "signals")
+    portfolio.validate_data(list(data_map))
+    portfolio.validate_data(list(signal_map))
+    config.base.validate(paper_trading=True)
+
+    weights = allocation_weights(portfolio.allocation, portfolio.instrument_ids)
+    overrides = config.overrides
+    shared_balance = float(
+        config.starting_balance
+        if config.starting_balance is not None
+        else overrides.get("starting_balance", DEFAULT_PORTFOLIO_BALANCE)
+    )
+    if not np.isfinite(shared_balance) or shared_balance <= 0.0:
+        raise ConfigError(
+            f"portfolio starting_balance must be finite and > 0; got {shared_balance!r}"
+        )
+    sizing = portfolio.sizing or config.base.risk.sizing
+    if sizing.kind == "fixed_units":
+        raise ConfigError(
+            "portfolio paper trading cannot use fixed_units sizing: units are not scaled "
+            "by the shared-capital allocation"
+        )
+
+    instruments = portfolio.instrument_map
+    new_events: list[LedgerEvent] = []
+    for symbol in portfolio.instrument_ids:
+        md = data_map[symbol]
+        sig = signal_map[symbol]
+        if not isinstance(md, MarketData):
+            raise ConfigError(
+                f"portfolio data[{symbol!r}] must be a MarketData; got {type(md).__name__}"
+            )
+        if not isinstance(sig, Signals):
+            raise ConfigError(
+                f"portfolio signals[{symbol!r}] must be Signals; got {type(sig).__name__}"
+            )
+        share = shared_balance * float(weights[symbol])
+        if share <= 0.0:
+            # A zero allocation means this instrument gets none of the pool. Skipping
+            # keeps zero-balance legs out of engines that reject them, and matches the
+            # backtest orchestrator's behaviour.
+            continue
+        leg_overrides = dict(overrides)
+        leg_overrides["starting_balance"] = share
+        leg_base = dataclasses.replace(
+            config.base,
+            instrument=instruments[symbol],
+            risk=dataclasses.replace(config.base.risk, sizing=sizing),
+            engine_overrides=leg_overrides,
+            portfolio=None,
+        )
+        leg_config = dataclasses.replace(
+            config,
+            base=leg_base,
+            portfolio=None,
+            starting_balance=share,
+        )
+        _, events = step(
+            md,
+            sig,
+            state.states[symbol],
+            leg_config,
+            aux_data=_portfolio_aux(aux_data, symbol),
+            start_from_ns=start_from_ns,
+        )
+        new_events.extend(events)
+
+    state.last_processed_ns = state._max_cursor()
+    db_path = state.db_path or config.state_path
+    run_id = state.run_id or "default"
+    if db_path:
+        _save_portfolio_rollup(state, data_map, config, db_path, run_id)
+
+    new_events.sort(key=lambda event: (int(event.timestamp), event.instrument_id))
+    return state, new_events
+
+
 def run(
     strategy_name: str,
-    data: MarketData,
-    signals: Signals,
+    data: object,
+    signals: object,
     config: PaperConfig,
     *,
     db_path: str | None = None,
@@ -760,8 +1013,10 @@ def run(
         strategy_name: Human-readable strategy name (e.g. ``"BITCOIN_m5"``).
             Used as the stable key in the ``strategies`` table and as the
             ``run_id`` for ``paper_state`` (one row per strategy).
-        data: New bars (single instrument), aligned with ``signals``.
-        signals: 4-column signals for the same bar grid.
+        data: New bars for a single instrument, or ``{instrument_id: MarketData}`` for a
+            portfolio session, aligned with ``signals``.
+        signals: 4-column signals for the same bar grid, or ``{instrument_id: Signals}``
+            for a portfolio session.
         config: Canonical ``PaperConfig`` (already built externally from
             ``config.yaml`` — never a raw dict).
         db_path: Explicit sqlite path. When ``None``, uses
@@ -769,7 +1024,8 @@ def run(
         run_id: Optional explicit run_id override (defaults to
             ``strategy_name``).
         aux_data: Optional derived-series map (§5.2) referenced by name from ATR exits —
-            forwarded to :func:`step` and stored on ``state.aux_data``.
+            forwarded to :func:`step` and stored on ``state.aux_data``. For a portfolio
+            run a flat map (shared by every leg) or ``{instrument_id: map}`` is accepted.
         start_from_ns: Optional int64-ns first-tradable-bar anchor for a fresh session —
             forwarded to :func:`step` (suppresses pre-anchor entries on a live launch).
 
@@ -802,9 +1058,13 @@ def run(
         from ube.papertrading.state import get_or_create_run_id
 
         # instrument_id may not be known until after load/init, so use config's instrument
-        # for the first creation
-        instr = config.base.instrument
-        instr_id = instr.symbol if isinstance(instr, Instrument) else str(instr)
+        # for the first creation. A portfolio session registers every leg, in order.
+        portfolio = config.portfolio_config
+        if portfolio is not None:
+            instr_id = ",".join(portfolio.instrument_ids)
+        else:
+            instr = config.base.instrument
+            instr_id = instr.symbol if isinstance(instr, Instrument) else str(instr)
         effective_run_id = get_or_create_run_id(
             str(effective_db), str(effective_run_id), str(instr_id)
         )
@@ -815,7 +1075,14 @@ def run(
     # load-or-init (the try-load-fallback every caller was hand-rolling)
     state_cls = get_state_class(config.engine)
     try:
-        state = state_cls.load(str(effective_db), run_id=str(effective_run_id))
+        if config.is_portfolio:
+            state: PaperState = PortfolioPaperState.load(
+                str(effective_db),
+                run_id=str(effective_run_id),
+                state_cls=state_cls,
+            )
+        else:
+            state = state_cls.load(str(effective_db), run_id=str(effective_run_id))
         # ensure the loaded state knows its persistence location for auto-save
         state.db_path = str(effective_db)
         state.run_id = str(effective_run_id)
@@ -831,9 +1098,40 @@ def run(
     return step(data, signals, state, config, aux_data=aux_data, start_from_ns=start_from_ns)
 
 
+def _suffix_signals(full_targets: list[int], a: int) -> Signals:
+    """Build the not-yet-processed slice of a target-derived signal set."""
+    full_signals = from_target(np.asarray(full_targets, dtype=np.int64))
+    return Signals(
+        long_entry=full_signals.long_entry[a:],
+        long_exit=full_signals.long_exit[a:],
+        short_entry=full_signals.short_entry[a:],
+        short_exit=full_signals.short_exit[a:],
+    )
+
+
+def _suffix_market_data(data: MarketData, a: int) -> MarketData:
+    """The not-yet-processed slice of a bar series."""
+    return MarketData(
+        open=data.open[a:],
+        high=data.high[a:],
+        low=data.low[a:],
+        close=data.close[a:],
+        volume=data.volume[a:],
+        index=data.timestamps[a:],
+    )
+
+
+def _cursor_offset(data: MarketData, last_processed_ns: int | None) -> int:
+    """First bar index strictly after the persisted cursor."""
+    ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
+    if last_processed_ns is None:
+        return 0
+    return int(np.searchsorted(ts, int(last_processed_ns), side="right"))
+
+
 def run_auto(
-    data: MarketData,
-    signal_fn: Callable[[MarketData], int],
+    data: object,
+    signal_fn: Callable[[MarketData], int] | Mapping[str, Callable[[MarketData], int]],
     config: PaperConfig,
     state: PaperState | None = None,
     *,
@@ -848,8 +1146,10 @@ def run_auto(
     recomputed from history each call, which matches ``from_callable`` semantics).
 
     Args:
-        data: The (possibly full) bar series.
-        signal_fn: A callable returning ``-1/0/1`` for a growing window.
+        data: The (possibly full) bar series, or ``{instrument_id: MarketData}`` for a
+            portfolio session.
+        signal_fn: A callable returning ``-1/0/1`` for a growing window. A portfolio run
+            accepts one shared callable or ``{instrument_id: callable}``.
         config: The paper-trading configuration.
         state: An existing session state, or ``None`` to create one (ephemeral unless
             ``config.state_path`` is set).
@@ -857,8 +1157,13 @@ def run_auto(
     Returns:
         The list of ledger events produced by this call (empty if no new bars).
     """
+    if config.is_portfolio or isinstance(state, PortfolioPaperState):
+        return _run_auto_portfolio(data, signal_fn, config, state, run_id=run_id)
+
     if not isinstance(data, MarketData):
         raise ConfigError("run_auto expects a MarketData")
+    if not callable(signal_fn):
+        raise ConfigError("run_auto expects a signal callable")
     if state is None:
         state = init(config, run_id=run_id)
 
@@ -868,29 +1173,74 @@ def run_auto(
     full_targets = [int(signal_fn(data.head(i + 1))) for i in range(n)]
     state.signal_fn_state["targets"] = full_targets
 
-    ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
-    ts = np.asarray(ts, dtype=np.int64)
-    last = state.last_processed_ns
-    a = 0 if last is None else int(np.searchsorted(ts, last, side="right"))
+    a = _cursor_offset(data, state.last_processed_ns)
     if a >= n:
         return []
 
-    full_signals = from_target(np.asarray(full_targets, dtype=np.int64))
-    suffix_signals = Signals(
-        long_entry=full_signals.long_entry[a:],
-        long_exit=full_signals.long_exit[a:],
-        short_entry=full_signals.short_entry[a:],
-        short_exit=full_signals.short_exit[a:],
+    _, events = step(
+        _suffix_market_data(data, a),
+        _suffix_signals(full_targets, a),
+        state,
+        config,
     )
-    data_suffix = MarketData(
-        open=data.open[a:],
-        high=data.high[a:],
-        low=data.low[a:],
-        close=data.close[a:],
-        volume=data.volume[a:],
-        index=data.timestamps[a:],
-    )
-    _, events = step(data_suffix, suffix_signals, state, config)
+    return events
+
+
+def _run_auto_portfolio(
+    data: object,
+    signal_fn: Callable[[MarketData], int] | Mapping[str, Callable[[MarketData], int]],
+    config: PaperConfig,
+    state: PaperState | None,
+    *,
+    run_id: str,
+) -> list[LedgerEvent]:
+    """Portfolio variant of :func:`run_auto`: stream one callable per instrument."""
+    portfolio = config.portfolio_config
+    if not isinstance(portfolio, PortfolioConfig):
+        raise ConfigError("run_auto portfolio mode requires PaperConfig.portfolio")
+    data_map = _normalize_portfolio_inputs(data, "data")
+    portfolio.validate_data(list(data_map))
+    if isinstance(signal_fn, Mapping):
+        fn_map = _normalize_portfolio_inputs(signal_fn, "signal_fn")
+        portfolio.validate_data(list(fn_map))
+    elif callable(signal_fn):
+        fn_map = {symbol: signal_fn for symbol in portfolio.instrument_ids}
+    else:
+        raise ConfigError(
+            "run_auto portfolio mode expects one callable or {instrument_id: callable}"
+        )
+
+    if state is None:
+        state = init(config, run_id=run_id)
+    if not isinstance(state, PortfolioPaperState):  # pragma: no cover — init guarantees
+        raise ConfigError("run_auto portfolio state must be a PortfolioPaperState")
+
+    slices_data: dict[str, MarketData] = {}
+    slices_signals: dict[str, Signals] = {}
+    for symbol in portfolio.instrument_ids:
+        md = data_map[symbol]
+        fn = fn_map[symbol]
+        if not isinstance(md, MarketData):
+            raise ConfigError(
+                f"portfolio data[{symbol!r}] must be a MarketData; got {type(md).__name__}"
+            )
+        if not callable(fn):
+            raise ConfigError(f"portfolio signal_fn[{symbol!r}] must be callable")
+        n = md.n_bars
+        if n == 0:
+            continue
+        full_targets = [int(fn(md.head(i + 1))) for i in range(n)]
+        leg_state = state.states[symbol]
+        leg_state.signal_fn_state["targets"] = full_targets
+        a = _cursor_offset(md, leg_state.last_processed_ns)
+        if a >= n:
+            continue
+        slices_data[symbol] = _suffix_market_data(md, a)
+        slices_signals[symbol] = _suffix_signals(full_targets, a)
+
+    if not slices_data:
+        return []
+    _, events = step(slices_data, slices_signals, state, config)
     return events
 
 
