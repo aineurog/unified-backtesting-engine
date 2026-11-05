@@ -88,9 +88,10 @@ TRADE_FIELDS: tuple[str, ...] = (
 )
 
 #: Every engine name that must appear in every lock file, and that the cross-engine
-#: suite compares. All three adapters fill on the signal bar at its close (§9.4), so
-#: the same bars necessarily produce the same trade table in each — equality is the
-#: assertion, not a tolerance.
+#: suite compares. Every adapter honours the same ``execution_timing`` contract (default
+#: ``next_open``: a decision at bar *t* fills at bar *t+1*'s open, §6.1), so the same
+#: bars necessarily produce the same trade table in each — equality is the assertion,
+#: not a tolerance.
 ENGINES: tuple[str, ...] = ("vectorbt", "nautilus", "backtrader")
 
 
@@ -127,15 +128,21 @@ def manifest_info(asset_class: str) -> dict[str, Any]:
 
 
 def parity_target(n_bars: int) -> np.ndarray:
-    """Trivial parity strategy target: long from bar 1 to the last bar (flat ends).
+    """Trivial parity strategy target: long from bar 1, flat from bar ``n-2``.
 
     Deliberately the simplest possible strategy — one round trip, no stops, no sizing
     model, no warm-up. §16 calls for "a trivial strategy that *must* produce the same
     result through every engine"; anything richer would make a divergence ambiguous
     between strategy semantics and engine semantics.
+
+    Targets are decision-time (``from_target``): the entry decision lands on bar 1 and
+    the exit decision on bar ``n-2``. Under the default ``next_open`` timing both then
+    fill one bar later (bars 2 and ``n-1``), keeping the *exit* inside the data. Holding
+    through ``n-1`` would place the exit decision on the final bar, where ``next_open``
+    has no next bar to fill on and the round trip never closes.
     """
     target = np.zeros(n_bars, dtype=int)
-    target[1:-1] = 1
+    target[1:-2] = 1
     return target
 
 

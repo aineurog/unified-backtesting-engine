@@ -90,6 +90,8 @@ def build_bar_type(instrument_id: InstrumentId, period_ns: int) -> BarType:
 def to_nautilus_bars(
     market_data: MarketData,
     build: NautilusInstrumentBuild,
+    *,
+    fill_price_source: str = "close",
 ) -> tuple[Sequence[Bar], BarType]:
     """Convert canonical bars to native Nautilus :class:`Bar` objects (§4.4).
 
@@ -97,14 +99,29 @@ def to_nautilus_bars(
     ``size_precision`` (integer quantities when the size precision is 0, e.g. ES/GC
     futures). ``ts_event = ts_init`` is the canonical timestamp's int-ns UTC value.
 
+    Args:
+        market_data: The canonical bars.
+        build: The resolved instrument build (precision/bar type).
+        fill_price_source: ``"close"`` (default) leaves every bar unchanged, so a market
+            order submitted in ``on_bar`` fills at that bar's close. ``"open"`` rewrites
+            each bar's ``close`` to the *real open*, keeping the true open/high/low:
+            Nautilus then fills a market order at the bar's open. The adapter uses this
+            for ``execution_timing="next_open"`` (the signal map is shifted one bar, so
+            the actor submits on the bar that opens at the intended execution price).
+
     Returns:
         The bars (chronological order — ``MarketData`` is already sorted) plus the
         ``BarType`` they were built with (the actor subscribes to the same type).
     """
+    if fill_price_source not in ("close", "open"):
+        raise ValueError(
+            f"fill_price_source must be 'close' or 'open'; got {fill_price_source!r}"
+        )
     bar_type = build_bar_type(build.instrument_id, derive_bar_period_ns(market_data))
     price_precision = int(build.instrument.price_precision)
     size_precision = int(build.instrument.size_precision)
     ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    synthetic_open = fill_price_source == "open"
 
     bars: list[Bar] = []
     for i in range(market_data.n_bars):
@@ -118,13 +135,14 @@ def to_nautilus_bars(
             volume = Quantity.from_str(f"{volume_value:.{size_precision}f}")
         else:
             volume = Quantity.from_str(str(int(round(volume_value))))
+        close_px = market_data.open[i] if synthetic_open else market_data.close[i]
         bars.append(
             Bar(
                 bar_type=bar_type,
                 open=Price.from_str(f"{market_data.open[i]:.{price_precision}f}"),
                 high=Price.from_str(f"{market_data.high[i]:.{price_precision}f}"),
                 low=Price.from_str(f"{market_data.low[i]:.{price_precision}f}"),
-                close=Price.from_str(f"{market_data.close[i]:.{price_precision}f}"),
+                close=Price.from_str(f"{close_px:.{price_precision}f}"),
                 volume=volume,
                 ts_event=int(ts_ns[i]),
                 ts_init=int(ts_ns[i]),

@@ -19,7 +19,12 @@ from ube.adapters import (
 )
 from ube.core import signals as signals
 from ube.core.benchmark import BenchmarkConfig
-from ube.core.config import BacktestConfig, SignalConfig
+from ube.core.config import (
+    EXECUTION_TIMINGS,
+    BacktestConfig,
+    ExecutionTiming,
+    SignalConfig,
+)
 from ube.core.cost import CostModel
 from ube.core.data import MarketData
 from ube.core.instrument import Instrument
@@ -66,7 +71,9 @@ __all__ = [
     "BenchmarkConfig",
     "ChandelierExit",
     "CostModel",
+    "EXECUTION_TIMINGS",
     "EngineAdapter",
+    "ExecutionTiming",
     "EqualWeight",
     "Exit",
     "FixedWeight",

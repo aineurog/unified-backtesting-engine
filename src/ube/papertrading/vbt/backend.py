@@ -30,6 +30,7 @@ import warnings
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 from ube.adapters.vectorbt_adapter.adapter import VectorbtAdapter
 from ube.adapters.vectorbt_adapter.overrides import DEFAULT_STARTING_BALANCE
@@ -44,6 +45,7 @@ from ube.papertrading.core import (
     PaperEngine,
     apply_calendar_policy,
     decide_action,
+    events_after_cursor,
     register_paper_engine,
     register_state_class,
 )
@@ -246,6 +248,17 @@ class VbtPaperEngine(PaperEngine):
             )
         if a >= n:
             return []
+        # The carried entry was *decided* one bar before the bar it fills on for
+        # next_open/next_close (§6.1). Start the replay one bar earlier so the shifted
+        # entry signal is present and the adapter re-opens the position on its original
+        # fill bar; otherwise the window has no decision to replay and the resumed run
+        # diverges from the single-window run.
+        carry_lead = False
+        if open_pos is not None and config.base.execution_timing != "same_close":
+            if a > 0:
+                a -= 1
+            else:
+                carry_lead = True
 
         win_ts = ts[a:]
         win_data = MarketData(
@@ -276,6 +289,32 @@ class VbtPaperEngine(PaperEngine):
             # their entries so a live launch never books "past" fills from the backfill.
             # Only meaningful while the session is still fresh (no cursor yet).
             win_sig = _zero_entries_at_or_before(win_sig, win_ts, int(start_from_ns) - 1)
+
+        if carry_lead:
+            # The window begins exactly on the carried entry's *fill* bar, so the
+            # decision bar it came from is absent from the supplied data. Prepend a
+            # synthetic lead bar (same OHLC, one period earlier) so the carried entry
+            # can sit on a decision index; the adapter's next_* shift then lands it on
+            # the real fill bar instead of one bar late.
+            lead_ts = data.timestamps[a : a + 1] - pd.Timedelta(int(period_ns), unit="ns")
+            win_data = MarketData(
+                open=np.concatenate([data.open[a : a + 1], win_data.open]),
+                high=np.concatenate([data.high[a : a + 1], win_data.high]),
+                low=np.concatenate([data.low[a : a + 1], win_data.low]),
+                close=np.concatenate([data.close[a : a + 1], win_data.close]),
+                volume=np.concatenate([data.volume[a : a + 1], win_data.volume]),
+                index=lead_ts.append(win_data.timestamps),
+            )
+            win_ts = np.asarray(
+                win_data.timestamps.as_unit("ns").asi8, dtype=np.int64  # type: ignore[attr-defined]
+            )
+            blank = np.zeros(1, dtype=bool)
+            win_sig = Signals(
+                long_entry=np.concatenate([blank, win_sig.long_entry]),
+                long_exit=np.concatenate([blank, win_sig.long_exit]),
+                short_entry=np.concatenate([blank, win_sig.short_entry]),
+                short_exit=np.concatenate([blank, win_sig.short_exit]),
+            )
 
         policy = config.base.signal.on_opposite_signal
         if policy is None:
@@ -309,10 +348,10 @@ class VbtPaperEngine(PaperEngine):
                 if warn_key not in warned:
                     warned.add(warn_key)
                     warnings.warn(
-                        f"vectorbt paper: carried {'long' if side == 1 else 'short'} entered "
-                        f"at {open_pos.entry_ns} was not re-emitted by the recomputed "
-                        "window; carrying it from the persisted ledger (the signal function "
-                        "is not recomputable over the window)",
+                        f"vectorbt paper: carried {'long' if side == 1 else 'short'} "
+                        f"entered at {open_pos.entry_ns} was not re-emitted by the "
+                        "recomputed window; carrying it from the persisted ledger (the "
+                        "signal function is not recomputable over the window)",
                         stacklevel=3,
                     )
                 le = np.array(encoded.long_entry, dtype=bool)
@@ -399,12 +438,7 @@ class VbtPaperEngine(PaperEngine):
                 )
             ]
 
-        cutoff = None if cursor is None else int(cursor)
-        return [
-            event
-            for event in events
-            if cutoff is None or int(event.timestamp) > cutoff
-        ]
+        return events_after_cursor(events, state.ledger, cursor)
 
 
 register_paper_engine("vectorbt", VbtPaperEngine)

@@ -52,6 +52,7 @@ from ube.papertrading.core import (
     PaperEngine,
     apply_calendar_policy,
     decide_action,
+    events_after_cursor,
     register_paper_engine,
     register_state_class,
 )
@@ -388,17 +389,21 @@ class BacktraderPaperEngine(PaperEngine):
         carried = None
         if open_pos is not None:
             # ``win_ts[0]`` is the carried entry's fill bar (the window starts there, see
-            # ``window_start_ns``), so its raw close is the recorded raw fill price. The
-            # strategy holds the position verbatim from bar 0 instead of re-executing it,
-            # which would re-book and re-size the carried leg (review DEFECT 1 / DEFECT 2).
-            # The price is re-snapped to the instrument grid, exactly as the strategy
-            # booked the original fill, so the carried leg reproduces the full-run record.
+            # ``window_start_ns``), so the bar's execution-side price is the recorded raw
+            # fill price: the open under ``next_open``, the close otherwise. The strategy
+            # holds the position verbatim from bar 0 instead of re-executing it, which
+            # would re-book and re-size the carried leg (review DEFECT 1 / DEFECT 2). The
+            # price is re-snapped to the instrument grid, exactly as the strategy booked
+            # the original fill, so the carried leg reproduces the full-run record.
+            raw_fill = (
+                float(win_data.open[0])
+                if config.base.execution_timing == "next_open"
+                else float(win_data.close[0])
+            )
             carried = BtCarriedFill(
                 side=int(open_pos.side),
                 quantity=float(open_pos.quantity),
-                price=float(
-                    f"{win_data.close[0]:.{price_precision}f}"
-                ),
+                price=float(f"{raw_fill:.{price_precision}f}"),
             )
         # ATR-based exits (§5.2) resolve their named series from ``state.aux_data``; a
         # ``MarketData`` value is re-aligned to the sliced window by timestamp inside the
@@ -433,12 +438,7 @@ class BacktraderPaperEngine(PaperEngine):
                 )
             ]
 
-        cutoff = None if cursor is None else int(cursor)
-        return [
-            event
-            for event in events
-            if cutoff is None or int(event.timestamp) > cutoff
-        ]
+        return events_after_cursor(events, state.ledger, cursor)
 
 
 register_paper_engine("backtrader", BacktraderPaperEngine)

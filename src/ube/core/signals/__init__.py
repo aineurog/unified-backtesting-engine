@@ -12,6 +12,13 @@ The columns are independent and accumulate; ``False`` means only "no new action 
 bar", never "there is no open position". This is why a long→short flip is *two*
 simultaneous events on one bar (§6.2) and why the format cannot be a single column.
 
+Every flag is **decision-time**: a ``True`` on bar ``t`` means the decision was made at
+the close of ``t``, using information available at that close. When it executes is a
+separate configuration choice
+(:attr:`~ube.core.config.BacktestConfig.execution_timing`, default ``"next_open"`` —
+act on the following bar's open). The same rule applies to arrays built with
+:func:`from_target` and callables run by :func:`from_callable`.
+
 Two alternative inputs are accepted and converted to this format at the boundary:
 
 - A discrete target-position array of ``-1/0/1`` (where ``0`` = "flat", §6.2) via
@@ -78,6 +85,11 @@ class Signals:
     :class:`~ube.core.errors.InvalidSignalError` on a shape/dtype mismatch or on a
     contradictory entry. The four boolean arrays are read-only after construction
     (§3 principle 5).
+
+    A flag on bar ``t`` is a **decision made at the close of bar ``t``**. Execution is
+    governed by ``BacktestConfig.execution_timing`` (default ``"next_open"``), so the
+    same ``Signals`` object produces different fill bars under different timings without
+    the signal content changing.
 
     Attributes:
         long_entry: bool array — open a long position.
@@ -225,6 +237,12 @@ def from_target(target: object) -> Signals:
     value, never ``0`` (``[1, 1, 1]`` stays long; ``[1, 0, 0]`` exits at the second
     bar).
 
+    ``target[t]`` is a **decision made at the close of bar ``t``**: it is the position
+    desired *after* that bar closes. The transition events derived here are therefore
+    decision-time and follow the same execution rule as any other ``Signals`` — by
+    default they execute at the open of ``t + 1``
+    (:attr:`~ube.core.config.BacktestConfig.execution_timing`).
+
     Values outside ``{-1, 0, 1}`` (or NaN, or a non-1-D/non-numeric input) raise
     :class:`~ube.core.errors.InvalidSignalError`.
     """
@@ -272,8 +290,10 @@ def from_callable(fn: Callable[[MarketData], int], bars: MarketData) -> Signals:
     :class:`~ube.core.data.MarketData` slice ``bars[:i + 1]`` (all bars up to and
     including bar ``i``) — and must return a discrete target of ``-1/0/1``. The targets
     are collected and routed through :func:`from_target`, so the result is the same
-    event model backtest and paper trading share (§9.2). An invalid return raises
-    :class:`~ube.core.errors.InvalidSignalError` (via :func:`from_target`).
+    event model backtest and paper trading share (§9.2). The window ends at bar ``i``,
+    so the returned target is a decision at the close of ``i`` and executes under the
+    configured ``execution_timing`` (default: open of ``i + 1``). An invalid return
+    raises :class:`~ube.core.errors.InvalidSignalError` (via :func:`from_target`).
 
     The per-bar call is the one place a Python call per bar is inherent — ``fn`` is
     user code; everything after the target array is collected is vectorized.

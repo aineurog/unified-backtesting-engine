@@ -97,6 +97,7 @@ from ube.core.errors import (
     EngineError,
     InvalidSignalError,
 )
+from ube.core.execution import shift_signals
 from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
 from ube.core.instrument import (
     resolve_funding_interval_hours,
@@ -287,6 +288,18 @@ class NautilusAdapter(EngineAdapter):
         # before any engine work rather than letting the actor silently drop it.
         validate_long_only(signals, config.instrument.asset_class)
 
+        # §6.1 execution timing. Signals are decision-time: a flag on bar ``t`` is a
+        # decision made at that bar's close. Nautilus fills a market order submitted in
+        # ``on_bar`` at the bar's close, so:
+        #   * ``same_close`` — read the frame unshifted; act and fill at close ``t``.
+        #   * ``next_close`` — shift one bar; act on bar ``t+1`` and fill at close ``t+1``.
+        #   * ``next_open``  — shift one bar and feed execution bars whose close is the
+        #     real open, so the same-bar market fill lands on open ``t+1``.
+        timing = config.execution_timing
+        decision_offset = 0 if timing == "same_close" else 1
+        exec_signals = signals if decision_offset == 0 else shift_signals(signals, timing)
+        fill_price_source = "open" if timing == "next_open" else "close"
+
         overrides = validate_overrides(config.engine_overrides)
         cost_model = (
             config.cost_model
@@ -333,8 +346,10 @@ class NautilusAdapter(EngineAdapter):
         # venue-qualified Nautilus ``InstrumentId`` (``build.instrument_id`` is still
         # used below for the actor, which needs the venue to place native orders).
         instrument_id = config.instrument.symbol
-        bars, bar_type = to_nautilus_bars(data, build)
-        signal_map = to_signal_map(data, signals)
+        bars, bar_type = to_nautilus_bars(
+            data, build, fill_price_source=fill_price_source
+        )
+        signal_map = to_signal_map(data, exec_signals)
         settlement = resolve_settlement_currency(config.instrument)
 
         # Cash accounts cannot be leveraged: the reference nautilus_trader forces
@@ -348,6 +363,7 @@ class NautilusAdapter(EngineAdapter):
                 bar_type=bar_type,
                 signal_map=signal_map,
                 asset_class=config.instrument.asset_class,
+                decision_bar_offset=decision_offset,
             ),
             market_data=data,
             sizing=config.risk.sizing,

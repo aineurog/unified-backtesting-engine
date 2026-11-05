@@ -125,7 +125,8 @@ def test_backtest_24_7_trades_through_weekend(tmp_path) -> None:
     # a contradiction: the run must succeed. This proves the guard fires on the calendar,
     # not on bar count or weekday.
     data = _md(WEEKEND)
-    signals = from_target([1, 1, 1, 0])
+    # Exit decided on bar 2 so the default next_open fill lands on bar 3.
+    signals = from_target([1, 1, 0, 0])
     result = ube.run(
         data,
         signals,
@@ -140,8 +141,10 @@ def test_backtest_all_in_session_bars_pass(tmp_path) -> None:
     # Control: identical prices on trading days only — no holiday, no weekend — must
     # run cleanly (proves the reject path is not rejecting everything under a sessioned
     # calendar).
-    data = _md(["2024-01-05 15:00", "2024-01-08 15:00"])
-    signals = from_target([1, 0])
+    # Three in-session trading days: entry decided on bar 0 fills bar 1, exit decided
+    # on bar 1 fills bar 2 (default next_open).
+    data = _md(["2024-01-05 15:00", "2024-01-08 15:00", "2024-01-09 15:00"])
+    signals = from_target([1, 0, 0])
     for engine in BACKTEST_ENGINES:
         result = ube.run(
             data,

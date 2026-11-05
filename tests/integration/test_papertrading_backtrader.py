@@ -47,6 +47,17 @@ def _config(**kw: object) -> PaperConfig:
     return PaperConfig(base=bc, engine="backtrader", starting_balance=10_000.0, **kw)
 
 
+def _same_close_config() -> PaperConfig:
+    """The paper config pinned to the historical same-bar-close execution convention."""
+    instr = PRESETS[AC].instrument
+    bc = BacktestConfig(
+        instrument=instr,
+        execution_timing="same_close",
+        signal=SignalConfig(on_opposite_signal="reverse"),
+    )
+    return PaperConfig(base=bc, engine="backtrader", starting_balance=10_000.0)
+
+
 def _slice_md(md: MarketData, sl: slice) -> MarketData:
     sliced = MarketData.__new__(MarketData)  # type: ignore[call-arg]
     object.__setattr__(sliced, "open", md.open[sl])
@@ -76,7 +87,11 @@ def _summary(state: BacktraderPaperState, cfg: PaperConfig) -> list[tuple[int, f
 
 
 def _run_windows(
-    bounds: list[tuple[int, int]], *, n: int = 24, target: np.ndarray | None = None
+    bounds: list[tuple[int, int]],
+    *,
+    n: int = 24,
+    target: np.ndarray | None = None,
+    cfg: PaperConfig | None = None,
 ) -> tuple[list[tuple[int, float, int, int]], object]:
     if target is None:
         target = np.zeros(n, dtype=int)
@@ -85,7 +100,8 @@ def _run_windows(
         target[20:24] = 1
     data = synthetic_bars(PRESETS[AC], n_bars=n)
     signals = from_target(target)
-    cfg = _config()
+    if cfg is None:
+        cfg = _config()
     import tempfile
     from pathlib import Path
 
@@ -357,7 +373,9 @@ def test_flat_window_replay_does_not_double_the_first_entry() -> None:
 
     assert state is not None
     all_ts = [int(t) for t in np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)]
-    flip_bar = cursor_bar + 1
+    # The phantom frame flips to long with a decision at cursor_bar + 1; under next_open
+    # that executes on the following bar.
+    flip_bar = cursor_bar + 2
     # Exactly one long entry on the flip bar. Without the guard the replay also opens the
     # phantom short inside the committed region, so the strategy's *close* of it lands on the
     # flip bar too — where the `> cursor` filter keeps it — and the fold books a second buy
@@ -373,7 +391,7 @@ def test_flat_window_replay_does_not_double_the_first_entry() -> None:
         f"expected one long entry at bar {flip_bar}, got {len(long_entries)} "
         "(the phantom close was folded as a second entry)"
     )
-    expected = 0.10 * 10_000.0 * 100.0 / float(data.close[flip_bar])
+    expected = 0.10 * 10_000.0 * 100.0 / float(data.open[flip_bar])
     booked_qty = abs(float(long_entries[0].quantity))
     assert booked_qty < 1.5 * expected, (
         f"long quantity {booked_qty:.4f} is doubled (expected ~{expected:.4f})"
@@ -388,10 +406,13 @@ def test_flat_window_replay_does_not_double_the_first_entry() -> None:
 def test_full_run_produces_flip_trades() -> None:
     got, open_pos = _run_windows([(0, 24)])
     assert [t[0] for t in got] == [1, -1]
-    assert got[0][2] == 1_704_081_600_000_000_000  # bar-4 signal fills at bar 4 (same-bar close)
-    assert got[1][3] == 1_704_132_000_000_000_000  # short closed by the bar-18 signal at bar 18
+    # Signals are decision-time and the default next_open fills on the following bar's
+    # open: the bar-4 signal fills at bar 5, the bar-18 exit at bar 19, and the bar-20
+    # entry at bar 21.
+    assert got[0][2] == 1_704_085_200_000_000_000  # bar-4 signal fills at bar 5
+    assert got[1][3] == 1_704_135_600_000_000_000  # short closed by the bar-18 signal at bar 19
     assert open_pos is not None and open_pos.side == 1  # bar-20 long still open
-    assert open_pos.entry_ns == 1_704_139_200_000_000_000  # bar-20 signal fills at bar 20
+    assert open_pos.entry_ns == 1_704_142_800_000_000_000  # bar-20 signal fills at bar 21
 
 
 # Window plans for the reviewer boundary matrix (DEFECT-2 cases) and the vbt-style
@@ -524,7 +545,10 @@ def test_final_bar_exit_in_flight_fills_at_the_final_close() -> None:
     data = synthetic_bars(PRESETS[AC], n_bars=24)
     target = _target_full_run()
     signals = from_target(target)
-    cfg = _config()
+    # This test pins the same-bar-close convention: a signal on the window's final bar
+    # has no execution bar under ``next_*``, so ``same_close`` is what leaves it in flight
+    # for ``stop()`` to settle at that bar's close.
+    cfg = _same_close_config()
     import tempfile
     from pathlib import Path
 
@@ -541,7 +565,7 @@ def test_final_bar_exit_in_flight_fills_at_the_final_close() -> None:
         )
 
     got = _summary(state, cfg)
-    full, full_open = _run_windows([(0, 24)])
+    full, full_open = _run_windows([(0, 24)], cfg=cfg)
     assert got == full
     assert state.open_position == full_open
 
@@ -576,6 +600,9 @@ def _touched_stop_config(starting_balance: float = 10_000.0) -> PaperConfig:
     return PaperConfig(
         base=BacktestConfig(
             instrument=PRESETS["commodities"].instrument,
+            # These tests pin the same-bar-close convention: the carried long fills at
+            # bar 0's close, so a level touched during its entry bar must not fire.
+            execution_timing="same_close",
             risk=RiskConfig(
                 sizing=SizeModel(kind="fixed_fraction", value=0.10, leverage=100.0),
                 exit=(StopLoss(percent=0.05),),
@@ -724,11 +751,11 @@ def test_resume_carries_entry_when_signal_fn_does_not_reemit_it() -> None:
             )
 
     got = _summary(state, cfg)
-    # Long signalled bar 3 (fills bar 3), flipped short at bar 15 (fills bar 15), closed
-    # by bar 20's 0 (fills bar 20) — both legs survive the carry.
+    # Long signalled bar 3 (fills bar 4), flipped short at bar 15 (fills bar 16), closed
+    # by bar 20's 0 (fills bar 21) — both legs survive the carry.
     assert [t[0] for t in got] == [1, -1]
-    assert got[0][2] == 1_704_078_000_000_000_000  # bar-3 signal fills at bar 3
-    assert got[1][3] == 1_704_139_200_000_000_000  # bar-20 signal fills at bar 20
+    assert got[0][2] == 1_704_081_600_000_000_000  # bar-3 signal fills at bar 4
+    assert got[1][3] == 1_704_142_800_000_000_000  # bar-20 signal fills at bar 21
     assert state.open_position is None  # the bar-15 short is closed by bar 20's 0
 
 

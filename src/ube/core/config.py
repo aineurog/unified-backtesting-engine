@@ -36,11 +36,14 @@ from typing import Any, Literal
 from ube.core.benchmark import BenchmarkConfig
 from ube.core.cost import CostModel
 from ube.core.errors import ConfigError, UndeclaredConfigError
+from ube.core.execution import EXECUTION_TIMINGS, ExecutionTiming, validate_execution_timing
 from ube.core.instrument import Instrument
 from ube.core.portfolio import PortfolioConfig
 from ube.core.risk import RiskConfig
 
 __all__ = [
+    "EXECUTION_TIMINGS",
+    "ExecutionTiming",
     "OppositeSignalPolicy",
     "OPPOSITE_SIGNAL_POLICIES",
     "SignalConfig",
@@ -98,6 +101,11 @@ class BacktestConfig:
         signal: Signal-related config (default :class:`SignalConfig`).
         benchmark: Benchmark config (default
             :class:`~ube.core.benchmark.BenchmarkConfig`, ``buy_and_hold``, §7.1).
+        execution_timing: When a decision-time signal becomes a fill (§6.1):
+            ``"next_open"`` (default — execute on the following bar's open, no
+            look-ahead), ``"next_close"`` (following bar's close), or ``"same_close"``
+            (the signal bar's own close, vectorbt's native convention). Signals are
+            always decision-time: a flag on bar ``t`` was decided at the close of ``t``.
         engine: Engine adapter to use (default ``"auto"`` — first installed). Must be a
             non-empty string.
         engine_overrides: Optional engine-specific overrides (§4.2). Accepted as any
@@ -121,6 +129,7 @@ class BacktestConfig:
     risk: RiskConfig = RiskConfig()
     signal: SignalConfig = SignalConfig()
     benchmark: BenchmarkConfig = BenchmarkConfig()
+    execution_timing: ExecutionTiming = "next_open"
     engine: str = "auto"
     engine_overrides: Mapping[str, Any] | None = None
     date_range: tuple[Any, Any] | None = None
@@ -154,6 +163,7 @@ class BacktestConfig:
                 "BacktestConfig.benchmark must be a BenchmarkConfig; "
                 f"got {type(self.benchmark).__name__}"
             )
+        validate_execution_timing(self.execution_timing)
         if not isinstance(self.engine, str) or not self.engine.strip():
             raise ConfigError("engine must be a non-empty string")
         if self.engine_overrides is not None:

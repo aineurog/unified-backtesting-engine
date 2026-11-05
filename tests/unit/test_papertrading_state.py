@@ -50,6 +50,7 @@ def _sample_state() -> PaperState:
         pending_levels={"t1": {"tp": 120.0}},
         signal_fn_state={"targets": [1, 1, 0]},
         config_ref="run-1",
+        pending_decision={"kind": "close", "ts": 3_000},
     )
 
 
@@ -64,6 +65,7 @@ def test_save_load_round_trip(tmp_path) -> None:
     assert loaded.config_ref == "run-1"
     assert loaded.pending_levels == {"t1": {"tp": 120.0}}
     assert loaded.signal_fn_state == {"targets": [1, 1, 0]}
+    assert loaded.pending_decision == {"kind": "close", "ts": 3_000}
     assert loaded.open_position == state.open_position
     events = loaded.ledger.events
     assert len(events) == 4

@@ -98,6 +98,7 @@ def _auto_live_anchor_ns(data: MarketData) -> int | None:
 __all__ = [
     "PaperEngine",
     "RecordingBackend",
+    "events_after_cursor",
     "get_paper_engine",
     "get_state_class",
     "init",
@@ -107,6 +108,39 @@ __all__ = [
     "run_auto",
     "step",
 ]
+
+
+def events_after_cursor(
+    events: list[LedgerEvent], ledger: EventLedger, cursor: int | None
+) -> list[LedgerEvent]:
+    """Keep a window replay's new events, preserving a seam decision stamp.
+
+    Window-replay backends re-read committed bars to reconstruct history and keep only
+    events strictly after the persisted cursor. A decision evaluated on the previous
+    window's final bar executes on the next window's first bar, so its
+    ``signal_evaluated`` stamp is dated exactly at the cursor (the decision bar) and a
+    strict filter would drop it from the ledger forever. Keep such a stamp when the
+    persisted ledger does not already hold the same action on that bar; every other event
+    at the cursor is already committed and must not be re-booked.
+    """
+    if cursor is None:
+        return list(events)
+    limit = int(cursor)
+    committed = {
+        (int(event.timestamp), event.action)
+        for event in ledger.events
+        if event.event_type is EventType.SIGNAL_EVALUATED
+    }
+    kept: list[LedgerEvent] = []
+    for event in events:
+        ts = int(event.timestamp)
+        if ts > limit or (
+            ts == limit
+            and event.event_type is EventType.SIGNAL_EVALUATED
+            and (ts, event.action) not in committed
+        ):
+            kept.append(event)
+    return kept
 
 # Scale-relative tolerance for "the position is flat" (mirrors ``ube.core.ledger``'s
 # per-fill fold tolerance, which is relative for the same reason). Engine adapters can

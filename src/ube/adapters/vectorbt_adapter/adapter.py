@@ -65,6 +65,7 @@ from ube.core.errors import (
     EngineError,
     InvalidSignalError,
 )
+from ube.core.execution import ExecutionTiming, decision_index, shift_signals
 from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
 from ube.core.ledger import EventLedger, EventType, FXSeries, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
@@ -362,6 +363,11 @@ class VectorbtAdapter(EngineAdapter):
         # before any engine work rather than letting the engine silently drop it.
         validate_long_only(signals, config.instrument.asset_class)
 
+        # §6.1: signals are decision-time. ``exec_signals`` moves each flag onto the bar
+        # the configured timing executes it on; the original ``signals`` is kept so the
+        # ledger can stamp ``signal_evaluated`` on the decision bar.
+        exec_signals = shift_signals(signals, config.execution_timing)
+
         overrides = validate_overrides(config.engine_overrides)
         cost_model: CostModel = (
             config.cost_model
@@ -407,7 +413,11 @@ class VectorbtAdapter(EngineAdapter):
             vol_arr = resolve_vol_for_sizing(sizing, aux_data, data)
 
         # --- Translate to vectorbt inputs + exit primitives -----------------
-        inputs = to_vbt_inputs(data, signals)
+        inputs = to_vbt_inputs(data, exec_signals)
+        # ``next_open`` cannot be expressed by vectorbt's close-priced fills, so the
+        # execution frame's ``open`` is passed as the fill price. ``same_close`` and
+        # ``next_close`` keep vectorbt's native close fill.
+        fill_price = inputs.open if config.execution_timing == "next_open" else None
         sl_stop, tp_stop, sl_trail = exit_stop_params(exits, data, aux_data)
         # Commission only: slippage is applied at the fill price level in the ledger fold,
         # not as a fee fraction in vectorbt (§8 — parity with the Nautilus actor).
@@ -426,6 +436,7 @@ class VectorbtAdapter(EngineAdapter):
             tp_stop=tp_stop,
             sl_trail=sl_trail,
             size=1.0,
+            price=fill_price,
         )
         records = pf.trades.records_readable
         if len(records):
@@ -441,7 +452,7 @@ class VectorbtAdapter(EngineAdapter):
                 settlement=settlement,
                 exits=exits,
                 aux_data=aux_data,
-                signals=signals,
+                signals=exec_signals,
             )
             pf = build_portfolio(
                 inputs,
@@ -451,6 +462,7 @@ class VectorbtAdapter(EngineAdapter):
                 tp_stop=tp_stop,
                 sl_trail=sl_trail,
                 size=size_series,
+                price=fill_price,
             )
             records = pf.trades.records_readable
 
@@ -459,6 +471,8 @@ class VectorbtAdapter(EngineAdapter):
             records=records,
             data=data,
             signals=signals,
+            exec_signals=exec_signals,
+            execution_timing=config.execution_timing,
             cost_model=cost_model,
             exits=exits,
             aux_data=aux_data,
@@ -498,6 +512,8 @@ class VectorbtAdapter(EngineAdapter):
         records: pd.DataFrame,
         data: MarketData,
         signals: Signals,
+        exec_signals: Signals,
+        execution_timing: ExecutionTiming,
         cost_model: CostModel,
         exits: tuple[Any, ...],
         aux_data: Mapping[str, Any] | None,
@@ -596,7 +612,14 @@ class VectorbtAdapter(EngineAdapter):
             else:
                 exit_price = float(slipped_price(raw_exit, -side, slip))
                 exit_reason = classify_exit_reason(
-                    exits, data, side, entry_price, entry_bar, exit_bar, aux_data, signals
+                    exits,
+                    data,
+                    side,
+                    entry_price,
+                    entry_bar,
+                    exit_bar,
+                    aux_data,
+                    exec_signals,
                 )
                 # An ``end_of_run`` label on a closed record means no core exit and no signal
                 # fired on vectorbt's own exit bar: its frozen entry-anchored fraction stop
@@ -614,7 +637,7 @@ class VectorbtAdapter(EngineAdapter):
                         entry_bar=entry_bar,
                         exit_bar=exit_bar,
                         aux_data=aux_data,
-                        signals=signals,
+                        signals=exec_signals,
                     )
                     if late_exit is not None:
                         exit_bar, raw_exit, exit_reason = late_exit
@@ -631,23 +654,27 @@ class VectorbtAdapter(EngineAdapter):
                         # leg open lets that run resume the trade instead of re-opening it.
                         is_open = True
 
-            # Signal evaluation recorded at the entry bar (§6.1): holds are never
-            # emitted, and only real entries reach the ledger — matching the Nautilus fold.
-            if bool(signals.long_entry[entry_bar]):
-                eval_action = "long_entry"
-            elif bool(signals.short_entry[entry_bar]):
-                eval_action = "short_entry"
-            else:
-                eval_action = None
+            # Signal evaluation is stamped on the DECISION bar (§6.1), even when the
+            # fill landed on the following bar under ``next_*``. Holds are never
+            # emitted, and only real entries reach the ledger — matching the Nautilus
+            # fold. A decision with no execution bar cannot produce a trade, so the
+            # entry bar always has a decision bar here.
+            decision_bar = decision_index(entry_bar, execution_timing)
+            eval_action = None
+            if decision_bar is not None:
+                if bool(signals.long_entry[decision_bar]):
+                    eval_action = "long_entry"
+                elif bool(signals.short_entry[decision_bar]):
+                    eval_action = "short_entry"
             if eval_action is not None:
                 _add(
                     LedgerEvent(
                         EventType.SIGNAL_EVALUATED,
-                        int(bar_ts[entry_bar]),
+                        int(bar_ts[decision_bar]),
                         instrument_id,
                         action=eval_action,
                     ),
-                    int(bar_ts[entry_bar]),
+                    int(bar_ts[decision_bar]),
                 )
 
             # Entry fill + cash leg + position change.

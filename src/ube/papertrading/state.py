@@ -183,7 +183,8 @@ CREATE TABLE IF NOT EXISTS paper_state (
     config_ref       TEXT,
     aux_data         TEXT,
     exit_seed        TEXT,
-    last_funding_ns  INTEGER
+    last_funding_ns  INTEGER,
+    pending_decision TEXT
 )
 """
 
@@ -231,8 +232,9 @@ CREATE TABLE IF NOT EXISTS equity (
 _INSERT_SQL = (
     "INSERT OR REPLACE INTO paper_state "
     "(run_id, instrument_id, last_processed_ns, last_price, ledger, open_position, "
-    "pending_levels, signal_fn_state, config_ref, aux_data, exit_seed, last_funding_ns) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "pending_levels, signal_fn_state, config_ref, aux_data, exit_seed, last_funding_ns, "
+    "pending_decision) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 # -- strategy registry helpers (§9.5 strategy_name → run_id) ----------------
@@ -255,6 +257,8 @@ def _ensure_all_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE paper_state ADD COLUMN exit_seed TEXT")
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE paper_state ADD COLUMN last_funding_ns INTEGER")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE paper_state ADD COLUMN pending_decision TEXT")
 
 
 def _return_between(current: float, previous: float) -> float | None:
@@ -543,6 +547,9 @@ class PaperState:
             the backend at the end of each ``execute`` and re-applied on resume so trailing /
             ATR exits are not degenerate after a restart (issue C). ``None`` when flat or no
             path-dependent exit needs it.
+        pending_decision: A decision taken on the last processed bar whose execution bar
+            has not arrived yet (§6.1). Persisted so a live poll that delivers one new bar
+            at a time never drops a signal. ``None`` when no decision is pending.
         stats_trade_count: Closed trades as of the last snapshot written during this
             process. Informational only; resume-safe snapshot idempotency is determined
             from the database.
@@ -561,6 +568,7 @@ class PaperState:
         aux_data: dict[str, Any] | None = None,
         exit_seed: ExitSeed | None = None,
         last_funding_ns: int | None = None,
+        pending_decision: dict[str, Any] | None = None,
         run_id: str | None = None,
         db_path: str | None = None,
         stats_trade_count: int = 0,
@@ -578,6 +586,9 @@ class PaperState:
         self.aux_data: dict[str, Any] = aux_data if aux_data is not None else {}
         self.exit_seed: ExitSeed | None = exit_seed
         self.last_funding_ns: int | None = last_funding_ns
+        self.pending_decision: dict[str, Any] | None = (
+            dict(pending_decision) if pending_decision else None
+        )
         self.run_id: str | None = run_id
         self.db_path: str | None = db_path
         self.stats_trade_count = int(stats_trade_count)
@@ -813,6 +824,7 @@ class PaperState:
                     _aux_to_json(self.aux_data),
                     _json(asdict(self.exit_seed)) if self.exit_seed else None,
                     self.last_funding_ns,
+                    _json(self.pending_decision) if self.pending_decision else None,
                 ),
             )
             conn.close()
@@ -832,6 +844,7 @@ class PaperState:
         aux_text: str | None = None
         exit_seed_text: str | None = None
         last_funding_ns: int | None = None
+        pending_decision_text: str | None = None
         try:
             conn = sqlite3.connect(str(path), isolation_level=None)
             # Ensure aux_data column exists for old DBs
@@ -843,11 +856,14 @@ class PaperState:
             # Ensure last_funding_ns column exists (funding clock)
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ALTER TABLE paper_state ADD COLUMN last_funding_ns INTEGER")
+            # Ensure pending_decision exists (deferred decisions, §6.1)
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE paper_state ADD COLUMN pending_decision TEXT")
             try:
                 row = conn.execute(
                     "SELECT instrument_id, last_processed_ns, last_price, ledger, "
                     "open_position, pending_levels, signal_fn_state, config_ref, aux_data, "
-                    "exit_seed, last_funding_ns "
+                    "exit_seed, last_funding_ns, pending_decision "
                     "FROM paper_state "
                     "WHERE run_id = ?",
                     (run_id,),
@@ -857,7 +873,7 @@ class PaperState:
                     row = conn.execute(
                         "SELECT instrument_id, last_processed_ns, last_price, ledger, "
                         "open_position, pending_levels, signal_fn_state, config_ref, aux_data, "
-                        "exit_seed "
+                        "exit_seed, last_funding_ns "
                         "FROM paper_state "
                         "WHERE run_id = ?",
                         (run_id,),
@@ -866,26 +882,38 @@ class PaperState:
                     try:
                         row = conn.execute(
                             "SELECT instrument_id, last_processed_ns, last_price, ledger, "
-                            "open_position, pending_levels, signal_fn_state, config_ref, aux_data "
+                            "open_position, pending_levels, signal_fn_state, config_ref, aux_data, "
+                            "exit_seed "
                             "FROM paper_state "
                             "WHERE run_id = ?",
                             (run_id,),
                         ).fetchone()
                     except sqlite3.OperationalError:
-                        row = conn.execute(
-                            "SELECT instrument_id, last_processed_ns, last_price, ledger, "
-                            "open_position, pending_levels, signal_fn_state, config_ref "
-                            "FROM paper_state "
-                            "WHERE run_id = ?",
-                            (run_id,),
-                        ).fetchone()
+                        try:
+                            row = conn.execute(
+                                "SELECT instrument_id, last_processed_ns, last_price, ledger, "
+                                "open_position, pending_levels, signal_fn_state, config_ref, "
+                                "aux_data "
+                                "FROM paper_state "
+                                "WHERE run_id = ?",
+                                (run_id,),
+                            ).fetchone()
+                        except sqlite3.OperationalError:
+                            row = conn.execute(
+                                "SELECT instrument_id, last_processed_ns, last_price, ledger, "
+                                "open_position, pending_levels, signal_fn_state, config_ref "
+                                "FROM paper_state "
+                                "WHERE run_id = ?",
+                                (run_id,),
+                            ).fetchone()
             conn.close()
         except sqlite3.Error as exc:
             raise StateCorruptionError(f"could not read paper state at {path}: {exc}") from exc
         if row is None:
             raise StateCorruptionError(f"no paper state for run_id={run_id!r} in {path}")
 
-        # Handle schema variants: newest (11 cols), 10 with aux+exit_seed, 9 with aux only, 8 base.
+        # Handle schema variants: newest (12 cols), 11 with last_funding_ns, 10 with
+        # aux+exit_seed, 9 with aux only, 8 base.
         (
             instrument_id,
             last_ns,
@@ -902,6 +930,8 @@ class PaperState:
             exit_seed_text = row[9]
         if len(row) > 10:
             last_funding_ns = row[10]
+        if len(row) > 11:
+            pending_decision_text = row[11]
         ledger = _ledger_from_json(ledger_text)
         open_position = None
         if open_text is not None:
@@ -927,6 +957,7 @@ class PaperState:
             aux_data=_aux_from_json(aux_text),
             exit_seed=exit_seed,
             last_funding_ns=last_funding_ns,
+            pending_decision=_from_json(pending_decision_text, None),
             run_id=run_id,
             db_path=path,
         )
@@ -1064,6 +1095,7 @@ class PortfolioPaperState(PaperState):
         self.aux_data = {}
         self.exit_seed = None
         self.last_funding_ns = None
+        self.pending_decision = None
         self.run_id = run_id
         self.db_path = db_path
         self.stats_trade_count = int(stats_trade_count)
@@ -1132,6 +1164,7 @@ class PortfolioPaperState(PaperState):
                         _json({}),
                         self.config_ref,
                         _json({"unallocated_cash": self.unallocated_cash}),
+                        None,
                         None,
                         None,
                     ),

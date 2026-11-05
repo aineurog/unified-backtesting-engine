@@ -196,18 +196,22 @@ def test_max_atr_period() -> None:
 def test_full_run_produces_flip_trades() -> None:
     got, open_pos = _run_windows([(0, 24)])
     assert [t[0] for t in got] == [1, -1]
-    assert got[0][2] == 1_704_081_600_000_000_000  # entry bar 4
+    # Target turns long on bar 4; the default next_open timing fills on bar 5.
+    assert got[0][2] == 1_704_085_200_000_000_000  # entry bar 5
     assert open_pos is not None and open_pos.side == 1  # bar-20 long still open
 
 
 @pytest.mark.parametrize(
     "bounds",
     [
-        [(0, 11), (4, 24)],  # window 1 ends exactly on the flip bar
-        [(0, 10), (4, 18), (9, 24)],  # open carry; resume at the entry bar
-        [(0, 12), (4, 20), (9, 24)],
-        [(0, 6), (4, 14), (9, 24)],
-        [(0, 11), (10, 20), (20, 24)],
+        # Decision bars sit one before the fill bars: a window ending at N includes the
+        # decision at N but not its fill on N+1, so a carried entry fills on N+1 and the
+        # next window must start at or before it.
+        [(0, 12), (5, 24)],  # window 1 ends on the flip fill bar
+        [(0, 11), (5, 19), (10, 24)],  # open carry; resume at the entry fill bar
+        [(0, 12), (5, 20), (10, 24)],
+        [(0, 6), (5, 14), (10, 24)],
+        [(0, 11), (5, 20), (20, 24)],
     ],
 )
 def test_split_windows_match_full_run(bounds: list[tuple[int, int]]) -> None:
@@ -218,8 +222,9 @@ def test_split_windows_match_full_run(bounds: list[tuple[int, int]]) -> None:
 
 
 def test_resume_requires_entry_bar_in_window() -> None:
-    # After window 1 (bars 0..9) the long entered at bar 4 is still open. A window that
-    # starts after bar 4 (i.e. omits the entry bar) cannot re-open the carried trade.
+    # After window 1 (bars 0..9) the long decided on bar 4 and filled on bar 5 is still
+    # open. A window that starts after bar 5 (i.e. omits the entry fill bar) cannot
+    # re-open the carried trade.
     data = synthetic_bars(PRESETS[AC], n_bars=24)
     target = np.zeros(24, dtype=int)
     target[4:10] = 1
@@ -236,8 +241,8 @@ def test_resume_requires_entry_bar_in_window() -> None:
         with pytest.raises(EngineError, match="carried entry"):
             run(
                 "x",
-                _slice_md(data, slice(5, 24)),
-                _slice_sig(signals, slice(5, 24)),
+                _slice_md(data, slice(6, 24)),
+                _slice_sig(signals, slice(6, 24)),
                 cfg,
                 db_path=db,
             )
@@ -250,8 +255,9 @@ def test_resume_carries_entry_when_signal_fn_does_not_reemit_it() -> None:
     # the entry bar. The persisted ledger is authoritative, so the backend must carry the
     # open trade forward (with a warning) instead of aborting the live worker.
     data = synthetic_bars(PRESETS[AC], n_bars=24)
-    # Window 1 (bars 0..11): the wall-clock fn originally emitted a long entry at bar 3
-    # and holds it — the reference leg we must resume.
+    # Window 1 (bars 0..11): the wall-clock fn originally emitted a long entry decision
+    # at bar 3 (filled on bar 4 by the default next_open timing) and holds it — the
+    # reference leg we must resume.
     first = from_target(np.array([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]))
     # Window 2: the same "wall-clock minute" re-derives a FLAT signal at bar 3 (the entry
     # is not re-emitted at its own bar), but the next leg — a short at bar 15 — is.
@@ -266,21 +272,22 @@ def test_resume_carries_entry_when_signal_fn_does_not_reemit_it() -> None:
         db = str(Path(td) / "s.db")
         init(cfg, run_id="x", db_path=db)
         run("x", _slice_md(data, slice(0, 12)), _slice_sig(first, slice(0, 12)), cfg, db_path=db)
-        # Window 2 restarts at the carried entry bar (bar 3); the wall-clock fn re-derives
-        # a flat signal there, so the window must be carried from the ledger, not crash.
+        # Window 2 restarts at the carried entry fill bar (bar 4); the wall-clock fn
+        # re-derives a flat signal there, so the window must be carried from the ledger,
+        # not crash.
         with pytest.warns(UserWarning, match="not re-emitted"):
             state, _ = run(
                 "x",
-                _slice_md(data, slice(3, 24)),
-                _slice_sig(signals, slice(3, 24)),
+                _slice_md(data, slice(4, 24)),
+                _slice_sig(signals, slice(4, 24)),
                 cfg,
                 db_path=db,
             )
 
     got = _summary(state, cfg)
-    # Long entered bar 3, closed by the short at bar 15 — both legs survive the carry.
+    # Long entered bar 4, closed by the short decided on bar 15 — both legs survive.
     assert [t[0] for t in got] == [1, -1]
-    assert got[0][2] == 1_704_078_000_000_000_000  # entry bar 3
+    assert got[0][2] == 1_704_081_600_000_000_000  # entry bar 4
     assert state.open_position is None  # the bar-15 short is closed by bar 20's 0
 
 
@@ -515,7 +522,8 @@ def test_ulp_residue_close_does_not_resurrect_a_closed_trade() -> None:
     )
 
     fills = [e for e in new_events if e.event_type is EventType.FILL]
-    # Only the genuine bar-6 short entry may be booked: no exit fill without its entry.
+    # Only the genuine short entry (decided on bar 6, filled on bar 7) may be booked:
+    # no exit fill without its entry.
     booked = [
         (int(e.timestamp), int(e.side or 0), round(float(e.quantity or 0.0), 5), e.exit_reason)
         for e in fills
@@ -523,7 +531,7 @@ def test_ulp_residue_close_does_not_resurrect_a_closed_trade() -> None:
     assert len(fills) == 1, (
         f"orphan fill committed against a position the ledger did not hold: {booked}"
     )
-    assert (int(fills[0].timestamp), int(fills[0].side or 0)) == (int(ts[6]), -1)
+    assert (int(fills[0].timestamp), int(fills[0].side or 0)) == (int(ts[7]), -1)
     assert state.open_position is not None and state.open_position.side == -1
 
     # The phantom cash is gone: equity moved by the trade's own PnL, not by ~100k.

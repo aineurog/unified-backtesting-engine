@@ -564,7 +564,7 @@ def test_vectorbt_full_loop_crypto_perp_books_fees_and_funding():
     assert all(e.amount > 0.0 for e in fundings)
     (trade,) = result.trades
     assert trade.exit_reason == "signal"
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.59, abs=1e-2)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.56435, abs=1e-2)
 
 
 def test_vectorbt_full_loop_crypto_perp_short_pays_loss():
@@ -584,7 +584,7 @@ def test_vectorbt_full_loop_crypto_perp_short_pays_loss():
     # Parity with the Nautilus engine (which pins the same value): fees are booked at the
     # slipped fill notional and funding on the held notional, so the short is less lossy than
     # the legacy vectorbt fold predicted.
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(99568.9293, abs=1e-2)
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(99568.90319, abs=1e-2)
 
 
 def test_vectorbt_funding_default_8h_accrues_proportionally_per_open_bar():
@@ -951,6 +951,9 @@ def test_vectorbt_early_atr_stop_is_retimed_to_the_core_trigger_bar():
             instrument=PRESETS["crypto_perp"].instrument,
             risk=RiskConfig(exit=(ATRStop(atr="atr_1h", mult=2.0),)),
             engine_overrides={"starting_balance": 100000.0},
+            # These bars encode an entry at bar 0's close (100.0); same_close keeps the
+            # retiming assertions anchored to that entry bar.
+            execution_timing="same_close",
         ),
         aux_data=aux,
     )
@@ -992,6 +995,9 @@ def test_vectorbt_early_atr_stop_keeps_the_trade_open_when_the_core_never_fires(
             instrument=PRESETS["crypto_perp"].instrument,
             risk=RiskConfig(exit=(ATRStop(atr="atr_1h", mult=2.0),)),
             engine_overrides={"starting_balance": 100000.0},
+            # Entry must stay on bar 0 (close 100.0) for the levels below to mean what
+            # the docstring says; next_open would enter at open[1] = 110.0.
+            execution_timing="same_close",
         ),
         aux_data=aux,
     )
@@ -1081,6 +1087,9 @@ def test_vectorbt_early_stop_before_the_flip_retimes_the_close_and_sizes_the_sho
         instrument=PRESETS["crypto_perp"].instrument,
         risk=RiskConfig(exit=(ATRStop(atr="atr_1h", mult=2.0),)),
         engine_overrides={"starting_balance": 100000.0},
+        # Entry must stay on bar 0 (close 100.0) for the levels below to mean what the
+        # docstring says; next_open would enter at open[1] = 110.0.
+        execution_timing="same_close",
     )
     result = VectorbtAdapter().run(md, signals, config, aux_data=aux)
     fills = _fills(result)

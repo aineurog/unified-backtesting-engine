@@ -62,6 +62,10 @@ def _align_aux(
     # keeps the leading main bars finite instead of NaN.
     series = series.shift(1).fillna(series.iloc[0])
     aligned = series.reindex(_ns_index(main_ts), method="ffill")
+    # A main bar may legitimately precede the first aux bar by up to one bar
+    # (``validate_aux`` allows it); reindex cannot forward-fill before its start, so
+    # seed those leading bars with the earliest known aux value rather than NaN.
+    aligned = aligned.bfill()
     return np.asarray(aligned.to_numpy(dtype=np.float64))
 
 

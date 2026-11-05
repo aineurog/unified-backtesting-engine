@@ -740,8 +740,8 @@ def test_nautilus_full_loop_crypto_perp_books_fees_and_funding():
     assert trade.exit_reason == "signal"
     # all_in now reserves the entry fee in the sized quantity (§7.1), so the entry fills
     # slightly fewer units and the net PnL/equity reflect the correctly-reserved fee.
-    assert trade.net_pnl == pytest.approx(90.5904, rel=1e-4)  # gross less fees + funding
-    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.5904, rel=1e-6)
+    assert trade.net_pnl == pytest.approx(90.56435, rel=1e-4)  # gross less fees + funding
+    assert float(result.equity_curve.equity[-1]) == pytest.approx(100090.56435, rel=1e-6)
 
 
 def test_nautilus_full_loop_crypto_perp_short_pays_loss():
@@ -814,6 +814,10 @@ def test_nautilus_last_bar_rejection_surfaces_after_run():
             BacktestConfig(
                 instrument=PRESETS["stocks"].instrument,
                 engine_overrides={"account_type": "cash"},
+                # This test targets the post-run rejection check on the *final* bar;
+                # same_close keeps the rejected order on bar 5 (next_open would move it
+                # past the data and submit nothing).
+                execution_timing="same_close",
             ),
         )
 
@@ -893,6 +897,9 @@ def test_nautilus_reference_trailing_stop_mirror():
         BacktestConfig(
             instrument=instrument,
             risk=RiskConfig(exit=(TrailingStop(0.001),)),
+            # Mirrors the nautilus reference journal, which acts on the same bar's
+            # close; keep same_close so the locked reference prices stay meaningful.
+            execution_timing="same_close",
         ),
     )
 
@@ -1028,6 +1035,9 @@ def test_nautilus_trailing_and_chandelier_ratchet_without_lookahead():
         BacktestConfig(
             instrument=PRESETS["stocks"].instrument,
             risk=RiskConfig(exit=(TrailingStop(0.02),)),
+            # The level-ratchet/no-lookahead assertions are anchored at entry_bar=0;
+            # same_close keeps the entry on bar 0 so those bars line up.
+            execution_timing="same_close",
         ),
     )
     assert [(e.quantity, e.price, e.exit_reason) for e in _fills(trailing)[2:]] == [
@@ -1044,6 +1054,7 @@ def test_nautilus_trailing_and_chandelier_ratchet_without_lookahead():
         BacktestConfig(
             instrument=PRESETS["stocks"].instrument,
             risk=RiskConfig(exit=(ChandelierExit(2, atr="atr_14"),)),
+            execution_timing="same_close",
         ),
         aux_data={"atr_14": atr(data, 14)},
     )
@@ -1111,11 +1122,13 @@ def test_nautilus_actor_same_bar_flip_closes_and_opens():
             "2024-01-01 02:00:00+00:00,101.00,103.00,100.50,102.50",
             "2024-01-01 03:00:00+00:00,102.50,103.50,100.00,101.00",
             "2024-01-01 04:00:00+00:00,101.00,101.50,98.50,99.00",
+            # Extra bar: under next_open the bar-4 flat decision exits on bar 5.
+            "2024-01-01 05:00:00+00:00,99.00,99.50,98.00,98.50",
         ]
     )
     result = NautilusAdapter().run(
         data,
-        from_target([0, 1, 1, -1, 0]),
+        from_target([0, 1, 1, -1, 0, 0]),
         BacktestConfig(instrument=PRESETS["stocks"].instrument),
     )
 
@@ -1192,11 +1205,13 @@ def test_nautilus_actor_time_exit_closes_at_hold_bar():
             "2024-01-01 01:00:00+00:00,100.00,101.00,99.50,101.00",
             "2024-01-01 02:00:00+00:00,101.00,102.00,100.50,102.00",
             "2024-01-01 03:00:00+00:00,102.00,103.00,101.50,103.00",
+            # Extra bar: the bar-3 time-exit decision fills at this bar's open.
+            "2024-01-01 04:00:00+00:00,102.00,102.50,101.00,101.50",
         ]
     )
     result = NautilusAdapter().run(
         data,
-        from_target([1, 1, 1, 1]),
+        from_target([1, 1, 1, 1, 1]),
         BacktestConfig(
             instrument=PRESETS["stocks"].instrument,
             risk=RiskConfig(exit=(TimeExit(2),)),
@@ -1207,7 +1222,7 @@ def test_nautilus_actor_time_exit_closes_at_hold_bar():
     assert len(fills) == 4
     times = _fills_by_reason(result, "time_exit")
     assert len(times) == 2
-    assert all(round(e.price, 2) in (102.0, 101.99) for e in times)  # hold bar's close
+    assert all(round(e.price, 2) in (102.0, 101.99) for e in times)  # hold bar's next open
     assert not _fills_by_reason(result, "signal")
     (trade,) = result.trades
     assert trade.exit_reason == "time_exit"
@@ -1217,7 +1232,8 @@ def test_nautilus_actor_time_exit_closes_at_hold_bar():
         for e in result.ledger
         if e.event_type is EventType.SIGNAL_EVALUATED
     }
-    assert evaluated[int(data.timestamps.asi8[2])] == "exit_time_exit"
+    # Stamped on the decision bar (bar 3), one before the bar-4 execution.
+    assert evaluated[int(data.timestamps.asi8[3])] == "exit_time_exit"
     assert float(result.equity_curve.equity[-1]) == pytest.approx(101980.5, rel=1e-6)
 
 
@@ -1235,11 +1251,13 @@ def test_nautilus_actor_close_trigger_mode_ignores_intra_bar_touch():
             "2024-01-01 01:00:00+00:00,100.00,101.00,99.00,100.50",
             "2024-01-01 02:00:00+00:00,100.50,103.00,99.00,99.00",
             "2024-01-01 03:00:00+00:00,99.00,103.50,98.50,103.00",
+            # Extra bar: the bar-3 close-trigger decision fills at this bar's open.
+            "2024-01-01 04:00:00+00:00,103.00,103.50,102.00,102.50",
         ]
     )
     result = NautilusAdapter().run(
         data,
-        from_target([0, 1, 1, 1]),
+        from_target([0, 1, 1, 1, 1]),
         BacktestConfig(
             instrument=PRESETS["stocks"].instrument,
             risk=RiskConfig(exit=(TakeProfit(0.02, trigger="close"),)),
@@ -1250,7 +1268,8 @@ def test_nautilus_actor_close_trigger_mode_ignores_intra_bar_touch():
     assert len(fills) == 4
     targets = _fills_by_reason(result, "take_profit")
     assert len(targets) == 2
-    assert all(e.timestamp == int(data.timestamps.asi8[3]) for e in targets)  # bar 3, not 2
+    # Triggered on bar 3's close, executed at bar 4's open (next_open).
+    assert all(e.timestamp == int(data.timestamps.asi8[4]) for e in targets)
     assert all(round(e.price, 2) in (103.0, 102.99) for e in targets)
     (trade,) = result.trades
     assert trade.exit_reason == "take_profit"
@@ -1275,11 +1294,13 @@ def test_nautilus_actor_scale_out_take_profit_then_signal():
             "2024-01-01 02:00:00+00:00,100.50,103.00,100.00,102.00",
             "2024-01-01 03:00:00+00:00,102.00,103.00,101.50,102.50",
             "2024-01-01 04:00:00+00:00,102.50,103.00,100.00,101.00",
+            # Extra bar: under next_open the bar-4 flat decision exits on bar 5.
+            "2024-01-01 05:00:00+00:00,101.00,101.50,100.50,101.00",
         ]
     )
     result = NautilusAdapter().run(
         data,
-        from_target([0, 1, 1, 1, 0]),
+        from_target([0, 1, 1, 1, 0, 0]),
         BacktestConfig(
             instrument=PRESETS["stocks"].instrument,
             risk=RiskConfig(exit=(TakeProfit(0.02, scale_out=0.4),)),
@@ -1305,19 +1326,22 @@ def test_nautilus_actor_close_time_exit_precedes_close_time_signal():
     from ube.core.ledger import EventType
     from ube.core.risk import RiskConfig, TimeExit
 
-    # Bar 2 both reaches the 2-bar time exit AND a long_exit signal. Close-time risk
-    # exits are evaluated before close-time signal actions (§8), so a single close with
-    # reason "time_exit" results, never a duplicate signal close.
+    # Entry fills on bar 1, so the 2-bar time exit triggers on bar 3. Bar 3 also carries
+    # the long_exit signal. Close-time risk exits are evaluated before close-time signal
+    # actions (§8), so a single close with reason "time_exit" results, never a duplicate
+    # signal close; under next_open both execute on bar 4.
     data = _bars_from_rows(
         [
             "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
             "2024-01-01 01:00:00+00:00,100.00,101.00,99.50,101.00",
             "2024-01-01 02:00:00+00:00,101.00,102.00,100.50,102.00",
+            "2024-01-01 03:00:00+00:00,102.00,103.00,101.50,103.00",
+            "2024-01-01 04:00:00+00:00,102.00,102.50,101.00,101.50",
         ]
     )
     result = NautilusAdapter().run(
         data,
-        from_target([1, 1, 0]),
+        from_target([1, 1, 1, 0, 0]),
         BacktestConfig(
             instrument=PRESETS["stocks"].instrument,
             risk=RiskConfig(exit=(TimeExit(2),)),
@@ -1336,7 +1360,8 @@ def test_nautilus_actor_close_time_exit_precedes_close_time_signal():
         for e in result.ledger
         if e.event_type is EventType.SIGNAL_EVALUATED
     }
-    assert evaluated[int(data.timestamps.asi8[2])] == "exit_time_exit"
+    # Stamped on the decision bar (bar 3), one before the bar-4 execution.
+    assert evaluated[int(data.timestamps.asi8[3])] == "exit_time_exit"
 
 
 # ---------------------------------------------------------------------------

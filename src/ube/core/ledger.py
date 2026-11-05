@@ -92,6 +92,18 @@ class EventType(StrEnum):
 #: All event types, in a stable order for iteration/testing.
 EVENT_TYPES: tuple[EventType, ...] = tuple(EventType)
 
+#: Canonical within-bar emission order (§4.6) — mirrors the adapters' fold sort rank.
+_EVENT_RANK: dict[EventType, int] = {
+    EventType.CASH_MOVEMENT: 0,
+    EventType.SIGNAL_EVALUATED: 0,
+    EventType.ORDER_SUBMITTED: 0,
+    EventType.FILL: 1,
+    EventType.COMMISSION: 2,
+    EventType.POSITION_CHANGE: 3,
+    EventType.FUNDING_PAYMENT: 4,
+    EventType.FUTURES_ROLLOVER: 4,
+}
+
 #: Canonical exit-reason strings stamped on a closing ``fill`` (§4.6). The field is a
 #: free string (like ``signal_evaluated.action``), not a closed enum, so a future exit
 #: kind doesn't require a ledger change; these are the recognized values.
@@ -329,19 +341,29 @@ class EventLedger:
         """Add ``event`` at its timestamp (the only mutation allowed).
 
         Normally this appends to the end. An event older than the last recorded
-        entry is inserted after any existing entries sharing its timestamp, so
-        same-timestamp emission order is preserved (stable placement).
+        entry is inserted at its timestamp. Within one timestamp the canonical
+        within-bar order (§4.6: signal/order, fill, commission, position change,
+        funding) is preserved, so an event supplied by a later paper-trading window
+        (e.g. a decision evaluated on the previous window's final bar and executed on
+        this one) lands where a single full-window run would have put it.
         """
         if not isinstance(event, LedgerEvent):
             raise DataShapeError(
                 f"EventLedger.append expects a LedgerEvent; got {type(event).__name__}"
             )
-        if not self._events or event.timestamp >= self._events[-1].timestamp:
+        if not self._events or event.timestamp > self._events[-1].timestamp:
             self._events.append(event)
             return
-        idx = bisect.bisect_right(
+        idx = bisect.bisect_left(
             self._events, event.timestamp, key=lambda e: e.timestamp
         )
+        rank = _EVENT_RANK.get(event.event_type, 0)
+        while (
+            idx < len(self._events)
+            and self._events[idx].timestamp == event.timestamp
+            and _EVENT_RANK.get(self._events[idx].event_type, 0) <= rank
+        ):
+            idx += 1
         self._events.insert(idx, event)
 
     @property

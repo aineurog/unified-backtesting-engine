@@ -33,6 +33,7 @@ def build_portfolio(
     tp_stop: Any,
     sl_trail: Any,
     size: Any,
+    price: Any = None,
 ) -> Any:
     """Call ``vbt.Portfolio.from_signals`` once and return the resulting portfolio.
 
@@ -45,6 +46,10 @@ def build_portfolio(
         tp_stop: Take-profit fraction, or ``None``.
         sl_trail: Trailing-stop fraction, or ``None``.
         size: Per-bar ``size`` (amount) series, or ``1.0`` for the nominal pass.
+        price: Optional engine fill-price series. ``None`` keeps vectorbt's native
+            same-bar close fill; for ``execution_timing="next_open"`` the caller passes
+            the execution frame's ``open`` so a decision on bar ``t`` fills at
+            ``open[t+1]``.
 
     Returns:
         The ``vbt.Portfolio`` object (typed ``Any`` — vectorbt ships no stubs).
@@ -60,6 +65,7 @@ def build_portfolio(
     try:
         return vbt.Portfolio.from_signals(
             close=signals.close,
+            price=price,
             entries=signals.entries,
             exits=signals.long_exits,
             short_entries=signals.short_entries,

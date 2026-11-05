@@ -141,6 +141,11 @@ class UbeActorConfig(StrategyConfig):  # type: ignore[misc]
     bar_type: BarType
     signal_map: dict[int, tuple[bool, bool, bool, bool]]
     asset_class: str = "crypto_perp"
+    #: Bars between the decision bar and the bar whose signal the actor reads. ``0`` for
+    #: ``same_close`` (the signal map is unshifted); ``1`` for ``next_close`` / ``next_open``
+    #: (the signal map is shifted so the actor acts on the bar *after* the decision). Used
+    #: to stamp ``signal_evaluated`` and evaluate close-time triggers on the decision bar.
+    decision_bar_offset: int = 0
 
     @property
     def signals(self) -> dict[int, tuple[bool, bool, bool, bool]]:
@@ -253,7 +258,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
             if fired is not None:
                 reason, fraction = fired
                 self._submit_close(reason, fraction, ts=int(bar.ts_event))
-                self.signal_evaluated[idx] = f"exit_{reason}"
+                self._record_signal_evaluation(idx, f"exit_{reason}")
             else:
                 self._apply_signal(self._lookup_signal(bar), bar, idx)
         else:
@@ -352,7 +357,13 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 action = "short_entry"
 
         if action != "hold":
-            self.signal_evaluated[idx] = action
+            self._record_signal_evaluation(idx, action)
+
+    def _record_signal_evaluation(self, idx: int, action: str) -> None:
+        """Stamp a signal evaluation on the *decision* bar (never before the first bar)."""
+        config = cast(UbeActorConfig, self.config)
+        decision_idx = idx - int(config.decision_bar_offset)
+        self.signal_evaluated[max(decision_idx, 0)] = action
 
     def _open(self, side: int, bar: Bar, idx: int) -> None:
         model = self._cost_model
@@ -594,9 +605,14 @@ class UbeActor(Strategy):  # type: ignore[misc]
         n = self._market_data.n_bars
         if idx <= self._book.entry_bar:
             return None
+        # The execution bar is ``idx``; the decision that fires here was made on
+        # ``idx - offset`` (offset 0 for same_close, 1 for next_close/next_open).
+        decision_idx = idx - int(cast(UbeActorConfig, self.config).decision_bar_offset)
+        if decision_idx < 0 or decision_idx >= n:
+            return None
         for i in range(len(self._book.close_exits)):
             reason, fraction, triggered = self._book.close_exits[i]
-            if idx < n and bool(triggered[idx]):
+            if bool(triggered[decision_idx]):
                 self._book.close_exits.pop(i)
                 return reason, fraction
         return None
@@ -627,9 +643,14 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 self.cancel_order(order)
                 self._book.live.pop(cid, None)
                 continue
+            # Ratchet from the decision bar's level, never the execution bar's close:
+            # with next_close/next_open the actor acts one bar after the decision.
+            decision_idx = idx - int(
+                cast(UbeActorConfig, self.config).decision_bar_offset
+            )
             trigger = None
-            if live.levels is not None and idx < n:
-                trigger = self._fmt_price(float(live.levels[idx]))
+            if live.levels is not None and 0 <= decision_idx < n:
+                trigger = self._fmt_price(float(live.levels[decision_idx]))
             qty_same = float(order.quantity.as_double()) == float(new_qty.as_double())
             trigger_same = trigger is not None and order.trigger_price is not None and (
                 float(order.trigger_price.as_double()) == float(trigger)

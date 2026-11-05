@@ -2,23 +2,23 @@
  "asset_class": "forex",
  "engines": {
   "backtrader": {
-   "final_equity": 99999.981,
+   "final_equity": 99999.9828,
    "n_trades": 1,
-   "trades_hash": "3584d37cbac450f8e0e268db9653910ac12c806295a20b06cde34e6254bbdcc3"
+   "trades_hash": "db9be6112a178b397b17327ca88670e36649b2e0cc5aade01808f4cec89f5294"
   },
   "nautilus": {
-   "final_equity": 99999.981,
+   "final_equity": 99999.9828,
    "n_trades": 1,
-   "trades_hash": "3584d37cbac450f8e0e268db9653910ac12c806295a20b06cde34e6254bbdcc3"
+   "trades_hash": "db9be6112a178b397b17327ca88670e36649b2e0cc5aade01808f4cec89f5294"
   },
   "vectorbt": {
-   "final_equity": 99999.981,
+   "final_equity": 99999.9828,
    "n_trades": 1,
-   "trades_hash": "3584d37cbac450f8e0e268db9653910ac12c806295a20b06cde34e6254bbdcc3"
+   "trades_hash": "db9be6112a178b397b17327ca88670e36649b2e0cc5aade01808f4cec89f5294"
   }
  },
  "instrument": "EURUSD",
- "locked_at": "2026-10-22",
+ "locked_at": "2026-11-05",
  "strategy": "trivial_long_roundtrip",
  "tolerance": {
   "final_equity_rtol": 1e-06

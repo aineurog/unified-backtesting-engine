@@ -204,6 +204,11 @@ class NautilusPaperEngine(PaperEngine):
             # submitted against. The historical (test-clock) ts is preserved separately via
             # ``signal_map`` so the ledger/trades stay comparable (§9.4).
             live_base = time.time_ns() + 10_000_000_000  # +10s headroom, ns precision
+            # Signals are decision-time: each bar delivers the row decided *on that bar*
+            # (§6.1). The strategy carries the resulting order to the next bar — next_open
+            # executes at that bar's open, next_close/same_close at its close — so a live
+            # poll that delivers one new bar at a time never loses the decision.
+            execution_timing = str(config.base.execution_timing)
             bars = []
             signal_map = {}
             for i in range(n):
@@ -228,13 +233,20 @@ class NautilusPaperEngine(PaperEngine):
                 )
 
             # Fresh-session live anchor (§9.6): bars fetched for indicator warmup must not
-            # open trades — suppress every pre-anchor signal row so a live launch never
+            # open trades — suppress every pre-anchor decision so a live launch never
             # books "past" fills from the backfill (mirrors the vectorbt/backtrader warmup
             # suppression). Only meaningful while the session is still fresh.
             if start_from_ns is not None and state.last_processed_ns is None:
-                for t_live, row in list(signal_map.items()):
-                    if row[4] < int(start_from_ns):
-                        signal_map[t_live] = (False, False, False, False, row[4])
+                for i in range(n):
+                    if int(ts[i]) < int(start_from_ns):
+                        t_live = int(live_base + i * period_ns)
+                        signal_map[t_live] = (
+                            False,
+                            False,
+                            False,
+                            False,
+                            int(ts[i]),
+                        )
 
             bar_type = build_bar_type(instrument_id, period_ns)
 
@@ -327,6 +339,8 @@ class NautilusPaperEngine(PaperEngine):
                 last_funding_ns=state.last_funding_ns,
                 aux_data=dict(state.aux_data or {}),
                 window_bars=n,
+                execution_timing=execution_timing,
+                pending_decision=state.pending_decision,
             )
             strategy = UbePaperStrategy(config=strat_cfg)
 
@@ -351,6 +365,11 @@ class NautilusPaperEngine(PaperEngine):
             # by the backend because it owns the strategy lifecycle; ``step`` does not see the
             # strategy's internal state. Cleared automatically when the position is flat.
             state.exit_seed = strategy.exit_seed()
+            # §6.1: a decision taken on this window's final bar has no execution bar yet.
+            # Persist it so the next ``step`` (which may deliver just one new bar) executes
+            # it exactly once, at the correct price — otherwise a one-bar live poll would
+            # drop every signal.
+            state.pending_decision = strategy.pending_decision()
             # Issue 2: persist the funding clock so a resume continues from the exact
             # saved point (not from bar spacing, which is contaminated by synthetic seed bars).
             # Synthetic indicator history must never generate funding (issue 3).

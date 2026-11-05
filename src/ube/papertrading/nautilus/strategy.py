@@ -78,6 +78,15 @@ class UbePaperConfig(StrategyConfig):  # type: ignore[misc]
     last_funding_ns: int | None = None  # persisted funding clock (issue 2)
     aux_data: dict[str, Any] | None = None  # PaperState.aux_data — ATR/vol series (§5.2)
     window_bars: int = 0  # bars in this step's window; precomputed aux arrays align to it (§5.2)
+    #: §6.1 execution timing. ``same_close`` acts on the bar that carries the signal;
+    #: ``next_open`` / ``next_close`` act one bar later, filling at that bar's open / close.
+    execution_timing: str = "next_open"
+    #: Bars between the decision bar and the bar the strategy acts on (0 or 1).
+    decision_bar_offset: int = 0
+    #: A decision taken on the previous step's final bar, waiting for this step's first
+    #: bar to execute it (§6.1). Persisted in ``PaperState.pending_decision`` so a live
+    #: poll that delivers one new bar at a time never drops the decision.
+    pending_decision: dict[str, Any] | None = None
 
 
 class UbePaperStrategy(Strategy):  # type: ignore[misc]
@@ -102,6 +111,19 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # (keyed by the bar's live ts). ``_hist_ts`` is that historical ts for the bar
         # currently being processed.
         self._hist_ts = 0
+        #: Previous bar's historical ts — the decision bar for next_open/next_close.
+        self._prev_hist_ts: int = 0
+        self._execution_timing = str(getattr(config, "execution_timing", "next_open"))
+        self._decision_offset = int(getattr(config, "decision_bar_offset", 0) or 0)
+        #: §6.1 decision carried from the previous bar. ``next_*`` executes it on the
+        #: following bar, which may arrive in a later ``step`` call, so it is persisted in
+        #: ``PaperState.pending_decision`` between calls.
+        self._pending: dict[str, Any] | None = (
+            dict(config.pending_decision) if config.pending_decision else None
+        )
+        #: Per-order fill-price overrides for the open leg (next_open fills at the bar's
+        #: open; the sandbox would otherwise book the bar close).
+        self._open_prices: dict[Any, float] = {}
         self._sim_side = config.open_position.side if config.open_position else 0
         self._sim_qty = float(config.open_position.quantity) if config.open_position else 0.0
         # Qty of the most recent ``_submit_open`` order — used as a fallback for close
@@ -431,6 +453,13 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         if md is None or md.n_bars == 0:
             return None
         cur_bar = md.n_bars - 1
+        # The action taken on the current bar was decided ``decision_bar_offset`` bars
+        # earlier (§6.1); evaluate the trigger on the decision bar, not the execution bar.
+        check_bar = cur_bar - self._decision_offset
+        if check_bar < 0 or (
+            self._entry_bar is not None and check_bar < self._entry_bar
+        ):
+            return None
         # Resolve aux_data for ATR-based exits (backtest parity §5.2).
         # For paper, aux_data is supplied via PaperState.aux_data or via
         # strategy config; we look for an 'atr' series by name or compute
@@ -462,7 +491,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 )
             except Exception:
                 continue
-            if triggered[cur_bar]:
+            if triggered[check_bar]:
                 # Map config type to exit_reason string for ledger.
                 name = type(cfg).__name__
                 reason = {
@@ -487,7 +516,7 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                                 entry_price=self._entry_price,
                                 entry_bar=self._entry_bar,
                                 atr_series=atr_series,
-                            )[cur_bar]
+                            )[check_bar]
                         )
                     except Exception:
                         level = None
@@ -497,8 +526,13 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # §4.7/§8: a bar that sweeps several levels has no unique intra-bar path, so the
         # level nearest the bar's open is the one it reached first. Level-less exits
         # (TimeExit, trigger="close") fill at the close, so they rank on the close price.
-        ranked = [lvl if lvl is not None else self._last_close for _, _, lvl in fired]
-        pick = first_reached_exit(ranked, open_price=float(md.open[cur_bar]))
+        ranked = [
+            lvl if lvl is not None else float(md.close[check_bar])
+            for _, _, lvl in fired
+        ]
+        pick = first_reached_exit(
+            ranked, open_price=float(md.open[check_bar])
+        )
         return fired[0 if pick is None else pick]
 
     def on_bar(self, bar: Bar) -> None:
@@ -509,7 +543,15 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         # (test-clock) ts from the registry so every emitted ``LedgerEvent`` stays on the
         # ube timeline (§9.4 comparability).
         le, lx, se, sx, hist = SIGNAL_REGISTRY.at(bar.ts_event)
+        self._prev_hist_ts = self._hist_ts
         self._hist_ts = int(hist)
+        # The price an action decided on this bar fills at under the configured timing:
+        # next_open executes against this bar's open, next_close/same_close at its close.
+        exec_price = (
+            float(bar.open.as_double())
+            if self._execution_timing == "next_open"
+            else float(bar.close.as_double())
+        )
         # Issue 1: lazily seed exit-level bar buffer with proper preceding timestamps
         # (not 0) so elapsed-time calculations are not contaminated by a huge 0→hist gap.
         # Seeding happens only on the first real bar after a resume, before the real bar
@@ -518,6 +560,14 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._last_close = float(bar.close.as_double())
         # Buffer bar for exit level computation.
         self._bars.append(bar)
+        # §6.1: execute the decision taken on the previous bar at this bar's execution
+        # price (next_open: the open; next_close: the close). Carrying the decision in
+        # state is what lets a live poll deliver one new bar at a time without dropping it:
+        # the decision bar and its execution bar need not share a ``step`` call.
+        if self._pending is not None:
+            pending = self._pending
+            self._pending = None
+            self._execute_decision(pending, exec_price)
         # Issue C: maintain the running extreme price and ATR warmup window *before* the risk
         # exit check, so the current bar contributes to the peak/ATR used to seed the next
         # resume. Only tracked while a position is open and a path-dependent exit requires it.
@@ -538,40 +588,31 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                     self._atr_window.pop(0)
 
         # — Risk exits (T4) — checked before signals; among exits that trigger on the
-        # same bar, the one the bar reached first wins (§4.7/§8).
+        # same bar, the one the bar reached first wins (§4.7/§8). The trigger is a
+        # *decision* on this bar; the close executes on the next bar (§6.1).
         risk_exit = self._check_risk_exits()
         if risk_exit is not None and self._sim_side != 0:
             reason, fraction, exit_level_price = risk_exit
-            t = self._hist_ts
             self._events.append(
-                LedgerEvent(EventType.SIGNAL_EVALUATED, t, self._iid, action=f"exit_{reason}")
+                LedgerEvent(
+                    EventType.SIGNAL_EVALUATED,
+                    self._decision_ts(),
+                    self._iid,
+                    action=f"exit_{reason}",
+                )
             )
-            # Scale-out: fraction of remaining position (1.0 = full close).
-            qty_to_close = self._sim_qty * fraction
-            # §9.4 parity: a "touched" exit fills at its own level price (optimistic — exactly
-            # at the level, zero slippage beyond it); "close"-triggered and time exits keep the
-            # bar close. The level price is stashed per-order and read on fill in
-            # ``on_order_filled`` (the sandbox would otherwise price the MARKET order at bar close).
-            close_price = exit_level_price if exit_level_price is not None else self._last_close
-            # Fill lag: the entry order submitted on the previous bar has not been filled
-            # yet, so ``_sim_qty`` is still 0 and ``_submit_close`` has nothing to close.
-            # Stash the exit instead of dropping it — a dropped exit leaves the position
-            # open, the late entry fill re-opens it, and the exit then re-fires on some
-            # later bar against a different level, changing both the fill price and the
-            # reason versus the backtest/vbt/backtrader engines. It is applied in
-            # ``on_order_filled`` the moment the entry fill lands.
-            if self._sim_qty <= 0 and self._pending_open_qty > 0:
-                self._pending_risk_exit = (reason, fraction, exit_level_price)
-            else:
-                self._submit_close(close_price, fraction=fraction, exit_reason=reason)
-            if fraction >= 1.0 - 1e-12:
-                self._sim_side = 0
-                self._sim_qty = 0.0
-                self._entry_bar = None
-                self._entry_price = None
-                self._reset_exit_seed()
-            else:
-                self._sim_qty -= qty_to_close
+            self._queue_decision(
+                {
+                    "kind": "exit",
+                    "reason": reason,
+                    "fraction": float(fraction),
+                    "level": (
+                        None if exit_level_price is None else float(exit_level_price)
+                    ),
+                    "ts": int(self._hist_ts),
+                },
+                exec_price,
+            )
             return
 
         # — Funding carry (T5) — accrues on *every* bar the position is open, regardless of
@@ -636,38 +677,70 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 )
             return
 
-        close_first = action in ("close", "reverse")
-        desired = 0
+        self._events.append(
+            LedgerEvent(
+                EventType.SIGNAL_EVALUATED,
+                self._decision_ts(),
+                self._iid,
+                action=action,
+            )
+        )
+        # §6.1: the signal is a decision on this bar; the order is sent on the next bar at
+        # its open/close. ``same_close`` executes it immediately (its execution price is
+        # this bar's close). The pending side for a reverse is fixed here, while the
+        # position the action was decided against is still current.
         if action == "open_long":
-            desired = 1
+            pending = {"kind": "open", "side": 1, "ts": int(self._hist_ts)}
         elif action == "open_short":
-            desired = -1
+            pending = {"kind": "open", "side": -1, "ts": int(self._hist_ts)}
         elif action == "reverse":
-            desired = -self._sim_side
+            pending = {
+                "kind": "reverse",
+                "side": -int(self._sim_side),
+                "ts": int(self._hist_ts),
+            }
+        else:  # close
+            pending = {"kind": "close", "ts": int(self._hist_ts)}
+        self._queue_decision(pending, exec_price)
 
-        t = self._hist_ts
-        self._events.append(LedgerEvent(EventType.SIGNAL_EVALUATED, t, self._iid, action=action))
-        # Predictive position tracking: update ``_sim_side`` synchronously here, on the
-        # same bar the orders are submitted — not in ``on_order_filled`` (which lags a
-        # fill). This is what prevents ``decide_action`` from double-submitting on the
-        # next bar. The fill handler only uses the order-id sets to tag open vs close
-        # fills (and to set ``_sim_qty`` to the *actual* filled quantity).
+    # -- pending decisions (§6.1) ------------------------------------------ #
+    def _queue_decision(self, pending: dict[str, Any], exec_price: float) -> None:
+        """Execute ``pending`` now (same_close) or carry it to the next bar."""
+        if self._execution_timing == "same_close":
+            self._execute_decision(pending, exec_price)
+        else:
+            self._pending = pending
 
-        # Optimistic close-credit for same-bar reverse sizing. The close order is
-        # submitted below (``_submit_close``) and its anticipated cash leg is reserved in
-        # ``_inflight_close_legs`` until the fill lands, so ``_current_balance`` at the
-        # ``_submit_open`` sizing point already reflects post-close equity. This is the
-        # same anticipation regardless of whether the close was a same-bar signal
-        # reversal or a risk exit from the previous bar.
+    def pending_decision(self) -> dict[str, Any] | None:
+        """The decision taken on the final processed bar, awaiting its execution bar."""
+        return dict(self._pending) if self._pending is not None else None
 
+    def _execute_decision(self, pending: dict[str, Any], exec_price: float) -> None:
+        """Execute a decision taken on the previous bar at this bar's execution price.
+
+        Sizing happens here (not at decision time), so the quantity is derived from the
+        balance and price the order actually executes against — the same point the
+        vectorbt/backtrader adapters use.
+        """
+        kind = pending.get("kind")
+        if kind == "exit":
+            self._execute_risk_exit(
+                str(pending.get("reason", "")),
+                float(pending.get("fraction", 1.0)),
+                None if pending.get("level") is None else float(pending["level"]),
+                exec_price,
+            )
+            return
+        close_first = kind in ("close", "reverse")
+        desired = int(pending.get("side", 0)) if kind in ("open", "reverse") else 0
         if close_first:
             if self._sim_qty > 0:
-                self._submit_close(self._last_close)
+                self._submit_close(exec_price)
             elif self._sim_side != 0 and self._pending_open_qty > 0:
-                # Fill lag: the prior open fill hasn't arrived yet, so _sim_qty is
-                # stale.  Emit a synthetic close synchronously so the ledger's cash
-                # trail is complete before the new position opens.
-                self._emit_synthetic_close(self._last_close)
+                # Fill lag: the prior open fill hasn't arrived yet, so ``_sim_qty`` is
+                # stale. Emit a synthetic close synchronously so the ledger's cash trail
+                # is complete before the new position opens.
+                self._emit_synthetic_close(exec_price)
             # A risk exit stashed against the entry fill that is still in flight is moot
             # once this signal has closed the position — there is nothing left for it to
             # close. Left set, it would emit a second close when the stale entry fill
@@ -678,14 +751,47 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self._entry_bar = None
             self._entry_price = None
         if desired != 0:
-            self._submit_open(desired, self._last_close)
+            self._submit_open(desired, exec_price)
             # Record entry for risk-exit level computation (vectorized, §8). Anchored to
             # the slipped entry price — the fill the venue books — so touched stop/target
             # levels match the real executed entry.
             self._entry_bar = len(self._bars) - 1
-            self._entry_price = self._slipped(self._last_close, desired)
+            self._entry_price = self._slipped(exec_price, desired)
             # Funding: reset last funding timestamp on new entry.
             self._last_funding_ns = self._hist_ts
+
+    def _execute_risk_exit(
+        self,
+        reason: str,
+        fraction: float,
+        exit_level_price: float | None,
+        exec_price: float,
+    ) -> None:
+        """Send the close order for a risk exit decided on the previous bar (§6.1).
+
+        ``touched`` exits fill at their own level; close-triggered and time exits fill at
+        the execution price — the bar open under ``next_open``, the bar close otherwise.
+        """
+        # Scale-out: fraction of remaining position (1.0 = full close).
+        qty_to_close = self._sim_qty * fraction
+        close_price = (
+            exit_level_price if exit_level_price is not None else exec_price
+        )
+        # Fill lag: the entry order has not filled yet, so ``_sim_qty`` is still 0 and
+        # ``_submit_close`` has nothing to close. Stash the exit instead of dropping it —
+        # it is applied in ``on_order_filled`` the moment the entry fill lands.
+        if self._sim_qty <= 0 and self._pending_open_qty > 0:
+            self._pending_risk_exit = (reason, fraction, exit_level_price)
+        else:
+            self._submit_close(close_price, fraction=fraction, exit_reason=reason)
+        if fraction >= 1.0 - 1e-12:
+            self._sim_side = 0
+            self._sim_qty = 0.0
+            self._entry_bar = None
+            self._entry_price = None
+            self._reset_exit_seed()
+        else:
+            self._sim_qty -= qty_to_close
 
     # -- fills ------------------------------------------------------------- #
     def on_order_filled(self, event: Any) -> None:
@@ -709,12 +815,17 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             exit_reason: str | None = None
             self._sim_side = 1 if event.is_buy else -1
             self._sim_qty = float(event.last_qty.as_double())
+            # next_open books the entry at the bar open, not the sandbox's bar close.
+            fill_price = self._open_prices.pop(coid, fill_price)
+            base_px = (
+                float(fill_price)
+                if fill_price is not None
+                else float(event.last_px.as_double())
+            )
             # Record entry for risk-exit level computation. Anchored to the slipped fill
             # price (mirrors the backtest actor), so touched stop/target levels line up.
             self._entry_bar = len(self._bars) - 1
-            self._entry_price = self._slipped(
-                float(event.last_px.as_double()), 1 if event.is_buy else -1
-            )
+            self._entry_price = self._slipped(base_px, 1 if event.is_buy else -1)
             self._last_funding_ns = self._hist_ts
             # Issue C: a fresh (non-resume) entry starts a new running extreme and ATR window
             # from this bar. The fill arrives asynchronously (one bar after submission), so
@@ -959,6 +1070,12 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             self._entry_bar = None
 
     # -- order submission -------------------------------------------------- #
+    def _decision_ts(self) -> int:
+        """The historical ts of the bar the current action was *decided* on (§6.1)."""
+        if self._decision_offset and self._prev_hist_ts:
+            return int(self._prev_hist_ts)
+        return int(self._hist_ts)
+
     def _slipped(self, price: float, side: int) -> float:
         """Adverse price-level slippage for a fill of direction ``side`` (+1 BUY, -1 SELL).
 
@@ -1037,6 +1154,9 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         self._sim_side = desired
         self._pending_open_qty = float(qty.as_double())
         self._entry_order_ids.add(order.client_order_id)
+        # Pin the fill to the execution price (§6.1): for next_open that is the bar open,
+        # whereas the sandbox would book the bar close.
+        self._open_prices[order.client_order_id] = float(price)
         self._events.append(
             LedgerEvent(
                 EventType.ORDER_SUBMITTED,

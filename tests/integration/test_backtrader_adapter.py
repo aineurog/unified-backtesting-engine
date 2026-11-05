@@ -408,9 +408,8 @@ def test_trailing_stop_stamps_exit_reason():
 
 def test_time_exit_executes_and_stamps_reason():
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
-    # Entry signal bar 1 fills at that bar's close; TimeExit(2) fires at entry_bar + 2 =
-    # bar 3, filling at bar 3 close (bar-synchronous fills now that the adapter fills at
-    # the submit bar, matching the vectorbt/nautilus references).
+    # Entry signal bar 1 -> fill bar 2 open; TimeExit(2) fires at entry_bar + 2 = bar 4,
+    # filling at bar 5 open.
     result = BacktraderAdapter().run(
         md,
         from_target([0, 1, 1, 1, 1, 1, 0, 0, 0, 0]),
@@ -425,7 +424,7 @@ def test_time_exit_executes_and_stamps_reason():
     assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "time_exit")]
     (trade,) = result.trades
     assert trade.exit_reason == "time_exit"
-    assert fills[1].price == pytest.approx(float(md.close[3]), abs=1e-6)
+    assert fills[1].price == pytest.approx(float(md.open[5]), abs=1e-6)
 
 
 
@@ -470,8 +469,10 @@ def test_full_loop_flip_within_same_bar_submits_exit_then_entry():
 
 def test_full_loop_final_bar_exit_signal_realizes_at_last_close():
     # Exit signal on the very last bar (target flat at bar 11): the order can't fill
-    # next-bar-open, so stop() realizes it at the final bar's close with the signal reason
-    # (reference adapter semantics).
+    # on a later bar, so stop() realizes it at the final bar's close with the signal
+    # reason. Pin ``same_close`` — under the default ``next_open`` the decision would
+    # simply have no bar to execute on and the position would stay open (matching the
+    # other engines), which is not what this stop() regression targets.
     md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=12)
     result = BacktraderAdapter().run(
         md,
@@ -479,6 +480,7 @@ def test_full_loop_final_bar_exit_signal_realizes_at_last_close():
         BacktestConfig(
             instrument=PRESETS["futures"].instrument,
             engine_overrides={"starting_balance": 100000.0},
+            execution_timing="same_close",
         ),
     )
     fills = _fills(result)

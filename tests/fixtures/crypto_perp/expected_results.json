@@ -2,23 +2,23 @@
  "asset_class": "crypto_perp",
  "engines": {
   "backtrader": {
-   "final_equity": 91259.98991624996,
+   "final_equity": 91902.41885499997,
    "n_trades": 1,
-   "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
+   "trades_hash": "719b8fde25c6083b2047335527def4e0dbc4f2585bcbd29cdbfd9424ced92138"
   },
   "nautilus": {
-   "final_equity": 91259.98991624996,
+   "final_equity": 91902.41885499997,
    "n_trades": 1,
-   "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
+   "trades_hash": "719b8fde25c6083b2047335527def4e0dbc4f2585bcbd29cdbfd9424ced92138"
   },
   "vectorbt": {
-   "final_equity": 91259.98991624996,
+   "final_equity": 91902.41885499997,
    "n_trades": 1,
-   "trades_hash": "3ecfb532eeacd01c19a39ed0f8443f9cee4caa6bd3b5b6bea5a0aca6547aff02"
+   "trades_hash": "719b8fde25c6083b2047335527def4e0dbc4f2585bcbd29cdbfd9424ced92138"
   }
  },
  "instrument": "BTC-USDT",
- "locked_at": "2026-10-22",
+ "locked_at": "2026-11-05",
  "strategy": "trivial_long_roundtrip",
  "tolerance": {
   "final_equity_rtol": 1e-06

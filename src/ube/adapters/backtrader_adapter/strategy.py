@@ -90,6 +90,12 @@ class BtRunContext:
     vol_arr: np.ndarray | None
     slip: float
     starting_balance: float
+    #: §6.1 execution timing: ``True`` for ``next_open`` (the execution bar's open is the
+    #: fill price), ``False`` for ``same_close``/``next_close`` (the bar's close).
+    fill_at_open: bool = False
+    #: Bars between the decision bar and the bar whose signal row the strategy reads:
+    #: ``1`` for ``next_*`` (the frame is shifted), ``0`` for ``same_close``.
+    signal_bar_offset: int = 0
     #: The position carried into this run by a paper-trading resume (§3) — seeded into the
     #: broker and the strategy's own tracker at ``start()``, never re-executed. ``None`` for
     #: a fresh backtest (and the cold paper window).
@@ -218,17 +224,20 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         """
         return float(f"{price:.{self._ctx.inst.price_precision}f}")
 
-    def _fill_price(self, side: int) -> float:
-        """Actual fill price for a market order: the current bar's close (§9.4 parity).
+    def _raw_fill_price(self) -> float:
+        """The execution bar's unslipped fill price under the configured timing (§6.1)."""
+        ctx = self._ctx
+        raw = float(self.data.open[0]) if ctx.fill_at_open else float(self.data.close[0])
+        return self._snap_price(raw)
 
-        The adapter's folded ledger fills at raw bar closes (or a *touched* exit's own
-        level) regardless of the broker's internal next-open execution, so the price used
-        for sizing and realized PnL is always available within the decision bar's
-        ``next()``.
+    def _fill_price(self, side: int) -> float:
+        """Actual fill price for a market order under the configured timing (§6.1).
+
+        ``same_close`` fills at the current bar's close, ``next_close`` at the execution
+        bar's close, and ``next_open`` at its open. The adapter's folded ledger uses this
+        price regardless of the broker's internal next-bar-open execution.
         """
-        return float(
-            slipped_price(self._snap_price(float(self.data.close[0])), side, self._ctx.slip)
-        )
+        return float(slipped_price(self._raw_fill_price(), side, self._ctx.slip))
 
     def _target_quantity(self, side: int) -> float:
         """Core-sized entry quantity for one direction (§6.3), floored to the lot increment."""
@@ -384,25 +393,24 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             entry_bar=0,
             atr_map=ctx.atr_map,
         )
-        # Arm the carried plan from the bar *after* its fill bar. The carried leg filled at
-        # ``data[0]``'s close (same-bar close fill, §8), so a level touched during bar 0 was
-        # reached *before* the position existed and must not fire it. That is exactly how a
-        # plan this strategy builds for its own entry behaves: ``notify_order`` builds it on
-        # the fill bar and ``next()`` first consults it on the next one, so an entry-bar touch
-        # is structurally unreachable in a full run. Without masking bar 0 here a warm window
-        # exits the carried trade on its own entry bar (a phantom stop-out at the wrong bar),
-        # which books the wrong realized PnL and desynchronizes every later size from the full
-        # run — the windowed ledger then drifts from a single full-window run.
-        plan = tuple(
-            replace(
-                line,
-                triggered=np.asarray(
-                    [False, *np.asarray(line.triggered, dtype=np.bool_)[1:]],
-                    dtype=np.bool_,
-                ),
+        # Under ``same_close`` the carried leg filled at ``data[0]``'s close, so a level
+        # touched during bar 0 was reached *before* the position existed and must not fire
+        # it: ``notify_order`` builds the plan on the fill bar and ``next()`` first consults
+        # it on the next one, so an entry-bar touch is structurally unreachable in a full
+        # run. Under ``next_*`` the fill is at bar 0's open, the carried plan is evaluated
+        # at decision index 0 on bar 1 exactly as the full run does, so bar 0's trigger is
+        # reachable and must stay armed — masking it would drop a real exit.
+        if ctx.signal_bar_offset == 0:
+            plan = tuple(
+                replace(
+                    line,
+                    triggered=np.asarray(
+                        [False, *np.asarray(line.triggered, dtype=np.bool_)[1:]],
+                        dtype=np.bool_,
+                    ),
+                )
+                for line in plan
             )
-            for line in plan
-        )
         self._pos = _OpenPosition(
             side=int(carried.side),
             entry_bar=0,
@@ -425,20 +433,32 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             and abs(self.position.size) > _FLAT_EPS
         ):
             fired: BtExitLine | _SignalExit | None = None
-            due = [
-                line
-                for line in self._pos.plan
-                if line.index not in self._pos.spent and bool(line.triggered[i])
-            ]
+            # Risk exits are *decided* on the bar whose trigger fires and execute on the
+            # next bar under ``next_*`` (§6.1): evaluate the plan at the decision index,
+            # never at the execution bar, so a trigger on bar ``t`` never fills at
+            # ``open[t]``/``close[t]`` using bar ``t``'s own high/low (look-ahead).
+            decision_idx = i - ctx.signal_bar_offset
+            due = []
+            if 0 <= decision_idx < ctx.data.n_bars:
+                due = [
+                    line
+                    for line in self._pos.plan
+                    if line.index not in self._pos.spent
+                    and bool(line.triggered[decision_idx])
+                ]
             if due:
                 # Several exits can trigger on one bar; the one the bar reached first wins
                 # (§4.7/§8). Level-less exits (TimeExit, trigger="close") fill at the close,
-                # so they rank on the close price.
+                # so they rank on the decision bar's close price.
                 ranked = [
-                    float(line.level[i]) if line.level is not None else float(self.data.close[0])
+                    float(line.level[decision_idx])
+                    if line.level is not None
+                    else float(self.data.close[-ctx.signal_bar_offset])
                     for line in due
                 ]
-                pick = first_reached_exit(ranked, open_price=float(self.data.open[0]))
+                pick = first_reached_exit(
+                    ranked, open_price=float(self.data.open[-ctx.signal_bar_offset])
+                )
                 fired = due[0 if pick is None else pick]
             if fired is None:
                 side = self._pos.side
@@ -469,7 +489,7 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                     level_price = (
                         None
                         if isinstance(fired, _SignalExit) or fired.level is None
-                        else float(fired.level[i])
+                        else float(fired.level[decision_idx])
                     )
                     self._realize_exit_pnl(exit_side, exit_qty, level_price)
                     order = (
@@ -482,8 +502,15 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                         if isinstance(fired, _SignalExit)
                         else f"exit_{fired.reason}"
                     )
+                    # A signal exit is stamped on its decision bar; a risk exit is
+                    # stamped on the bar whose close triggered it.
+                    signal_bar = (
+                        i - ctx.signal_bar_offset
+                        if isinstance(fired, _SignalExit)
+                        else i
+                    )
                     self.signal_records.append(
-                        BtSignalRecord(i, action, exit_side)
+                        BtSignalRecord(signal_bar, action, exit_side)
                     )
                     self._pending_exit = {
                         "ref": order.ref,
@@ -535,7 +562,11 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         self._check_affordable(side, qty)
         order = self.buy(size=qty) if side == 1 else self.sell(size=qty)
         self.signal_records.append(
-            BtSignalRecord(i, "long_entry" if side == 1 else "short_entry", side)
+            BtSignalRecord(
+                i - self._ctx.signal_bar_offset,
+                "long_entry" if side == 1 else "short_entry",
+                side,
+            )
         )
         self._pending_entry = {
             "ref": order.ref,
@@ -572,11 +603,16 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         fill_bar = submit_bar  # same-bar close fills (§9.4 parity with the references)
         side = int(meta["side"])
         qty = abs(float(order.executed.size))
-        # Bar-synchronous pricing: the folded ledger fills a market order at the *submit*
-        # bar's close (the reference's same-bar fill), not at the broker's internal
-        # next-bar-open execution, so re-stamp the executed price here (snapped to the
-        # instrument's price grid like the reference's ingested bars).
-        price = self._snap_price(float(ctx.data.close[submit_bar]))
+        # Bar-synchronous pricing: the folded ledger fills a market order on the *submit*
+        # (execution) bar — at its open for ``next_open``, its close otherwise — not at
+        # the broker's internal next-bar-open execution, so re-stamp the price here
+        # (snapped to the instrument's price grid like the reference's ingested bars).
+        raw = (
+            float(ctx.data.open[submit_bar])
+            if ctx.fill_at_open
+            else float(ctx.data.close[submit_bar])
+        )
+        price = self._snap_price(raw)
         if meta["kind"] == "entry":
             self.order_records.append(
                 BtOrderRecord(submit_bar, fill_bar, side, qty, price, None)
@@ -637,7 +673,7 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         """
         last = self._ctx.data.n_bars - 1
         ctx = self._ctx
-        close_price = self._snap_price(float(self.data.close[0]))
+        close_price = self._raw_fill_price()
         pending = self._pending_exit
         if pending is not None:
             # Book an in-flight exit at the price ``notify_order`` would have used: a touched

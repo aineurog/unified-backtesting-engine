@@ -16,7 +16,11 @@ The inputs mirror the canonical contract:
   :class:`pandas.DataFrame`; richer encodings (a ``-1/0/1`` target array or a per-bar
   callable) are converted *first* via :func:`~ube.core.signals.from_target` /
   :func:`~ube.core.signals.from_callable`, not guessed here.
-* ``config`` — the full :class:`~ube.core.config.BacktestConfig`.
+* ``config`` — the full :class:`~ube.core.config.BacktestConfig`. Its
+  ``execution_timing`` decides when a decision-time signal fills: ``"next_open"``
+  (default — the following bar's open), ``"next_close"`` (following bar's close), or
+  ``"same_close"`` (the signal bar's own close). A signal flag on bar ``t`` always
+  means "decided at the close of ``t``"; only the execution bar changes.
 * ``aux_data`` — a flat ``name -> value`` mapping referenced by name from exit configs
   (e.g. ``ATRStop(atr="atr_12h")``). A value may be a precomputed 1-D array (length
   must match ``data``'s bar count), or a :class:`~ube.core.data.MarketData` of the

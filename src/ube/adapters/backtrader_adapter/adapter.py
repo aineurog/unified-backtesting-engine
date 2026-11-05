@@ -55,6 +55,7 @@ from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel, fill_cost, resolve_cost_model, slipped_price
 from ube.core.data import MarketData, resolve_price_precision, snap_prices
 from ube.core.errors import ConfigError, DataShapeError, EngineError, InvalidSignalError
+from ube.core.execution import shift_signals
 from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
 from ube.core.ledger import (
     EventLedger,
@@ -180,6 +181,17 @@ class BacktraderAdapter(EngineAdapter):
         # before any engine work rather than letting the engine silently drop it.
         validate_long_only(signals, config.instrument.asset_class)
 
+        # §6.1 execution timing. Signals are decision-time; the strategy reads the frame
+        # on the bar that *executes* the decision, so ``next_*`` shifts every column one
+        # bar forward. ``same_close`` reads the frame unshifted and fills at the bar's
+        # close; ``next_close`` fills the shifted bar's close; ``next_open`` fills its open.
+        timing = config.execution_timing
+        signal_bar_offset = 0 if timing == "same_close" else 1
+        exec_signals = (
+            signals if signal_bar_offset == 0 else shift_signals(signals, timing)
+        )
+        fill_at_open = timing == "next_open"
+
         overrides = validate_overrides(config.engine_overrides)
         cost_model: CostModel | None = (
             config.cost_model
@@ -238,9 +250,11 @@ class BacktraderAdapter(EngineAdapter):
             vol_arr=vol_arr,
             slip=slip,
             starting_balance=starting_balance,
+            fill_at_open=fill_at_open,
+            signal_bar_offset=signal_bar_offset,
             carried=carried,
         )
-        frame = to_signal_frame(data, signals)
+        frame = to_signal_frame(data, exec_signals)
         strat = run_backtrader(
             frame,
             ctx,

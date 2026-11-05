@@ -33,8 +33,10 @@ class PaperConfig:
 
     Attributes:
         base: The canonical :class:`~ube.core.config.BacktestConfig` (instrument,
-            risk/exits, cost model, engine overrides, and the ``signal`` policy). Engine is
-            ``"nautilus"`` for the nautilus backend, implied here and not re-stored.
+            risk/exits, cost model, engine overrides, the ``signal`` policy, and
+            ``execution_timing``). Engine is ``"nautilus"`` for the nautilus backend,
+            implied here and not re-stored. Execution timing is inherited from ``base``
+            so a paper session fills decisions exactly like the equivalent backtest.
         state_path: sqlite path for :class:`PaperState` persistence (§9.5). ``None`` means
             the run is ephemeral (no resume).
         starting_balance: Convenience override of the venue starting balance; folded into

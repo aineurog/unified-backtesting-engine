@@ -81,15 +81,15 @@ def test_crypto_perp_entry_then_exit() -> None:
     assert fills[0].exit_reason is None
     assert fills[1].exit_reason == "signal"
 
-    # §9.4 fill-timing parity: each market order is matched to the bar it was submitted
-    # against, so the fill price equals that bar's close. The entry is on bar 0 and the
-    # exit on bar 5 (the long-exit signal); a mismatch here would mean the sandbox matched
-    # the order to the wrong (later) bar.
-    assert abs(fills[0].price - float(data.close[0])) < 1e-6
-    assert abs(fills[1].price - float(data.close[5])) < 1e-6
+    # §6.1 fill-timing: signals are decision-time, so the entry decided on bar 0 fills on
+    # bar 1 at its open and the exit decided on bar 5 fills on bar 6 at its open (the
+    # default ``execution_timing="next_open"``). A mismatch here would mean the sandbox
+    # matched the order to the wrong bar.
+    assert abs(fills[0].price - float(data.open[1])) < 1e-6
+    assert abs(fills[1].price - float(data.open[6])) < 1e-6
     hist_ts = data.timestamps.as_unit("ns").asi8
-    assert fills[0].timestamp == int(hist_ts[0])  # ledger stays on historical timeline
-    assert fills[1].timestamp == int(hist_ts[5])
+    assert fills[0].timestamp == int(hist_ts[1])  # ledger stays on historical timeline
+    assert fills[1].timestamp == int(hist_ts[6])
 
 
 def test_crypto_perp_no_position_when_flat_signal() -> None:
@@ -177,9 +177,10 @@ def test_crypto_perp_resume() -> None:
     fills2 = [e for e in ev2 if e.event_type == EventType.FILL]
     assert len(fills2) == 1
     assert fills2[0].exit_reason == "signal"
-    # fill landed on the bar it was submitted against (§9.4)
-    assert abs(fills2[0].price - float(data.close[6])) < 1e-6
-    assert fills2[0].timestamp == int(data.timestamps.as_unit("ns").asi8[6])
+    # the exit was decided on bar 6 (first flat target) and fills on bar 7 at its open
+    # under the default ``next_open`` timing (§6.1)
+    assert abs(fills2[0].price - float(data.open[7])) < 1e-6
+    assert fills2[0].timestamp == int(data.timestamps.as_unit("ns").asi8[7])
 
 
 def test_resume_with_non_trailing_atr_seeds_atr_warmup_only() -> None:
@@ -246,7 +247,7 @@ def test_atr_stop_aligns_when_aux_index_is_us_resolution() -> None:
     strategy's nanosecond hist timestamps. The two grids never overlapped, so ``reindex``
     forward-filled every bar from the aux's *trailing* ATR value: the stop level became a
     constant ``entry - mult * atr[-1]`` and fired on the wrong bar at the wrong price.
-    Before the fix this scenario exited at bar 3 @ 96.544 instead of bar 2 @ 98.25.
+    The pre-fix engine exited at 96.544 (the collapsed level) instead of 98.25.
     """
     md = MarketData.from_records(
         [
@@ -318,12 +319,13 @@ def test_atr_stop_aligns_when_aux_index_is_us_resolution() -> None:
     # Wilder ATR (period 2) over the aux: [2, 1.75, 2.325, ...]; shifted one bar and
     # primed, atr[2] = 1.75 → level = 100 - 1.0*1.75 = 98.25. Bar 2's low (96.9) touches
     # it; bar 2's low is *above* the trailing-collapse level (100 - atr[-1] ≈ 96.54), so
-    # the pre-fix engine skipped it and exited a bar later at the wrong price.
+    # the pre-fix engine skipped it and exited a bar later at the wrong price. The stop is
+    # decided on bar 2 and executes on bar 3 under the default ``next_open`` timing.
     assert fills[1].exit_reason == "atr_stop"
     assert abs(fills[1].price - 98.25) < 1e-6
     assert abs(closed[0].exit_price - 98.25) < 1e-6
-    assert fills[1].timestamp == int(md.timestamps.as_unit("ns").asi8[2])
-    assert closed[0].exit_timestamp == int(md.timestamps.as_unit("ns").asi8[2])
+    assert fills[1].timestamp == int(md.timestamps.as_unit("ns").asi8[3])
+    assert closed[0].exit_timestamp == int(md.timestamps.as_unit("ns").asi8[3])
 
 
 def test_atr_stop_fires_with_precomputed_array_aux() -> None:
@@ -338,7 +340,7 @@ def test_atr_stop_fires_with_precomputed_array_aux() -> None:
     2: ``exit_reason='signal'`` instead of ``'atr_stop'``).
 
     Same bars/signals/level as the ``MarketData``-aux case above — aux as the §5.2
-    precomputed ndarray instead — so both must exit at bar 2 @ 98.25.
+    precomputed ndarray instead — so both must exit at the same price, 98.25.
     """
     md = MarketData.from_records(
         [
@@ -383,8 +385,9 @@ def test_atr_stop_fires_with_precomputed_array_aux() -> None:
     assert fills[1].exit_reason == "atr_stop"
     assert abs(fills[1].price - 98.25) < 1e-6
     assert abs(closed[0].exit_price - 98.25) < 1e-6
-    assert fills[1].timestamp == int(md.timestamps.as_unit("ns").asi8[2])
-    assert closed[0].exit_timestamp == int(md.timestamps.as_unit("ns").asi8[2])
+    # decided on bar 2 (the touch), executed on bar 3 under ``next_open``
+    assert fills[1].timestamp == int(md.timestamps.as_unit("ns").asi8[3])
+    assert closed[0].exit_timestamp == int(md.timestamps.as_unit("ns").asi8[3])
     assert state.open_position is None
 
 
@@ -603,13 +606,14 @@ def _leveraged_cfg() -> PaperConfig:
     return PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
 
 
-def _exit_cfg(exit_cfg, asset_class: str = "crypto_perp") -> PaperConfig:
+def _exit_cfg(exit_cfg, asset_class: str = "crypto_perp", **kw) -> PaperConfig:
     """A paper config carrying a ``RiskConfig.exit`` (single-exit cases for §9.4)."""
     instr = PRESETS[asset_class].instrument
     bc = BacktestConfig(
         instrument=instr,
         signal=SignalConfig(on_opposite_signal="reverse"),
         risk=RiskConfig(exit=(exit_cfg,)),
+        **kw,
     )
     return PaperConfig(base=bc, engine="nautilus", starting_balance=10_000.0)
 
@@ -1014,7 +1018,9 @@ def test_crypto_perp_close_trigger_exit_fills_at_bar_close() -> None:
 
     Bar 1 wicks to 97 (below the 98 stop) but closes at 100.5 → not triggered by the
     close rule. Bar 2 closes at 97.5 → triggered; with no level the MARKET order fills
-    at the closing price 97.5, matching the backtest's close-based exit.
+    at the closing price 97.5, matching the backtest's close-based exit. Pinned to
+    ``same_close``: the point of the test is the *fill basis* (bar close, not the stop
+    level), so the decision and execution bars are aligned.
     """
     md = MarketData.from_records(
         [
@@ -1053,7 +1059,7 @@ def test_crypto_perp_close_trigger_exit_fills_at_bar_close() -> None:
         ]
     )
     signals = from_target(np.array([1, 1, 1, 0]))
-    cfg = _exit_cfg(StopLoss(percent=0.02, trigger="close"))
+    cfg = _exit_cfg(StopLoss(percent=0.02, trigger="close"), execution_timing="same_close")
     state = init(cfg)
 
     _, events = step(md, signals, state, cfg)
@@ -1211,3 +1217,48 @@ def test_fresh_start_from_ns_suppresses_pre_anchor_entries() -> None:
     assert any(int(t.entry_timestamp) < anchor_ns for t in legacy), [
         (int(t.entry_timestamp), int(t.exit_timestamp)) for t in legacy
     ]
+
+
+def test_pending_decision_carries_across_single_bar_steps() -> None:
+    """A live poll that delivers one new bar per ``step`` never drops a decision.
+
+    Signals are decision-time (§6.1) and the default ``next_open`` executes them one bar
+    later. When the decision bar is the *last* bar of a step, its execution bar belongs to
+    the next step — the decision must be persisted in ``state.pending_decision`` across the
+    boundary instead of vanishing with the finished Nautilus node.
+    """
+    data = synthetic_bars(PRESETS["crypto_perp"], n_bars=8, seed=3)
+    hist_ts = data.timestamps.as_unit("ns").asi8
+    target = np.array([1, 1, 0, 0, 0, 0, 0, 0])
+    signals = from_target(target)
+    cfg = _config()
+    state = init(cfg)
+
+    events: list[object] = []
+    for i in range(8):
+        _, step_events = step(
+            slice_md(data, slice(i, i + 1)),
+            slice_signals(signals, slice(i, i + 1)),
+            state,
+            cfg,
+        )
+        events.extend(step_events)
+        if i == 0:
+            # Entry decided on bar 0 has no execution bar inside this step's window.
+            assert state.pending_decision == {
+                "kind": "open",
+                "side": 1,
+                "ts": int(hist_ts[0]),
+            }
+        if i == 1:
+            # Executed on bar 1; the bar-1 target (still long) emits no new decision.
+            assert state.pending_decision is None
+
+    fills = [e for e in events if e.event_type is EventType.FILL]
+    assert len(fills) == 2
+    assert abs(fills[0].price - float(data.open[1])) < 1e-6
+    assert fills[0].timestamp == int(hist_ts[1])
+    # Exit decided on bar 2 (target 1 -> 0) fills on bar 3 at its open.
+    assert abs(fills[1].price - float(data.open[3])) < 1e-6
+    assert fills[1].timestamp == int(hist_ts[3])
+    assert state.open_position is None
