@@ -6,9 +6,10 @@ property of the recomputable backend: folding a long history in *multiple* windo
 exactly the ledger a single full-window run produces (including same-bar flips and carried
 positions), because every window re-derives its start and checkpoint balance from state.
 
-Unlike vectorbt (which fills at the signal bar), backtrader fills market orders at the
-*next* bar's open, so the entry/first-exit timestamps here are one bar later than the
-vectorbt mirrors (e.g. a bar-4 signal fills at bar 5 = ``1704085200000000000``).
+Every backend follows the same ``execution_timing`` contract (default ``next_open``):
+a decision on bar *t* fills at bar *t+1*'s open, so the entry/first-exit timestamps here
+land one bar after their signal (e.g. a bar-4 signal fills at bar 5 =
+``1704085200000000000``).
 """
 
 from __future__ import annotations
@@ -894,8 +895,8 @@ def test_atr_exit_survives_windowed_resume_with_aux() -> None:
 def test_fresh_start_from_ns_suppresses_pre_anchor_entries() -> None:
     # Live-launch warmup suppression (see the vectorbt mirror): bars fetched for indicator
     # warmup must not open trades on a fresh session, while the anchor bar and later stay
-    # tradable. Backtrader fills the bar after the signal, so entry timestamps are anchored
-    # one bar later than the vectorbt mirror � every folded entry must still be >= anchor.
+    # tradable. Every backend fills on the bar after the signal under the default
+    # next_open; every folded entry must still be >= anchor.
     import tempfile
     from pathlib import Path
 

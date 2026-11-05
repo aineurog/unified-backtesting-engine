@@ -7,9 +7,12 @@ strategy, then folds recorded signals and fills into the canonical event ledger.
 ## Mapping and Behavior
 
 - The adapter accepts single-instrument OHLCV data and aligned `Signals`.
-- A signal or exit plan drives entry/exit orders. The UBE ledger records
-  bar-synchronous fills at the signal bar close, or at the touched exit level for
-  a level-triggered risk exit; slippage and commission are applied in the fold.
+- A signal or exit plan drives entry/exit orders. Signals are decision-time: the
+  adapter shifts them to the execution bar chosen by `execution_timing` (default
+  `"next_open"` — the following bar's open; `"next_close"` / `"same_close"` fill the
+  execution bar's close). The UBE ledger records fills on that execution bar, or at
+  the touched level for a level-triggered risk exit; slippage and commission are
+  applied in the fold.
 - Position sizing uses the shared sizing model, effective leverage, asset-class
   lot increment, and an affordability check. A running net cash balance is used
   for subsequent sizing rather than treating the broker's leveraged equity as

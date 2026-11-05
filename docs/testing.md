@@ -9,6 +9,11 @@ pytest
 mkdocs build --strict
 ```
 
+The editable install is what puts `ube` on the interpreter's import path, so plain
+`pytest` works from the repository root. If you would rather not install the package
+(e.g. a throwaway environment), run the suite against the source tree instead:
+`PYTHONPATH=src python -m pytest`. CI uses the editable install in every job.
+
 The test suite is organized as:
 
 - `tests/unit/`: core contracts, sizing, exits, ledger, results, and state.

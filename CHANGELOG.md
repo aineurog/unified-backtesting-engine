@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-05
+
+### Changed
+
+- **Breaking:** signals are decision-time. A flag on bar `t` means "decided at the
+  close of bar `t`", and a new `BacktestConfig.execution_timing` chooses the fill
+  bar: `"next_open"` (default — bar `t+1`'s open), `"next_close"` (bar `t+1`'s
+  close), or `"same_close"` (bar `t`'s close). Previously vectorbt and nautilus
+  filled on the signal bar's close while backtrader filled on the next bar's open,
+  so the same signals produced different results per engine. All engines now honour
+  the same setting. Set `execution_timing="same_close"` to restore the old
+  vectorbt/nautilus behaviour.
+- Nautilus paper trading carries a decision taken on a step's final bar in
+  `PaperState.pending_decision` and executes it on the next step's first bar, so
+  live polls that deliver one new bar at a time no longer drop the last signal.
+  The paper-state sqlite schema migrates automatically.
+
 ## [Unreleased]
 
 - Initial project scaffold (structure only, no implementation).

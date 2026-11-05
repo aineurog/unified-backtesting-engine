@@ -4,13 +4,15 @@ backtrader is an actor loop, not a vector engine: the strategy walks the bars an
 market orders via the broker. This module implements the single-instrument execution policy
 that mirrors the other adapters' semantics on that loop:
 
-- **Entry**: a ``long_entry``/``short_entry`` signal bar submits a market order that fills at that
-  bar's close (same-bar, bar-synchronous fills matching the vectorbt/nautilus references). Sizing
+- **Entry**: a ``long_entry``/``short_entry`` row submits a market order that fills on that
+  (execution) bar at its open when ``execution_timing="next_open"``, or at its close otherwise
+  (§6.1). The adapter has already shifted the decision-time signals for ``next_*``, so the row
+  the strategy reads is the execution bar; ``same_close`` leaves it on the decision bar. Sizing
   uses the core :func:`~ube.core.risk.sizing.size_position` against the broker equity levered by
-  the effective leverage (§6.3), priced at the slipped current close, floored to the asset-class
-  lot increment and additionally floored to what the broker margin allows — mirroring the
-  reference ``NotionalSizer`` so a leveraged perp entry can never be rejected by the venue for
-  insufficient margin.
+  the effective leverage (§6.3), priced at the slipped execution price, floored to the
+  asset-class lot increment and additionally floored to what the broker margin allows — mirroring
+  the reference ``NotionalSizer`` so a leveraged perp entry can never be rejected by the venue
+  for insufficient margin.
 - **Exits**: at entry fill time the strategy precomputes the per-bar trigger arrays of every
   configured exit via :func:`~ube.adapters.backtrader_adapter.exits.build_exit_plan` (anchored
   to the actual fill and the slipped entry price, causal — §8). Each bar, the first not-yet-spent
@@ -18,20 +20,20 @@ that mirrors the other adapters' semantics on that loop:
   stops always exit the whole remaining position. A spent line never re-fires. A *touched* stop
   fills at its own level (the reference books the touched level, not the bar close).
 - **Signal exits / flips**: a matching ``long_exit``/``short_exit`` (or an opposite-side entry)
-  closes the position via a *signal* exit at the bar close; a flip then re-enters the opposite
-  side on the same bar.
+  closes the position via a *signal* exit at the execution bar's price (the open under
+  ``next_open``, the close otherwise); a flip then re-enters the opposite side on the same bar.
 - **Accounting**: the strategy records every evaluated signal and submitted order into
   ``signal_records`` / ``order_records``; those (not the broker's cash) are what the adapter
   folds into the canonical ledger — the broker cash is only the *sizing* equity, and fills happen
   at raw bar closes (or touched levels), with ``commission`` and ``slippage`` applied by the fold
   (§8).
 - **Final bar**: backtrader's broker executes a market order at the *next* bar's open, so an order
-  placed on the last bar can never fill through the broker within the run. Because the reference
-  fills it at the same bar's close, ``stop()`` books an in-flight exit or entry on the final bar
-  at that bar's close (with its reason), so a final-bar signal still trades exactly like the
-  references. A position with no exit signal is left *open* — the references keep the final trade
-  unrealized (realized PnL 0), so the ledger ends on an open mark-to-market row rather than a
-  reasonless close.
+  placed on the last bar can never fill through the broker within the run. ``stop()`` therefore
+  books an in-flight exit or entry on the final bar at that bar's configured execution price
+  (its open under ``next_open``, its close otherwise), with its reason, so a final-bar execution
+  still trades exactly like the other engines. A position with no exit signal is left *open* —
+  the references keep the final trade unrealized (realized PnL 0), so the ledger ends on an open
+  mark-to-market row rather than a reasonless close.
 """
 
 from __future__ import annotations

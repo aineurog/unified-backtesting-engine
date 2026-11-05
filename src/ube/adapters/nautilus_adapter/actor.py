@@ -8,10 +8,11 @@ into Nautilus's native mechanism — no strategy re-implementation (requirements
 
 Behavior summary (each item maps to a requirements §6 bullet):
 
-* **Entries** — on a bar whose signals demand a position, size via
+* **Entries** — on an execution bar whose signals demand a position, size via
   :func:`~ube.core.risk.sizing.size_position` against the venue account balance and the
-  bar's close, submit a market order (fills at the same-bar close — the entry is
-  evaluated at bar close, requirements §4.4/§5.2).
+  bar's close, submit a market order. Signals are decision-time; the adapter has shifted
+  them one bar for ``next_open``/``next_close`` (§6.1), and the fill is booked at that
+  execution bar's open under ``next_open`` or its close otherwise.
 * **Signal exits / flips** — ``long_exit`` / ``short_exit`` close the open position with a
   reduce-only market order; a same-bar flip closes + opens (two orders, the netting venue
   reconciles at the bar close). ``short_entry`` while long (and the mirror) is treated as

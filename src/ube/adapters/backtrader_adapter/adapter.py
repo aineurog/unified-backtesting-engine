@@ -13,9 +13,12 @@ first bar, ``signal_evaluated`` / ``order_submitted`` at the signal (submit) bar
 sibling adapters (§24). A partial scale-out exit is just another exit fill against the open
 position — the ledger fold already handles partial closes (§4.6).
 
-Fills are bar-synchronous (same bar as the signal/trigger, at that bar's close or at a touched
-exit's own level), matching the vectorbt/nautilus references — the exit *reason* is classified
-against the core ``exit_triggered`` semantics by the strategy's precomputed plan.
+Fills land on the bar selected by ``config.execution_timing`` (§6.1): the adapter shifts the
+decision-time signals one bar for ``next_open``/``next_close``, so the strategy's signal row
+is the *execution* bar — its open for ``next_open``, its close otherwise; ``same_close``
+leaves the signals unshifted and fills the decision bar's close. A touched exit fills at its
+own level. The exit *reason* is classified against the core ``exit_triggered`` semantics by
+the strategy's precomputed plan.
 """
 
 from __future__ import annotations

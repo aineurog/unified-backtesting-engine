@@ -417,6 +417,12 @@ class VectorbtAdapter(EngineAdapter):
         # ``next_open`` cannot be expressed by vectorbt's close-priced fills, so the
         # execution frame's ``open`` is passed as the fill price. ``same_close`` and
         # ``next_close`` keep vectorbt's native close fill.
+        #
+        # WARNING: vectorbt also uses this ``price`` series to mark the portfolio between
+        # trades (``pf.value()``), so under ``next_open`` that series values positions at
+        # opens rather than closes. UBE never reads ``pf.value()`` — the ledger fold uses
+        # only ``pf.trades.records_readable`` (fills) — but do not reuse this run's
+        # portfolio object for mark-to-market/equity: equity comes from the ledger.
         fill_price = inputs.open if config.execution_timing == "next_open" else None
         sl_stop, tp_stop, sl_trail = exit_stop_params(exits, data, aux_data)
         # Commission only: slippage is applied at the fill price level in the ledger fold,

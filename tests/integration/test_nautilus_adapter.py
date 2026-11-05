@@ -663,12 +663,21 @@ def test_nautilus_full_loop_futures_signal_roundtrip():
 
     fills = _fills(result)
     assert len(fills) == 2
-    # Entry fills at the signal bar's close; the signal exit at the next close.
-    # Quantity floors to the lot grid: 100000 / 5002.5 = 19.99 -> 19 contracts (§7.1).
-    assert [(e.side, e.quantity, e.price, e.exit_reason) for e in fills] == [
-        (1, 19.0, 5002.5, None),
-        (-1, 19.0, 4989.5, "signal"),
+    # §6.1: decisions are decision-time and the default ``next_open`` fills on the
+    # following bar at its open — the entry decided on bar 1 fills on bar 2, the exit
+    # decided on bar 4 fills on bar 5. The synthetic series carries each close into the
+    # next open, so assert against the bars rather than literal prices (a same_close
+    # regression is otherwise invisible on gapless data). Quantity floors to the lot
+    # grid: 100000 / 5002.5 = 19.99 -> 19 contracts (§7.1).
+    ts = md.timestamps.as_unit("ns").asi8
+    assert [(e.side, e.quantity, e.exit_reason) for e in fills] == [
+        (1, 19.0, None),
+        (-1, 19.0, "signal"),
     ]
+    assert fills[0].price == pytest.approx(float(md.open[2]))
+    assert fills[1].price == pytest.approx(float(md.open[5]))
+    assert fills[0].timestamp == int(ts[2])
+    assert fills[1].timestamp == int(ts[5])
     assert sum(e.quantity for e in fills[:-1]) == 19.0  # no scale-out partials
     (trade,) = result.trades
     assert trade.quantity == 19.0
