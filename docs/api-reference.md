@@ -209,7 +209,9 @@ tuple and each exit is evaluated in that order.
 |---|---|---|
 | `StopLoss` | `(percent, trigger='touched')` | Static stop a fixed fraction from entry; never ratchets. |
 | `TakeProfit` | `(percent, scale_out=1.0, trigger='touched')` | Fixed target; `scale_out` exits that fraction (in `(0, 1]`) when hit. |
-| `TrailingStop` | `(percent, trigger='touched')` | Trailing percentage stop off the running peak/trough since entry. |
+| `ATRTakeProfit` | `(mult, trigger='touched', scale_out=1.0, period=14, atr=None)` | Target `mult × ATR` beyond entry (moves with ATR); `scale_out` behaves as for `TakeProfit`. `atr` **must** name an `aux_data` series. |
+| `RiskRewardTP` | `(ratio, stop, trigger='touched', scale_out=1.0)` | Target anchored at entry at `ratio ×` the linked stop's initial risk. `stop` is a `StopLoss`, `ATRStop`, `TrailingStop`, or `ChandelierExit`; a nested ATR stop needs its named `atr` series. |
+| `TrailingStop` | `(percent, trigger='touched', activation=None)` | Trailing percentage stop off the running peak/trough since entry. With `activation`, a static entry-anchored stop applies until price moves that fraction favourably. |
 | `TimeExit` | `(bars)` | Close after N bars held. |
 | `ATRStop` | `(mult, trigger='touched', trailing=False, period=14, atr=None)` | ATR stop (entry-anchored, or ratcheting when `trailing=True`). `atr` **must** name an `aux_data` series. |
 | `ChandelierExit` | `(mult, trigger='touched', period=14, atr=None)` | Running high/low offset by `mult × ATR`. `atr` **must** name an `aux_data` series. |
@@ -234,7 +236,10 @@ without running an engine:
 | `time_exit_mask(cfg, market_data, *, entry_bar=0)` | Per-bar mask for a `TimeExit`. |
 | `is_triggered(trigger, level, *, high, low, close, direction)` | Apply the trigger rule to a raw level array. |
 | `first_reached_exit(levels, *, open_price, triggered=None)` | Which of several touched levels fired first (by distance from the open). |
-| `scale_out_fraction(cfg)` | The fraction an exit takes (only `TakeProfit` is `!= 1.0`). |
+| `scale_out_fraction(cfg)` | The fraction an exit takes (only `TakeProfit` / `ATRTakeProfit` / `RiskRewardTP` can be `!= 1.0`). |
+| `initial_risk_distance(cfg, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Distance from entry to a `RiskRewardTP`'s linked stop level. |
+| `risk_reward_take_profit_level(cfg, market_data, *, side, entry_price, entry_bar=0, atr_series=None)` | Per-bar target level for a `RiskRewardTP`. |
+| `exit_atr_config(cfg)` | The ATR-consuming config an exit references (resolves through a `RiskRewardTP`'s nested stop), or `None`. |
 | `scale_out_plan(exits, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Ordered `ExitPlan` of fractions + per-exit triggered masks. |
 | `size_position(model, *, capital, price, n=None, vol=None, cost_model=None)` | Dispatch a `SizeModel` to its sizer (returns units). |
 | `floor_to_step(units, step)` | Floor sized units onto the instrument's lot grid. |

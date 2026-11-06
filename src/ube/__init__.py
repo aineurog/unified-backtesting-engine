@@ -37,9 +37,11 @@ from ube.core.portfolio import (
 )
 from ube.core.risk import (
     ATRStop,
+    ATRTakeProfit,
     ChandelierExit,
     Exit,
     RiskConfig,
+    RiskRewardTP,
     SizeModel,
     StopLoss,
     TakeProfit,
@@ -61,11 +63,12 @@ from ube import papertrading as paper  # noqa: E402
 
 sys.modules["ube.paper"] = paper
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AUTO_ENGINE_ORDER",
     "ATRStop",
+    "ATRTakeProfit",
     "AllocationPolicy",
     "BacktestConfig",
     "BenchmarkConfig",
@@ -81,6 +84,7 @@ __all__ = [
     "MarketData",
     "PortfolioConfig",
     "RiskConfig",
+    "RiskRewardTP",
     "SignalConfig",
     "Signals",
     "SizeModel",

@@ -21,7 +21,7 @@ from ube.core.errors import EngineError
 from ube.core.execution import ExecutionTiming
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, trades
 from ube.core.risk import RiskConfig
-from ube.core.risk.exits import ATRStop, TakeProfit
+from ube.core.risk.exits import ATRStop, RiskRewardTP, TakeProfit, TrailingStop
 from ube.core.risk.sizing import SizeModel
 from ube.core.signals import Signals, from_target
 from ube.papertrading import get_paper_engine, get_state_class, init, run
@@ -301,6 +301,12 @@ def test_max_atr_period() -> None:
 
     assert _max_atr_period(Risk()) == 14
     assert _max_atr_period(None) == 0
+
+    class NestedRisk:
+        exit = (RiskRewardTP(2.0, ATRStop(14, period=21, atr="atr_x")),)
+
+    # A ``RiskRewardTP`` references its nested stop's ATR series.
+    assert _max_atr_period(NestedRisk()) == 21
 
 
 # ---------------------------------------------------------------------------
@@ -694,3 +700,49 @@ def test_fresh_start_from_ns_suppresses_pre_anchor_entries() -> None:
         state2, _ = run("x", data, signals, cfg, db_path=db2)
         legacy = _summary(state2, cfg)
     assert any(entry_ts < anchor_ns for _, _, entry_ts, _ in legacy), legacy
+
+
+def test_trailing_stop_activation_holds_static_stop() -> None:
+    """An activated trailing stop keeps the entry stop until the move arms it."""
+    md = MarketData.from_records(
+        [
+            {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+             "volume": 1000.0, "timestamp": "2024-01-01T00:00:00Z"},
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5,
+             "volume": 1000.0, "timestamp": "2024-01-01T01:00:00Z"},
+            {"open": 100.5, "high": 103.0, "low": 95.5, "close": 100.0,
+             "volume": 1000.0, "timestamp": "2024-01-01T02:00:00Z"},
+            {"open": 103.0, "high": 106.0, "low": 103.0, "close": 105.0,
+             "volume": 1000.0, "timestamp": "2024-01-01T03:00:00Z"},
+            {"open": 105.0, "high": 105.0, "low": 99.0, "close": 100.0,
+             "volume": 1000.0, "timestamp": "2024-01-01T04:00:00Z"},
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+             "volume": 1000.0, "timestamp": "2024-01-01T05:00:00Z"},
+        ]
+    )
+    signals = from_target(np.array([1, 1, 1, 1, 1, 1]))
+    bar_of = {int(t): i for i, t in enumerate(md.timestamps.as_unit("ns").asi8)}
+    instr = PRESETS[AC].instrument
+
+    def _run(exit_cfg):
+        bc = BacktestConfig(
+            instrument=instr,
+            signal=SignalConfig(on_opposite_signal="reverse"),
+            risk=RiskConfig(exit=(exit_cfg,)),
+        )
+        cfg = PaperConfig(base=bc, engine="vectorbt", starting_balance=10_000.0)
+        state = init(cfg)
+        _, events = step(md, signals, state, cfg)
+        return [
+            e
+            for e in events
+            if e.event_type is EventType.FILL and e.exit_reason == "trailing_stop"
+        ]
+
+    (plain,) = _run(TrailingStop(0.05))
+    (activated,) = _run(TrailingStop(0.05, activation=0.05))
+
+    # Plain trails off bar 2's high (103 * 0.95 = 97.85); activation survives bar 2's
+    # 95.5 low with the static 95 stop and exits on bar 4 at 106 * 0.95 = 100.7.
+    assert (bar_of[int(plain.timestamp)], plain.price) == (2, pytest.approx(97.85))
+    assert (bar_of[int(activated.timestamp)], activated.price) == (4, pytest.approx(100.7))

@@ -94,13 +94,16 @@ from ube.core.risk.aux import (
 )
 from ube.core.risk.exits import (
     ATRStop,
+    ATRTakeProfit,
     ChandelierExit,
     Exit,
     ExitPlan,
+    RiskRewardTP,
     StopLoss,
     TakeProfit,
     TimeExit,
     TrailingStop,
+    exit_atr_config,
     exit_level,
     scale_out_plan,
 )
@@ -123,6 +126,8 @@ _NO_SIGNAL: tuple[bool, bool, bool, bool] = (False, False, False, False)
 #: `RiskConfig.exit` type -> §4.6 exit_reason string.
 _EXIT_REASONS: dict[type, str] = {
     TakeProfit: "take_profit",
+    ATRTakeProfit: "take_profit",
+    RiskRewardTP: "take_profit",
     StopLoss: "stop_loss",
     ATRStop: "atr_stop",
     TrailingStop: "trailing_stop",
@@ -162,6 +167,7 @@ class _LiveExit:
     reason: str
     fraction: float
     levels: np.ndarray | None = None
+    limit: bool = False
 
 
 @dataclass
@@ -322,7 +328,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
         Returns ``None`` for exits that need no ATR (e.g. ``TrailingStop``); the core
         level functions compute their running extremes from the bars directly.
         """
-        if isinstance(cfg, (ATRStop, ChandelierExit)):
+        if exit_atr_config(cfg) is not None:
             return atr_series_for_exit(cfg, self._aux_atr, self._market_data)
         return None
 
@@ -548,7 +554,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 atr_series=self._resolve_exit_atr(cfg),
             )
             exit_side = OrderSide.SELL if side > 0 else OrderSide.BUY
-            if isinstance(cfg, TakeProfit):
+            if isinstance(cfg, (TakeProfit, ATRTakeProfit, RiskRewardTP)):
                 target = float(levels[entry_bar])
                 oqty = self._scaled_quantity(size, fraction)
                 if oqty is None:
@@ -564,7 +570,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
                 self._record_order(order, entry_bar_ts)
                 self._fill_reasons[str(order.client_order_id)] = reason
                 book.live[str(order.client_order_id)] = _LiveExit(
-                    order=order, reason=reason, fraction=fraction
+                    order=order, reason=reason, fraction=fraction, levels=levels, limit=True
                 )
             else:
                 # StopLoss / ATRStop / TrailingStop / Chandelier: a native stop_market
@@ -649,20 +655,33 @@ class UbeActor(Strategy):  # type: ignore[misc]
             decision_idx = idx - int(
                 cast(UbeActorConfig, self.config).decision_bar_offset
             )
-            trigger = None
+            target = None
             if live.levels is not None and 0 <= decision_idx < n:
-                trigger = self._fmt_price(float(live.levels[decision_idx]))
+                target = self._fmt_price(float(live.levels[decision_idx]))
             qty_same = float(order.quantity.as_double()) == float(new_qty.as_double())
-            trigger_same = trigger is not None and order.trigger_price is not None and (
-                float(order.trigger_price.as_double()) == float(trigger)
-            )
-            if qty_same and (trigger is None or trigger_same):
+            if live.limit:
+                # A limit take-profit is re-priced to the moving core level (an ATR
+                # take-profit moves with ATR); a fixed TakeProfit's level never changes.
+                target_same = target is None or (
+                    order.price is not None
+                    and float(order.price.as_double()) == float(target)
+                )
+                price_kw = "price"
+            else:
+                target_same = target is None or (
+                    order.trigger_price is not None
+                    and float(order.trigger_price.as_double()) == float(target)
+                )
+                price_kw = "trigger_price"
+            if qty_same and target_same:
                 continue
             try:
-                if trigger is not None and not qty_same:
-                    self.modify_order(order, quantity=new_qty, trigger_price=trigger)
-                elif trigger is not None:
-                    self.modify_order(order, trigger_price=trigger)
+                if target is not None and not qty_same:
+                    self.modify_order(
+                        order, quantity=new_qty, **{price_kw: target}
+                    )
+                elif target is not None:
+                    self.modify_order(order, **{price_kw: target})
                 elif not qty_same:
                     self.modify_order(order, quantity=new_qty)
             except Exception:  # noqa: BLE001 — a rejected modify is non-fatal here.

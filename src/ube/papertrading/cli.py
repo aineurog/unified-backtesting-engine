@@ -14,8 +14,11 @@ The YAML shape mirrors what :func:`ube.papertrading.core.init` serializes
   * exits **must** carry a ``_type`` discriminator for ``StopLoss`` vs ``TrailingStop``
     (both are ``percent``-only and indistinguishable without it); other exits may omit
     ``_type`` and are inferred from keys. Supported ``_type`` values: ``TakeProfit``,
-    ``StopLoss``, ``ATRStop``, ``TrailingStop``, ``TimeExit``, ``ChandelierExit``.
+    ``ATRTakeProfit``, ``RiskRewardTP``, ``StopLoss``, ``ATRStop``, ``TrailingStop``,
+    ``TimeExit``, ``ChandelierExit``.
     Without ``_type`` for the ambiguous pair the loader raises ``ConfigError``.
+  * a ``RiskRewardTP`` carries a nested ``stop`` mapping which is rebuilt recursively
+    with the same rules (so a nested ``StopLoss`` / ``TrailingStop`` also needs ``_type``).
   * an optional ``paper`` mapping on the top level carries ``PaperConfig``-only fields
     (``state_path``, ``starting_balance``, ``engine``).
 """
@@ -36,8 +39,10 @@ from ube.core.instrument import Instrument
 from ube.core.risk import RiskConfig
 from ube.core.risk.exits import (
     ATRStop,
+    ATRTakeProfit,
     ChandelierExit,
     Exit,
+    RiskRewardTP,
     StopLoss,
     TakeProfit,
     TimeExit,
@@ -57,9 +62,15 @@ def _rebuild_exit(data: dict[str, Any]) -> Exit:
     """Rebuild one exit config, using a ``_type`` discriminator if present (§20)."""
     data = dict(data)
     etype = data.pop("_type", None)
+    if "stop" in data and isinstance(data["stop"], dict):
+        data["stop"] = _rebuild_exit(
+            _require_mapping(data["stop"], "RiskRewardTP.stop")
+        )
     if etype is not None:
         cls: type[Exit] | None = {
             "TakeProfit": TakeProfit,
+            "ATRTakeProfit": ATRTakeProfit,
+            "RiskRewardTP": RiskRewardTP,
             "StopLoss": StopLoss,
             "ATRStop": ATRStop,
             "TrailingStop": TrailingStop,
@@ -73,14 +84,22 @@ def _rebuild_exit(data: dict[str, Any]) -> Exit:
         return exit_obj
     # Bare asdict form (no discriminator). Disambiguate by fields; StopLoss vs TrailingStop
     # are indistinguishable from keys, so require _type for those.
+    if "ratio" in data:
+        return RiskRewardTP(**data)
     if "bars" in data:
         return TimeExit(**data)
-    if "scale_out" in data:
-        return TakeProfit(**data)
     if "mult" in data:
+        if "scale_out" in data:
+            return ATRTakeProfit(**data)
         if "trailing" in data:
             return ATRStop(**data)
         return ChandelierExit(**data)
+    if "scale_out" in data:
+        return TakeProfit(**data)
+    # ``asdict`` keeps ``activation: null`` for TrailingStop, which distinguishes it from
+    # a bare StopLoss; a hand-written percent-only mapping stays ambiguous on purpose.
+    if "activation" in data:
+        return TrailingStop(**data)
     if "percent" in data:
         raise ConfigError(
             "cannot disambiguate StopLoss vs TrailingStop from a bare asdict YAML; "

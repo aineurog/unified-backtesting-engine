@@ -28,11 +28,14 @@ from ube.core.risk.aux import (
 )
 from ube.core.risk.exits import (
     ATRStop,
+    ATRTakeProfit,
     ChandelierExit,
+    RiskRewardTP,
     StopLoss,
     TakeProfit,
     TimeExit,
     TrailingStop,
+    exit_atr_config,
     exit_level,
     exit_triggered,
     first_reached_exit,
@@ -91,8 +94,10 @@ def exit_stop_params(
 
     ``sl_stop`` is the tightest per-bar stop fraction over every **non-trailing** stop-type
     exit (fixed ``StopLoss`` and non-trailing ``ATRStop`` fractions — merged via per-bar
-    minimum); ``tp_stop`` is the tightest ``TakeProfit`` fraction; ``sl_trail`` is always
-    ``None``.
+    minimum); ``tp_stop`` is the tightest take-profit fraction (``TakeProfit`` and
+    ``ATRTakeProfit``). A ``RiskRewardTP`` is entry-anchored and depends on the entry
+    price, so it is left out of the native target and resolved by the core re-timing
+    fold instead. ``sl_trail`` is always ``None``.
 
     Take-profit scale-outs (``scale_out < 1.0``, §6.4) cannot be represented: vectorbt's
     single ``tp_stop`` closes the whole position. Rather than silently exiting 100% on the
@@ -114,6 +119,8 @@ def exit_stop_params(
     """
     # The tightest take-profit owns vectorbt's single ``tp_stop``.
     tp_percents: list[float] = []
+    # ATR take-profit distances are per-bar (ATR moves), unlike a fixed percent.
+    tp_fractions: list[np.ndarray] = []
     # Non-trailing stop distances merged into one per-bar ``sl_stop``.
     all_fractions: list[np.ndarray] = []
     # Scalar StopLoss broadcast to a per-bar array.
@@ -129,6 +136,31 @@ def exit_stop_params(
                     "nautilus for partial exits"
                 )
             tp_percents.append(float(exit.percent))
+        elif isinstance(exit, ATRTakeProfit):
+            if exit.scale_out < 1.0:
+                raise IncompatibleConfigError(
+                    "vectorbt cannot simulate take-profit scale-outs (§6.4): "
+                    f"ATRTakeProfit(mult={exit.mult}, scale_out={exit.scale_out}) "
+                    "closes the whole position on one vectorbt exit; use backtrader or "
+                    "nautilus for partial exits"
+                )
+            series = atr_series_for_exit(exit, aux_data, data)
+            tp_fractions.append(
+                exit.mult * series / np.where(data.close > 0, data.close, np.nan)
+            )
+        elif isinstance(exit, RiskRewardTP):
+            # The target is entry-anchored, but its distance depends on the entry price
+            # and the linked stop's initial risk — neither is available here. Leaving it
+            # out of vectorbt's native ``tp_stop`` is safe: the leg stays open and the
+            # core re-timing fold books the fill at the target bar/level.
+            if exit.scale_out < 1.0:
+                raise IncompatibleConfigError(
+                    "vectorbt cannot simulate take-profit scale-outs (§6.4): "
+                    f"RiskRewardTP(ratio={exit.ratio}, scale_out={exit.scale_out}) "
+                    "closes the whole position on one vectorbt exit; use backtrader or "
+                    "nautilus for partial exits"
+                )
+            continue
         elif isinstance(exit, StopLoss):
             sl_scalar = exit.percent if sl_scalar is None else sl_scalar
         elif isinstance(exit, ATRStop):
@@ -155,7 +187,19 @@ def exit_stop_params(
             combined = np.minimum(combined, frac)
         sl_stop = np.nan_to_num(combined, nan=0.0)
 
-    tp_stop: float | None = min(tp_percents) if tp_percents else None
+    tp_candidates = list(tp_fractions)
+    if tp_percents:
+        tp_candidates.append(np.full(n, min(tp_percents)))
+    tp_stop: Any = None
+    if tp_candidates:
+        combined_tp = tp_candidates[0]
+        for frac in tp_candidates[1:]:
+            combined_tp = np.minimum(combined_tp, frac)
+        tp_stop = (
+            np.nan_to_num(combined_tp, nan=0.0)
+            if tp_fractions
+            else float(min(tp_percents))
+        )
 
     # Never trail natively: vectorbt's single trailing primitive cannot represent a
     # heterogeneous stop set (see the docstring). ``None`` disables the trailing mechanism.
@@ -164,7 +208,7 @@ def exit_stop_params(
 
 def _exit_reason_name(exit: Any) -> str | None:
     """The canonical §4.6 reason string for an exit config (None for unknown types)."""
-    if isinstance(exit, TakeProfit):
+    if isinstance(exit, (TakeProfit, ATRTakeProfit, RiskRewardTP)):
         return "take_profit"
     if isinstance(exit, ATRStop):
         return "atr_stop"
@@ -200,7 +244,7 @@ def _exits_fired_at(
     for exit in exits:
         series = (
             atr_series_for_exit(exit, aux_data, data)
-            if isinstance(exit, (ATRStop, ChandelierExit))
+            if exit_atr_config(exit) is not None
             else None
         )
         if not bool(

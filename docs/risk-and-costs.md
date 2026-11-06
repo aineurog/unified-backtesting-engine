@@ -55,13 +55,15 @@ is missing the adapter raises `ConfigError` before the engine runs.
 ## Exits
 
 `RiskConfig.exit` accepts a single exit or an ordered sequence of exits. The
-core exposes six exit configs:
+core exposes eight exit configs:
 
 | Class | Signature | Description |
 |---|---|---|
 | `StopLoss` | `(percent, trigger="touched")` | Static stop a fixed fraction from entry; never ratchets. |
 | `TakeProfit` | `(percent, scale_out=1.0, trigger="touched")` | Fixed target a fraction beyond entry; can partially scale out. |
-| `TrailingStop` | `(percent, trigger="touched")` | Percentage stop that trails the running peak (long) / trough (short) since entry. |
+| `ATRTakeProfit` | `(mult, trigger="touched", scale_out=1.0, period=14, atr=None)` | Target `mult × ATR` beyond entry; moves with ATR and can partially scale out. Requires a named `atr` aux series. |
+| `RiskRewardTP` | `(ratio, stop, trigger="touched", scale_out=1.0)` | Target at `ratio ×` the linked stop's initial risk, anchored at entry; can partially scale out. |
+| `TrailingStop` | `(percent, trigger="touched", activation=None)` | Percentage stop that trails the running peak (long) / trough (short) since entry. With `activation`, a static entry-anchored stop applies until price moves that fraction favourably. |
 | `ATRStop` | `(mult, trigger="touched", trailing=False, period=14, atr=None)` | Stop `mult × ATR` from entry; `trailing=True` ratchets it. Requires a named `atr` aux series. |
 | `ChandelierExit` | `(mult, trigger="touched", period=14, atr=None)` | Running high/low offset by `mult × ATR`. Requires a named `atr` aux series. |
 | `TimeExit` | `(bars)` | Close once the position has been held `bars` bars. |
@@ -77,6 +79,15 @@ Every price-level exit has a `trigger`:
 `TimeExit` has no `trigger`; time is discrete, so there is no touched/close
 ambiguity.
 
+### Holding-period exits and calendar durations
+
+`TimeExit(bars)` counts **bars**, not wall-clock time. A UI that offers durations such
+as `"12h"` converts them to a bar count from the signal bar interval (`12h / 1h = 12`)
+before building the config; `max_duration`-style inputs are likewise the caller's
+responsibility. UBE deliberately performs no exchange-calendar or session-aware
+duration math, so intra-day breaks, holidays, and timezone shifts do not change the
+bar count.
+
 ```python
 ube.StopLoss(percent=0.02)                     # intrabar touch
 ube.StopLoss(percent=0.02, trigger="close")    # close-only confirmation
@@ -90,6 +101,9 @@ ube.StopLoss(percent=0.02)
 
 # Fixed target: long target = entry * (1 + percent), short target = entry * (1 - percent)
 ube.TakeProfit(percent=0.04)
+
+# ATR-scaled target: long target = entry + mult * ATR, short target = entry - mult * ATR
+ube.ATRTakeProfit(mult=2.0, period=14, atr="atr_1h")
 
 # Trailing percentage stop: long stop = running_high * (1 - percent)
 ube.TrailingStop(percent=0.02)
@@ -109,14 +123,41 @@ ube.TimeExit(bars=24)
 ```
 
 Stops (`StopLoss`, `TrailingStop`, `ATRStop`, `ChandelierExit`, `TimeExit`)
-always exit **100%** of the remaining position. Only `TakeProfit` can exit a
-fragment; see scale-out below.
+always exit **100%** of the remaining position. Only the take-profits
+(`TakeProfit`, `ATRTakeProfit`, `RiskRewardTP`) can exit a fragment; see scale-out
+below.
+
+### Risk/reward take-profit
+
+`RiskRewardTP` anchors a target at a multiple of the linked stop's *initial* risk:
+
+```python
+stop = ube.StopLoss(percent=0.02)
+exit=(
+    stop,
+    ube.RiskRewardTP(ratio=2.0, stop=stop),   # entry ± 2 × (entry × 0.02)
+)
+```
+
+The risk reference depends on the linked stop:
+
+| Linked stop | Initial risk |
+|---|---|
+| `StopLoss`, `TrailingStop` | `entry × percent` |
+| `ATRStop` | `mult × ATR` at the entry bar |
+| `ChandelierExit` | distance from entry to the entry bar's chandelier level |
+
+The target is set once at entry and does not follow a trailing stop. An
+ATR-consuming linked stop (or `ChandelierExit`) requires the same named `atr`
+aux series as configuring that stop directly; the library never computes ATR from
+the signal bars. The linked stop is a *risk reference*: list it in the same
+`exit` tuple (as above) when you also want it to trade.
 
 ### ATR and Chandelier need auxiliary data
 
-`ATRStop` and `ChandelierExit` never compute ATR from the signal bars. They must
-name an `aux_data` entry via the `atr` key, and you must supply it. A missing
-name raises `ConfigError` before the engine starts:
+`ATRStop`, `ATRTakeProfit`, and `ChandelierExit` never compute ATR from the
+signal bars. They must name an `aux_data` entry via the `atr` key, and you must
+supply it. A missing name raises `ConfigError` before the engine starts:
 
 ```text
 ConfigError: ATRStop requires an 'atr' key referencing an aux_data series (§5.2);
@@ -139,7 +180,17 @@ ube.run(md, signals, config, aux_data={"atr_4h": market_data_4h})
 
 When a `MarketData` is supplied, it must span the signal/price period (start at
 or before the first bar and reach within one aux bar of the last), or the adapter
-raises `DataShapeError`. See
+raises `DataShapeError`.
+
+**Causality.** A `MarketData` aux series is shifted one aux bar before it is
+forward-filled, so a main bar never sees the ATR of the aux bar it is inside. A
+precomputed array is used **verbatim**: if you derive it from the same bars you are
+backtesting, lag it yourself (for example, shift it one bar and fill the first value)
+so the number an entry-anchored exit reads at `entry_bar` was known before that bar
+closed. This matters most for levels fixed at entry — a non-trailing `ATRStop`, and a
+`RiskRewardTP` whose linked stop is an `ATRStop` or `ChandelierExit` — which read the
+ATR at `entry_bar` once. The adapter does not auto-lag precomputed arrays; that
+remains the caller's responsibility. See
 [Tutorial 3](tutorials.md#tutorial-3-atr-based-exits-with-auxiliary-data) and
 [Tutorial 11](tutorials.md#tutorial-11-engine-computed-atr-from-aux-bars) for
 worked examples.

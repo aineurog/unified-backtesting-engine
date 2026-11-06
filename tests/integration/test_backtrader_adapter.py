@@ -56,7 +56,9 @@ from ube.core.result import BacktestResult
 from ube.core.risk import RiskConfig, SizeModel
 from ube.core.risk.exits import (
     ATRStop,
+    ATRTakeProfit,
     ChandelierExit,
+    RiskRewardTP,
     StopLoss,
     TakeProfit,
     TimeExit,
@@ -234,6 +236,10 @@ def test_validate_aux_passes_when_atr_series_present():
 
 def test_exit_reason_label_maps_canonical_exits():
     assert exit_reason_label(TakeProfit(0.05)) == "take_profit"
+    assert exit_reason_label(ATRTakeProfit(mult=2.0, atr="a")) == "take_profit"
+    assert (
+        exit_reason_label(RiskRewardTP(2.0, StopLoss(0.02))) == "take_profit"
+    )
     assert exit_reason_label(ATRStop(atr="a", mult=2.0)) == "atr_stop"
     assert exit_reason_label(TrailingStop(0.01)) == "trailing_stop"
     assert exit_reason_label(ChandelierExit(atr="a", mult=3.0)) == "chandelier"
@@ -260,6 +266,39 @@ def test_build_exit_plan_is_causal_and_anchored():
     assert not plan[0].triggered[:1].any()
     assert not plan[1].triggered[:1].any()
     assert plan[0].triggered.dtype == np.bool_ or plan[0].triggered.dtype == bool
+
+
+def test_build_exit_plan_activation_delays_trailing_stop():
+    md = MarketData(
+        open=np.array([100, 100, 100, 100, 103, 105, 100, 100, 100, 100], dtype=float),
+        high=np.array([101, 101, 102, 104, 106, 105, 101, 101, 101, 101], dtype=float),
+        low=np.array([99, 99, 99, 95.5, 103, 99, 99, 99, 99, 99], dtype=float),
+        close=np.array([100, 100, 100, 103, 105, 100, 100, 100, 100, 100], dtype=float),
+        volume=np.ones(10),
+        index=pd.date_range("2024-01-01", periods=10, freq="h", tz="UTC"),
+    )
+    (plain,) = build_exit_plan(
+        (TrailingStop(0.05),), md, side=1, entry_price=100.0, entry_bar=2
+    )
+    (activated,) = build_exit_plan(
+        (TrailingStop(0.05, activation=0.05),),
+        md,
+        side=1,
+        entry_price=100.0,
+        entry_bar=2,
+    )
+
+    # Plain trails off bar 3's high (104 * 0.95 = 98.8), which that bar's low touches.
+    assert plain.reason == "trailing_stop"
+    assert plain.triggered[3]
+
+    # Activation needs entry * 1.05 = 105, first reached on bar 4. The trailing level
+    # (106 * 0.95 = 100.7) is first touched by bar 5's low, so nothing fires earlier.
+    assert activated.reason == "trailing_stop"
+    assert not activated.triggered[:5].any()
+    assert activated.triggered[5]
+    assert activated.level is not None
+    assert activated.level[5] == pytest.approx(100.7)
 
 
 def test_atr_from_aux_has_no_lookahead_shift():
@@ -682,6 +721,125 @@ def test_volatility_target_missing_vol_key_raises():
 
 
 
+def test_build_exit_plan_atr_take_profit_level_and_reason():
+    md = MarketData(
+        open=np.array([100.0, 100.0, 101.0, 103.0, 105.0, 107.0]),
+        high=np.array([101.0, 102.0, 104.0, 106.0, 108.0, 110.0]),
+        low=np.array([99.0, 99.5, 100.5, 102.5, 104.5, 106.5]),
+        close=np.array([100.0, 101.0, 103.0, 105.0, 107.0, 109.0]),
+        volume=np.ones(6),
+        index=pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+    )
+    plan = build_exit_plan(
+        (ATRTakeProfit(3.0, atr="atr_1h"),),
+        md,
+        side=1,
+        entry_price=100.0,
+        entry_bar=1,
+        atr_map={0: np.ones(6)},
+    )
+    assert len(plan) == 1
+    line = plan[0]
+    assert line.reason == "take_profit"
+    assert line.fraction == pytest.approx(1.0)
+    assert line.level is not None
+    np.testing.assert_allclose(line.level, 103.0)  # anchored at entry_price 100
+    np.testing.assert_array_equal(line.triggered, [False, False, True, True, True, True])
+
+
+def test_build_exit_plan_risk_reward_tp_level_and_reason():
+    md = MarketData(
+        open=np.array([100.0, 100.0, 101.0, 103.0, 105.0, 107.0]),
+        high=np.array([101.0, 102.0, 104.0, 106.0, 108.0, 110.0]),
+        low=np.array([99.0, 99.5, 100.5, 102.5, 104.5, 106.5]),
+        close=np.array([100.0, 101.0, 103.0, 105.0, 107.0, 109.0]),
+        volume=np.ones(6),
+        index=pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+    )
+    plan = build_exit_plan(
+        (RiskRewardTP(2.0, StopLoss(0.02)),),
+        md,
+        side=1,
+        entry_price=100.0,
+        entry_bar=1,
+    )
+    line = plan[0]
+    assert line.reason == "take_profit"
+    assert line.fraction == pytest.approx(1.0)
+    assert line.level is not None
+    np.testing.assert_allclose(line.level, 104.0)  # risk 100*0.02=2, ratio 2
+    np.testing.assert_array_equal(line.triggered, [False, False, True, True, True, True])
+
+
+def test_risk_reward_tp_exits_at_target():
+    md = MarketData(
+        open=np.array([100.0, 100.0, 101.0, 103.0, 105.0, 107.0]),
+        high=np.array([101.0, 102.0, 104.0, 106.0, 108.0, 110.0]),
+        low=np.array([99.0, 99.5, 100.5, 102.5, 104.5, 106.5]),
+        close=np.array([100.0, 101.0, 103.0, 105.0, 107.0, 109.0]),
+        volume=np.ones(6),
+        index=pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+    )
+    result = BacktraderAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(RiskRewardTP(2.0, StopLoss(0.02)),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_reason == "take_profit"
+    # Entry 101; risk = 101 * 0.02 = 2.02; ratio 2 -> target 105.04.
+    assert result.trades[0].entry_price == pytest.approx(101.0, abs=1e-9)
+    assert result.trades[0].exit_price == pytest.approx(105.04, abs=1e-9)
+
+
+def test_risk_reward_tp_with_nested_atr_stop_exits_at_target():
+    md = MarketData(
+        open=np.array([100.0, 100.0, 101.0, 103.0, 105.0, 107.0]),
+        high=np.array([101.0, 102.0, 104.0, 106.0, 108.0, 110.0]),
+        low=np.array([99.0, 99.5, 100.5, 102.5, 104.5, 106.5]),
+        close=np.array([100.0, 101.0, 103.0, 105.0, 107.0, 109.0]),
+        volume=np.ones(6),
+        index=pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+    )
+    result = BacktraderAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(
+                exit=(RiskRewardTP(2.0, ATRStop(2.0, atr="atr_1h")),)
+            ),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+        aux_data={"atr_1h": np.ones(md.n_bars)},
+    )
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_reason == "take_profit"
+    # ATR 1 at entry_bar -> risk 2, ratio 2 -> target 101 + 4 = 105.
+    assert result.trades[0].entry_price == pytest.approx(101.0, abs=1e-9)
+    assert result.trades[0].exit_price == pytest.approx(105.0, abs=1e-9)
+
+
+def test_risk_reward_tp_nested_atr_stop_requires_aux_data():
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=20)
+    with pytest.raises(ConfigError, match="aux_data"):
+        BacktraderAdapter().run(
+            md,
+            from_target([0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            BacktestConfig(
+                instrument=PRESETS["crypto_perp"].instrument,
+                risk=RiskConfig(
+                    exit=(RiskRewardTP(2.0, ATRStop(2.0, atr="atr_1h")),)
+                ),
+                engine_overrides={"starting_balance": 100000.0},
+            ),
+        )
+
+
 def test_aux_atr_stop_runs_with_aux_data():
     md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=20)
     aux = {"atr_1h": synthetic_bars(PRESETS["crypto_perp"], seed=1, n_bars=20)}
@@ -697,6 +855,33 @@ def test_aux_atr_stop_runs_with_aux_data():
     )
     assert len(result.trades) >= 1
 
+
+
+def test_atr_take_profit_exits_at_target():
+    md = MarketData(
+        open=np.array([100.0, 100.0, 101.0, 103.0, 105.0, 107.0]),
+        high=np.array([101.0, 102.0, 104.0, 106.0, 108.0, 110.0]),
+        low=np.array([99.0, 99.5, 100.5, 102.5, 104.5, 106.5]),
+        close=np.array([100.0, 101.0, 103.0, 105.0, 107.0, 109.0]),
+        volume=np.ones(6),
+        index=pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+    )
+    result = BacktraderAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(ATRTakeProfit(3.0, atr="atr_1h"),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+        aux_data={"atr_1h": np.ones(md.n_bars)},
+    )
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_reason == "take_profit"
+    # Entry is the bar after the target transition (bar 2 open 101); the ATR target is
+    # 101 + 3 * 1 = 104.
+    assert result.trades[0].entry_price == pytest.approx(101.0, abs=1e-9)
+    assert result.trades[0].exit_price == pytest.approx(104.0, abs=1e-9)
 
 
 def test_aux_guard_raises_without_aux_data():

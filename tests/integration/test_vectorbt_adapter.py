@@ -59,7 +59,9 @@ from ube.core.result import BacktestResult
 from ube.core.risk import RiskConfig, SizeModel
 from ube.core.risk.exits import (
     ATRStop,
+    ATRTakeProfit,
     ChandelierExit,
+    RiskRewardTP,
     StopLoss,
     TakeProfit,
     TimeExit,
@@ -276,6 +278,91 @@ def test_exit_stop_params_uses_tightest_take_profit():
     exits = (TakeProfit(0.10), TakeProfit(0.03))
     _, tp_stop, _ = exit_stop_params(exits, md, None)
     assert tp_stop == 0.03
+
+
+def test_exit_stop_params_translates_atr_take_profit():
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    aux = {"atr_1h": np.full(md.n_bars, 2.0)}
+    exits = (ATRTakeProfit(3.0, atr="atr_1h"),)
+    _, tp_stop, _ = exit_stop_params(exits, md, aux)
+    assert isinstance(tp_stop, np.ndarray)
+    np.testing.assert_allclose(tp_stop, 3.0 * 2.0 / md.close)
+
+
+def test_exit_stop_params_rejects_atr_take_profit_scale_out():
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    aux = {"atr_1h": np.full(md.n_bars, 2.0)}
+    exits = (ATRTakeProfit(3.0, atr="atr_1h", scale_out=0.5),)
+    with pytest.raises(IncompatibleConfigError, match="scale-out"):
+        exit_stop_params(exits, md, aux)
+
+
+def test_exit_stop_params_omits_risk_reward_tp_target():
+    # The RR target depends on the entry price, so it is left to the core re-timing fold.
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    exits = (RiskRewardTP(2.0, StopLoss(0.02)),)
+    _, tp_stop, _ = exit_stop_params(exits, md, None)
+    assert tp_stop is None
+    # A fixed target still owns vectorbt's single ``tp_stop``.
+    exits = (RiskRewardTP(2.0, StopLoss(0.02)), TakeProfit(0.05))
+    _, tp_stop, _ = exit_stop_params(exits, md, None)
+    assert tp_stop == 0.05
+
+
+def test_exit_stop_params_rejects_risk_reward_tp_scale_out():
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    exits = (RiskRewardTP(2.0, StopLoss(0.02), scale_out=0.5),)
+    with pytest.raises(IncompatibleConfigError, match="scale-out"):
+        exit_stop_params(exits, md, None)
+
+
+def _atr_take_profit_bars() -> MarketData:
+    return MarketData(
+        open=np.array([100.0, 100.0, 101.0, 103.0, 105.0, 107.0]),
+        high=np.array([101.0, 102.0, 104.0, 106.0, 108.0, 110.0]),
+        low=np.array([99.0, 99.5, 100.5, 102.5, 104.5, 106.5]),
+        close=np.array([100.0, 101.0, 103.0, 105.0, 107.0, 109.0]),
+        volume=np.ones(6),
+        index=pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+    )
+
+
+def test_vectorbt_atr_take_profit_exits_at_target():
+    md = _atr_take_profit_bars()
+    result = VectorbtAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(ATRTakeProfit(3.0, atr="atr_1h"),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+        aux_data={"atr_1h": np.ones(md.n_bars)},
+    )
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_reason == "take_profit"
+    # Entry is the bar after the target transition (bar 2 open 101); the ATR target is
+    # 101 + 3 * 1 = 104.
+    assert result.trades[0].entry_price == pytest.approx(101.0, abs=1e-9)
+    assert result.trades[0].exit_price == pytest.approx(104.0, abs=1e-9)
+
+
+def test_vectorbt_risk_reward_tp_exits_at_target():
+    md = _atr_take_profit_bars()
+    result = VectorbtAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(RiskRewardTP(2.0, StopLoss(0.02)),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_reason == "take_profit"
+    # Entry is 101 (bar 2 open); risk = 101 * 0.02 = 2.02, ratio 2 -> target 105.04.
+    assert result.trades[0].entry_price == pytest.approx(101.0, abs=1e-9)
+    assert result.trades[0].exit_price == pytest.approx(105.04, abs=1e-9)
 
 
 def test_exit_stop_params_rejects_take_profit_scale_out():
@@ -625,6 +712,53 @@ def test_vectorbt_trailing_stop_stamps_exit_reason():
     assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "trailing_stop")]
     (trade,) = result.trades
     assert trade.exit_reason == "trailing_stop"
+
+
+def test_vectorbt_trailing_stop_activation_delays_exit_to_trailed_level():
+    """Activation keeps the static entry stop until the move arms the ratchet (§8).
+
+    Plain trailing trails off bar 3's high and closes there at 104 * 0.95 = 98.8. With a
+    5% activation, the static stop (95) survives bar 3 (low 95.5), the high reaches 106
+    on bar 4, and the trailed level 106 * 0.95 = 100.7 fires on bar 5's low.
+    """
+    md = MarketData(
+        open=np.array([100, 100, 100, 100, 103, 105, 100, 100, 100, 100], dtype=float),
+        high=np.array([101, 101, 102, 104, 106, 105, 101, 101, 101, 101], dtype=float),
+        low=np.array([99, 99, 99, 95.5, 103, 99, 99, 99, 99, 99], dtype=float),
+        close=np.array([100, 100, 100, 103, 105, 100, 100, 100, 100, 100], dtype=float),
+        volume=np.ones(10),
+        index=pd.date_range("2024-01-01", periods=10, freq="h", tz="UTC"),
+    )
+    ts = bar_timestamps_ns(md)
+    bar_of = {int(t): i for i, t in enumerate(ts)}
+    signals = from_target(np.array([0, 1, 1, 1, 1, 1, 1, 0, 0, 0]))
+
+    def _run(exit_cfg):
+        return VectorbtAdapter().run(
+            md,
+            signals,
+            BacktestConfig(
+                instrument=PRESETS["crypto_perp"].instrument,
+                risk=RiskConfig(exit=(exit_cfg,)),
+                engine_overrides={
+                    "starting_balance": 100000.0,
+                    "funding_interval_hours": 1.0,
+                },
+            ),
+        )
+
+    (plain,) = _run(TrailingStop(0.05)).trades
+    (activated,) = _run(TrailingStop(0.05, activation=0.05)).trades
+
+    assert plain.exit_reason == activated.exit_reason == "trailing_stop"
+    assert (bar_of[plain.exit_timestamp], plain.exit_price) == (
+        3,
+        pytest.approx(98.8),
+    )
+    assert (bar_of[activated.exit_timestamp], activated.exit_price) == (
+        5,
+        pytest.approx(100.7),
+    )
 
 
 def test_vectorbt_time_exit_executes_and_stamps_reason():

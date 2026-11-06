@@ -11,8 +11,10 @@ from ube.core.errors import ConfigError, DataShapeError
 from ube.core.risk import (
     TRIGGERS,
     ATRStop,
+    ATRTakeProfit,
     ChandelierExit,
     RiskConfig,
+    RiskRewardTP,
     SizeModel,
     StopLoss,
     TakeProfit,
@@ -20,11 +22,15 @@ from ube.core.risk import (
     TrailingStop,
     atr,
     atr_stop_level,
+    atr_take_profit_level,
     chandelier_level,
+    exit_atr_config,
     exit_level,
     exit_triggered,
     first_reached_exit,
+    initial_risk_distance,
     is_triggered,
+    risk_reward_take_profit_level,
     scale_out_fraction,
     scale_out_plan,
     stop_loss_level,
@@ -64,6 +70,8 @@ def test_triggers_constant():
     "cfg",
     [
         TakeProfit(0.02),
+        ATRTakeProfit(3),
+        RiskRewardTP(2.0, StopLoss(0.02)),
         StopLoss(0.03),
         ATRStop(3),
         TrailingStop(0.1),
@@ -91,6 +99,50 @@ def test_take_profit_validation():
         TakeProfit(0.02, scale_out=0.0)
     with pytest.raises(ConfigError):
         TakeProfit(0.02, trigger="intraday")  # type: ignore[arg-type]
+
+
+def test_atr_take_profit_defaults_and_validation():
+    tp = ATRTakeProfit(3)
+    assert tp.scale_out == 1.0
+    assert tp.trigger == "touched"
+    assert tp.period == 14
+    assert tp.atr is None
+    with pytest.raises(ConfigError):
+        ATRTakeProfit(0.0)
+    with pytest.raises(ConfigError):
+        ATRTakeProfit(-1.0)
+    with pytest.raises(ConfigError):
+        ATRTakeProfit(3, scale_out=1.5)
+    with pytest.raises(ConfigError):
+        ATRTakeProfit(3, trigger="weekly")  # type: ignore[arg-type]
+    with pytest.raises(ConfigError):
+        ATRTakeProfit(3, period=0)
+    with pytest.raises(ConfigError):
+        ATRTakeProfit(3, atr="")
+
+
+def test_risk_reward_tp_defaults_and_validation():
+    rr = RiskRewardTP(2.0, StopLoss(0.02))
+    assert rr.trigger == "touched"
+    assert rr.scale_out == 1.0
+    assert isinstance(rr.stop, StopLoss)
+    with pytest.raises(ConfigError):
+        RiskRewardTP(0.0, StopLoss(0.02))
+    with pytest.raises(ConfigError):
+        RiskRewardTP(-1.0, StopLoss(0.02))
+    with pytest.raises(ConfigError):
+        RiskRewardTP(2.0, StopLoss(0.02), scale_out=1.5)
+    with pytest.raises(ConfigError):
+        RiskRewardTP(2.0, StopLoss(0.02), trigger="weekly")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "stop",
+    [TakeProfit(0.02), ATRTakeProfit(3), TimeExit(4), "nope"],
+)
+def test_risk_reward_tp_rejects_unsupported_stop(stop):
+    with pytest.raises(ConfigError):
+        RiskRewardTP(2.0, stop)  # type: ignore[arg-type]
 
 
 def test_stop_loss_validation():
@@ -186,6 +238,119 @@ def test_atr_stop_level_fixed():
     np.testing.assert_allclose(short_level, [103.0, 103.0, 103.0])
 
 
+def test_atr_take_profit_level_long_and_short():
+    md = _md([100, 101, 102])
+    atr_series = np.array([1.0, 1.5, 2.0])
+    long_level = atr_take_profit_level(
+        ATRTakeProfit(3), md, side=1, entry_price=100, atr_series=atr_series
+    )
+    short_level = atr_take_profit_level(
+        ATRTakeProfit(3), md, side=-1, entry_price=100, atr_series=atr_series
+    )
+    np.testing.assert_allclose(long_level, [103.0, 104.5, 106.0])
+    np.testing.assert_allclose(short_level, [97.0, 95.5, 94.0])
+
+
+def test_atr_take_profit_level_validates_entry_bar_and_side():
+    md = _md([100, 101, 102])
+    with pytest.raises(ConfigError):
+        atr_take_profit_level(
+            ATRTakeProfit(3), md, side=1, entry_price=100, entry_bar=3,
+            atr_series=np.ones(3),
+        )
+    with pytest.raises(ConfigError):
+        atr_take_profit_level(
+            ATRTakeProfit(3), md, side=0, entry_price=100, atr_series=np.ones(3)
+        )
+
+
+@pytest.mark.parametrize(
+    "stop",
+    [
+        StopLoss(0.02),
+        TrailingStop(0.02),
+        TrailingStop(0.02, activation=0.01),
+    ],
+)
+def test_initial_risk_distance_percentage_stops(stop):
+    md = _md([100, 101, 102])
+    rr = RiskRewardTP(2.0, stop)
+    assert initial_risk_distance(
+        rr, market_data=md, side=1, entry_price=100
+    ) == pytest.approx(2.0)
+    assert initial_risk_distance(
+        rr, market_data=md, side=-1, entry_price=100
+    ) == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("trailing", [False, True])
+def test_initial_risk_distance_atr_stop_uses_entry_bar_atr(trailing):
+    md = _md([100, 101, 102])
+    atr_series = np.array([1.0, 2.0, 3.0])
+    rr = RiskRewardTP(2.0, ATRStop(3, trailing=trailing))
+    assert initial_risk_distance(
+        rr, market_data=md, side=1, entry_price=100, entry_bar=1, atr_series=atr_series
+    ) == pytest.approx(6.0)
+    assert initial_risk_distance(
+        rr, market_data=md, side=-1, entry_price=100, entry_bar=1, atr_series=atr_series
+    ) == pytest.approx(6.0)
+
+
+def test_initial_risk_distance_chandelier_uses_entry_bar_extreme():
+    md = _md([100, 101, 102], high=[101, 105, 103], low=[99, 96, 98])
+    atr_series = np.ones(3)
+    rr = RiskRewardTP(2.0, ChandelierExit(2))
+    # long: entry 104, level = high[1] - 2*1 = 103 -> risk 1
+    assert initial_risk_distance(
+        rr, market_data=md, side=1, entry_price=104, entry_bar=1, atr_series=atr_series
+    ) == pytest.approx(1.0)
+    # short: entry 97, level = low[1] + 2*1 = 98 -> risk 1
+    assert initial_risk_distance(
+        rr, market_data=md, side=-1, entry_price=97, entry_bar=1, atr_series=atr_series
+    ) == pytest.approx(1.0)
+
+
+def test_initial_risk_distance_rejects_non_positive():
+    md = _md([100, 100], high=[110, 110], low=[99, 99])
+    rr = RiskRewardTP(2.0, ChandelierExit(2))
+    # long level = 110 - 2 = 108 is above entry 100 -> negative risk
+    with pytest.raises(ConfigError):
+        initial_risk_distance(
+            rr, market_data=md, side=1, entry_price=100, atr_series=np.ones(2)
+        )
+
+
+def test_initial_risk_distance_validates_entry_bar_and_side():
+    md = _md([100, 101, 102])
+    rr = RiskRewardTP(2.0, StopLoss(0.02))
+    with pytest.raises(ConfigError):
+        initial_risk_distance(
+            rr, market_data=md, side=1, entry_price=100, entry_bar=3
+        )
+    with pytest.raises(ConfigError):
+        initial_risk_distance(rr, market_data=md, side=0, entry_price=100)
+
+
+def test_risk_reward_take_profit_level_long_and_short():
+    md = _md([100, 101, 102])
+    rr = RiskRewardTP(2.0, StopLoss(0.02))
+    long_level = risk_reward_take_profit_level(rr, md, side=1, entry_price=100)
+    short_level = risk_reward_take_profit_level(rr, md, side=-1, entry_price=100)
+    # risk = 100 * 0.02 = 2; ratio 2 -> target entry +/- 4
+    np.testing.assert_allclose(long_level, [104.0, 104.0, 104.0])
+    np.testing.assert_allclose(short_level, [96.0, 96.0, 96.0])
+
+
+def test_exit_atr_config_resolves_nested_stop():
+    atr_stop = ATRStop(2, atr="atr_1h")
+    rr = RiskRewardTP(2.0, atr_stop)
+    assert exit_atr_config(rr) is atr_stop
+    chandelier = ChandelierExit(3, atr="atr_1h")
+    assert exit_atr_config(RiskRewardTP(2.0, chandelier)) is chandelier
+    assert exit_atr_config(RiskRewardTP(2.0, StopLoss(0.02))) is None
+    assert exit_atr_config(ATRTakeProfit(3, atr="atr_x")) is not None
+
+
 def test_atr_stop_level_trailing_ratchets_up():
     md = _md([100, 102, 101, 105, 104], high=[100, 102, 101, 105, 104])
     atr_series = np.ones(5)
@@ -216,6 +381,72 @@ def test_trailing_stop_level_short():
     md = _md([10, 9, 9.5, 8, 8.5], low=[10, 9, 9.5, 8, 8.5])
     level = trailing_stop_level(TrailingStop(0.1), md, side=-1)
     np.testing.assert_allclose(level, [11.0, 9.9, 9.9, 8.8, 8.8])
+
+
+def test_trailing_stop_activation_validation():
+    assert TrailingStop(0.1).activation is None
+    assert TrailingStop(0.1, activation=0.05).activation == 0.05
+    with pytest.raises(ConfigError):
+        TrailingStop(0.1, activation=0.0)
+    with pytest.raises(ConfigError):
+        TrailingStop(0.1, activation=-0.01)
+
+
+def test_trailing_stop_activation_long_uses_static_stop_until_armed():
+    md = _md(
+        [100, 101, 104, 102, 105],
+        high=[100, 103, 105, 104, 106],
+        low=[99, 100, 103, 101, 104],
+    )
+    level = trailing_stop_level(
+        TrailingStop(0.10, activation=0.04), md, side=1, entry_price=100
+    )
+    # Static 90 until the high reaches 104, then trail off the running peak (105, 105, 106).
+    np.testing.assert_allclose(level, [90.0, 90.0, 94.5, 94.5, 95.4])
+
+
+def test_trailing_stop_activation_short_uses_static_stop_until_armed():
+    md = _md(
+        [100, 98, 96, 94, 93],
+        high=[101, 102, 100, 97, 96],
+        low=[100, 97, 95, 94, 92],
+    )
+    level = trailing_stop_level(
+        TrailingStop(0.10, activation=0.04), md, side=-1, entry_price=100
+    )
+    # Static 110 until the low reaches 96, then trail off the running trough (95, 94, 92).
+    np.testing.assert_allclose(level, [110.0, 110.0, 104.5, 103.4, 101.2])
+
+
+def test_trailing_stop_activation_requires_entry_price():
+    md = _md([100, 101, 104])
+    with pytest.raises(ConfigError):
+        trailing_stop_level(TrailingStop(0.10, activation=0.04), md, side=1)
+
+
+def test_trailing_stop_activation_respects_entry_bar():
+    md = _md(
+        [100, 101, 104, 102, 105],
+        high=[100, 103, 105, 104, 106],
+        low=[99, 100, 103, 101, 104],
+    )
+    level = trailing_stop_level(
+        TrailingStop(0.10, activation=0.04), md, side=1, entry_bar=2, entry_price=100
+    )
+    assert np.isnan(level[:2]).all()
+    np.testing.assert_allclose(level[2:], [94.5, 94.5, 95.4])
+
+
+def test_exit_level_forwards_entry_price_to_activated_trailing_stop():
+    md = _md(
+        [100, 101, 104, 102, 105],
+        high=[100, 103, 105, 104, 106],
+        low=[99, 100, 103, 101, 104],
+    )
+    level = exit_level(
+        TrailingStop(0.10, activation=0.04), market_data=md, side=1, entry_price=100
+    )
+    np.testing.assert_allclose(level, [90.0, 90.0, 94.5, 94.5, 95.4])
 
 
 def test_chandelier_level_long_and_short():
@@ -250,6 +481,29 @@ def test_exit_level_dispatches():
         TakeProfit(0.1), market_data=md, side=1, entry_price=100
     )
     np.testing.assert_allclose(level, [110.0, 110.0, 110.0])
+
+
+def test_exit_level_dispatches_atr_take_profit():
+    md = _md([100, 101, 102])
+    level = exit_level(
+        ATRTakeProfit(3),
+        market_data=md,
+        side=1,
+        entry_price=100,
+        atr_series=np.array([1.0, 1.0, 1.0]),
+    )
+    np.testing.assert_allclose(level, [103.0, 103.0, 103.0])
+
+
+def test_exit_level_dispatches_risk_reward_tp():
+    md = _md([100, 101, 102])
+    level = exit_level(
+        RiskRewardTP(2.0, StopLoss(0.02)),
+        market_data=md,
+        side=1,
+        entry_price=100,
+    )
+    np.testing.assert_allclose(level, [104.0, 104.0, 104.0])
 
 
 def test_exit_level_dispatches_stop_loss():
@@ -302,6 +556,31 @@ def test_exit_triggered_take_profit_touched():
     np.testing.assert_array_equal(fired, [False, True, True])
 
 
+def test_exit_triggered_atr_take_profit_uses_high_for_long():
+    md = _md([100, 103, 102], high=[101, 104, 102], low=[99, 99, 99])
+    fired = exit_triggered(
+        ATRTakeProfit(3),
+        market_data=md,
+        side=1,
+        entry_price=100,
+        atr_series=np.ones(3),
+    )
+    # target level = 103 (above); touched means high >= 103 -> [False, True, False]
+    np.testing.assert_array_equal(fired, [False, True, False])
+
+
+def test_exit_triggered_risk_reward_tp_uses_high_for_long():
+    md = _md([100, 103, 102], high=[101, 105, 104], low=[99, 100, 101])
+    fired = exit_triggered(
+        RiskRewardTP(2.0, StopLoss(0.02)),
+        market_data=md,
+        side=1,
+        entry_price=100,
+    )
+    # target level = 104; touched means high >= 104 -> [False, True, True]
+    np.testing.assert_array_equal(fired, [False, True, True])
+
+
 def test_exit_triggered_stop_uses_low_for_long():
     md = _md([100, 101, 102], high=[100, 101, 102], low=[98, 96, 99])
     atr_series = np.ones(3)
@@ -327,6 +606,12 @@ def test_exit_triggered_stop_loss_uses_low_for_long():
 def test_scale_out_fraction_target_vs_stop():
     assert scale_out_fraction(TakeProfit(0.05, scale_out=0.5)) == 0.5
     assert scale_out_fraction(TakeProfit(0.05)) == 1.0
+    assert scale_out_fraction(ATRTakeProfit(3, scale_out=0.25)) == 0.25
+    assert scale_out_fraction(ATRTakeProfit(3)) == 1.0
+    assert (
+        scale_out_fraction(RiskRewardTP(2.0, StopLoss(0.02), scale_out=0.25)) == 0.25
+    )
+    assert scale_out_fraction(RiskRewardTP(2.0, StopLoss(0.02))) == 1.0
     assert scale_out_fraction(StopLoss(0.05)) == 1.0
     assert scale_out_fraction(ATRStop(3)) == 1.0
     assert scale_out_fraction(TrailingStop(0.1)) == 1.0
@@ -455,6 +740,30 @@ def test_risk_config_rejects_bad_exit_type():
 def test_risk_config_rejects_oversubscribed_scale_out():
     with pytest.raises(ConfigError):
         RiskConfig(exit=(TakeProfit(0.05, scale_out=0.6), TakeProfit(0.10, scale_out=0.6)))
+
+
+def test_risk_config_counts_atr_take_profit_in_scale_out_budget():
+    with pytest.raises(ConfigError):
+        RiskConfig(exit=(ATRTakeProfit(3, scale_out=0.6), TakeProfit(0.10, scale_out=0.6)))
+    cfg = RiskConfig(exit=(ATRTakeProfit(3, scale_out=0.5), TakeProfit(0.10, scale_out=0.5)))
+    assert len(cfg.exit) == 2
+
+
+def test_risk_config_counts_risk_reward_tp_in_scale_out_budget():
+    with pytest.raises(ConfigError):
+        RiskConfig(
+            exit=(
+                RiskRewardTP(2.0, StopLoss(0.02), scale_out=0.6),
+                TakeProfit(0.10, scale_out=0.6),
+            )
+        )
+    cfg = RiskConfig(
+        exit=(
+            RiskRewardTP(2.0, StopLoss(0.02), scale_out=0.5),
+            TakeProfit(0.10, scale_out=0.5),
+        )
+    )
+    assert len(cfg.exit) == 2
 
 
 def test_risk_config_allows_stop_plus_partial_targets():

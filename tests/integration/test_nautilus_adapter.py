@@ -9,6 +9,7 @@ contract + the engine registry (§4.1).
 from dataclasses import replace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import ube
@@ -951,6 +952,46 @@ def test_nautilus_reference_trailing_stop_mirror():
     assert float(result.equity_curve.equity[-1]) == pytest.approx(final_equity, rel=1e-3)
 
 
+def test_nautilus_trailing_stop_activation_delays_exit():
+    """Activation holds the static entry stop until the ratchet is armed (§8)."""
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import RiskConfig, TrailingStop
+
+    md = MarketData(
+        open=np.array([100, 100, 100, 100, 103, 105, 100, 100, 100, 100], dtype=float),
+        high=np.array([101, 101, 102, 104, 106, 105, 101, 101, 101, 101], dtype=float),
+        low=np.array([99, 99, 99, 95.5, 103, 99, 99, 99, 99, 99], dtype=float),
+        close=np.array([100, 100, 100, 103, 105, 100, 100, 100, 100, 100], dtype=float),
+        volume=np.ones(10),
+        index=pd.date_range("2024-01-01", periods=10, freq="h", tz="UTC"),
+    )
+    ts = {int(t): i for i, t in enumerate(md.timestamps.as_unit("ns").asi8)}
+    signals = from_target(np.array([0, 1, 1, 1, 1, 1, 1, 0, 0, 0]))
+
+    def _run(exit_cfg):
+        return NautilusAdapter().run(
+            md,
+            signals,
+            BacktestConfig(
+                instrument=PRESETS["crypto_perp"].instrument,
+                risk=RiskConfig(exit=(exit_cfg,)),
+                engine_overrides={"starting_balance": 100000.0},
+            ),
+        )
+
+    (plain,) = _run(TrailingStop(0.05)).trades
+    (activated,) = _run(TrailingStop(0.05, activation=0.05)).trades
+
+    assert plain.exit_reason == activated.exit_reason == "trailing_stop"
+    # The plain ratchet fires on bar 3; activation keeps the static stop alive there and
+    # only trails after the 106 high, so both the exit bar and the price move later/higher.
+    assert ts[activated.exit_timestamp] > ts[plain.exit_timestamp]
+    assert activated.exit_price > plain.exit_price
+    # 106 * 0.95 = 100.7, less the venue slippage.
+    assert activated.exit_price == pytest.approx(100.7, abs=0.2)
+
+
 def test_nautilus_touched_take_profit_stamps_exit_reason():
     from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
     from ube.core.config import BacktestConfig
@@ -1200,6 +1241,108 @@ def test_nautilus_actor_atr_stop_touched_fills_at_trigger():
         1
     ] == pytest.approx(97.2857, abs=1e-3)
     assert float(result.equity_curve.equity[-1]) == pytest.approx(96786.65, rel=1e-6)
+
+
+def test_nautilus_actor_atr_take_profit_exits_at_target():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import ATRTakeProfit, RiskConfig
+
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,101.00,99.00,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,102.00,99.50,101.00",
+            "2024-01-01 02:00:00+00:00,101.00,104.00,100.50,103.00",
+            "2024-01-01 03:00:00+00:00,103.00,106.00,102.50,105.00",
+            "2024-01-01 04:00:00+00:00,105.00,108.00,104.50,107.00",
+            "2024-01-01 05:00:00+00:00,107.00,110.00,106.50,109.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([0, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(ATRTakeProfit(3, atr="atr_14"),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+        aux_data={"atr_14": np.ones(data.n_bars)},
+    )
+
+    (trade,) = result.trades
+    assert trade.exit_reason == "take_profit"
+    # Entry is the bar after the target transition (bar 2 open 101); the ATR target is
+    # 101 + 3 * 1 = 104.
+    assert trade.entry_price == pytest.approx(101.1, abs=1e-1)
+    assert trade.exit_price == pytest.approx(104.0, abs=1e-6)
+
+
+def test_nautilus_actor_risk_reward_tp_exits_at_target():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import RiskConfig, RiskRewardTP, StopLoss
+
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,101.00,99.00,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,102.00,99.50,101.00",
+            "2024-01-01 02:00:00+00:00,101.00,104.00,100.50,103.00",
+            "2024-01-01 03:00:00+00:00,103.00,106.00,102.50,105.00",
+            "2024-01-01 04:00:00+00:00,105.00,108.00,104.50,107.00",
+            "2024-01-01 05:00:00+00:00,107.00,110.00,106.50,109.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([0, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(RiskRewardTP(2.0, StopLoss(0.02)),)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+
+    (trade,) = result.trades
+    assert trade.exit_reason == "take_profit"
+    # Entry ≈101.1; risk = entry * 0.02 ≈ 2.022; ratio 2 -> target ≈105.14, quantized to
+    # the instrument's 0.1 tick.
+    assert trade.entry_price == pytest.approx(101.1, abs=1e-1)
+    assert trade.exit_price == pytest.approx(105.0, abs=1e-1)
+
+
+def test_nautilus_actor_risk_reward_tp_with_nested_atr_stop_exits_at_target():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import ATRStop, RiskConfig, RiskRewardTP
+
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,101.00,99.00,100.00",
+            "2024-01-01 01:00:00+00:00,100.00,102.00,99.50,101.00",
+            "2024-01-01 02:00:00+00:00,101.00,104.00,100.50,103.00",
+            "2024-01-01 03:00:00+00:00,103.00,106.00,102.50,105.00",
+            "2024-01-01 04:00:00+00:00,105.00,108.00,104.50,107.00",
+            "2024-01-01 05:00:00+00:00,107.00,110.00,106.50,109.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([0, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(
+                exit=(RiskRewardTP(2.0, ATRStop(2.0, atr="atr_14")),)
+            ),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+        aux_data={"atr_14": np.ones(data.n_bars)},
+    )
+
+    (trade,) = result.trades
+    assert trade.exit_reason == "take_profit"
+    # ATR 1 at entry -> risk 2, ratio 2 -> target entry + 4 = 105 at the first fill price.
+    assert trade.entry_price == pytest.approx(101.1, abs=1e-1)
+    assert trade.exit_price == pytest.approx(105.0, abs=1e-1)
 
 
 def test_nautilus_actor_time_exit_closes_at_hold_bar():

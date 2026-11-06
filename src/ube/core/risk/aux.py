@@ -21,7 +21,7 @@ import pandas as pd
 
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError, DataShapeError
-from ube.core.risk.exits import ATRStop, ChandelierExit, atr
+from ube.core.risk.exits import Exit, RiskRewardTP, atr, exit_atr_config
 
 __all__ = [
     "validate_aux",
@@ -78,21 +78,27 @@ def validate_aux(
 ) -> None:
     """Fail fast if an ATR exit or ``volatility_target`` sizing has no usable series (§5.2, §6.3).
 
-    An ATR-based exit (``ATRStop`` / ``ChandelierExit``) must name a specific
-    ``aux_data`` series via its ``atr`` key — the library never computes ATR from the
-    signal ``data`` bars — and ``volatility_target`` sizing must name one via
-    ``SizeModel.vol``. Enforces that every named series is present. When ``data`` is
-    supplied, a named ``MarketData`` aux series must also span the main period (start
-    at or before it and reach within one aux bar of its end), so leading and trailing
-    main bars always have a value.
+    An ATR-based exit (``ATRStop`` / ``ATRTakeProfit`` / ``ChandelierExit``, including a
+    stop nested inside a ``RiskRewardTP``) must name a specific ``aux_data`` series via
+    its ``atr`` key — the library never computes ATR from the signal ``data`` bars — and
+    ``volatility_target`` sizing must name one via ``SizeModel.vol``. Enforces that every
+    named series is present. When ``data`` is supplied, a named ``MarketData`` aux series
+    must also span the main period (start at or before it and reach within one aux bar
+    of its end), so leading and trailing main bars always have a value.
     """
     named: set[str] = set()
     for e in exits:
-        if isinstance(e, (ATRStop, ChandelierExit)):
-            atr_name = getattr(e, "atr", None)
+        atr_cfg = exit_atr_config(e)
+        if atr_cfg is not None:
+            atr_name = atr_cfg.atr
             if atr_name is None:
+                label = (
+                    f"RiskRewardTP.stop ({type(atr_cfg).__name__})"
+                    if isinstance(e, RiskRewardTP)
+                    else type(atr_cfg).__name__
+                )
                 raise ConfigError(
-                    f"{type(e).__name__} requires an 'atr' key referencing an "
+                    f"{label} requires an 'atr' key referencing an "
                     "aux_data series (§5.2); ATR is never computed from the signal "
                     "data bars"
                 )
@@ -113,14 +119,14 @@ def validate_aux(
         raise ConfigError(
             "exits/sizing reference aux_data series(es) "
             f"{sorted(named)} but aux_data was not supplied; "
-            "ATR-based stops/chandelier require aux_data"
+            "ATR-based exits require aux_data"
         )
     missing = named - set(aux_data)
     if missing:
         raise ConfigError(
             "exits/sizing reference aux_data series(es) "
             f"{sorted(missing)} that are absent from aux_data; "
-            "ATR-based stops/chandelier require the named aux_data series"
+            "ATR-based exits require the named aux_data series"
         )
 
     if data is not None:
@@ -157,25 +163,35 @@ def atr_from_aux(data: MarketData, aux_md: MarketData, period: int) -> np.ndarra
 
 
 def atr_series_for_exit(
-    exit: ATRStop | ChandelierExit,
+    exit: Exit,
     aux_data: Mapping[str, Any] | None,
     data: MarketData,
 ) -> np.ndarray:
-    """The main-grid ATR series for one ATR/Chandelier exit (§5.2)."""
-    if exit.atr is None:
-        return atr(data, exit.period)
-    value = aux_data.get(exit.atr) if aux_data is not None else None
+    """The main-grid ATR series for one ATR-consuming exit (§5.2).
+
+    Accepts any exit; a :class:`RiskRewardTP` resolves through its nested stop. Raises
+    for an exit that references no ATR series, so callers can pass the configured exit
+    without unwrapping it themselves. A ``MarketData`` value is lagged one aux bar
+    (causal); a precomputed array is used verbatim, so the caller must lag it when it
+    was derived from the same bars being backtested.
+    """
+    cfg = exit_atr_config(exit)
+    if cfg is None:
+        raise ConfigError(f"{type(exit).__name__} does not reference an ATR series")
+    if cfg.atr is None:
+        return atr(data, cfg.period)
+    value = aux_data.get(cfg.atr) if aux_data is not None else None
     if value is None:
         raise ConfigError(
-            f"exit references aux_data[{exit.atr!r}] which was not supplied"
+            f"exit references aux_data[{cfg.atr!r}] which was not supplied"
         )
     if isinstance(value, MarketData):
-        arr = atr_from_aux(data, value, exit.period)
+        arr = atr_from_aux(data, value, cfg.period)
     else:
         arr = np.asarray(value, dtype=np.float64)
     if arr.ndim != 1 or arr.shape[0] != data.n_bars:
         raise DataShapeError(
-            f"aux_data[{exit.atr!r}] must be 1-D with length {data.n_bars}; "
+            f"aux_data[{cfg.atr!r}] must be 1-D with length {data.n_bars}; "
             f"got shape {arr.shape}"
         )
     if not np.isfinite(arr).all() or (arr <= 0).any():

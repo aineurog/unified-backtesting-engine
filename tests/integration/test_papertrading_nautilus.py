@@ -17,7 +17,14 @@ from ube.core.config import BacktestConfig, RiskConfig, SignalConfig  # noqa: E4
 from ube.core.data import MarketData  # noqa: E402
 from ube.core.errors import InvalidSignalError  # noqa: E402
 from ube.core.ledger import EventType, trades  # noqa: E402
-from ube.core.risk.exits import ATRStop, StopLoss, TakeProfit  # noqa: E402
+from ube.core.risk.exits import (  # noqa: E402
+    ATRStop,
+    ATRTakeProfit,
+    RiskRewardTP,
+    StopLoss,
+    TakeProfit,
+    TrailingStop,
+)
 from ube.core.signals import Signals, from_target  # noqa: E402
 from ube.papertrading import init, step  # noqa: E402
 from ube.papertrading.config import PaperConfig  # noqa: E402
@@ -689,6 +696,131 @@ def test_crypto_perp_touched_take_profit_fills_at_level() -> None:
     assert abs(closed[0].exit_price - 105.0) < 1e-6
 
 
+def test_crypto_perp_atr_take_profit_fills_at_level() -> None:
+    """An ``ATRTakeProfit`` target resolves from aux ATR and fills at its level."""
+    md = MarketData.from_records(
+        [
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T01:00:00Z",
+            },
+            {
+                "open": 100.5,
+                "high": 106.0,
+                "low": 100.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 100.5,
+                "high": 101.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T03:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 99.0,
+                "close": 99.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T04:00:00Z",
+            },
+        ]
+    )
+    signals = from_target(np.array([1, 1, 0, 0, 0]))
+    cfg = _exit_cfg(ATRTakeProfit(mult=5.0, atr="atr_1m"))
+    state = init(cfg)
+
+    _, events = step(md, signals, state, cfg, aux_data={"atr_1m": np.ones(5)})
+
+    instr = cfg.base.instrument
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "take_profit"
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert fills[1].exit_reason == "take_profit"
+    assert abs(fills[1].price - 105.0) < 1e-6
+    assert abs(closed[0].exit_price - 105.0) < 1e-6
+
+
+def test_crypto_perp_risk_reward_tp_fills_at_level() -> None:
+    """A ``RiskRewardTP`` target derives its risk from the linked stop and fills there."""
+    md = MarketData.from_records(
+        [
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T01:00:00Z",
+            },
+            {
+                "open": 100.5,
+                "high": 106.0,
+                "low": 100.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 100.5,
+                "high": 101.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T03:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 99.0,
+                "close": 99.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T04:00:00Z",
+            },
+        ]
+    )
+    signals = from_target(np.array([1, 1, 0, 0, 0]))
+    # Entry 100, stop 2% -> risk 2; ratio 2.5 -> target 105.
+    cfg = _exit_cfg(RiskRewardTP(ratio=2.5, stop=StopLoss(percent=0.02)))
+    state = init(cfg)
+
+    _, events = step(md, signals, state, cfg)
+
+    instr = cfg.base.instrument
+    closed = trades(state.ledger, instruments={instr.symbol: instr})
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "take_profit"
+    fills = [e for e in events if e.event_type == EventType.FILL]
+    assert fills[1].exit_reason == "take_profit"
+    assert abs(fills[1].price - 105.0) < 1e-6
+    assert abs(closed[0].exit_price - 105.0) < 1e-6
+
+
 def test_crypto_perp_touched_stop_loss_fills_at_level() -> None:
     """§9.4 — a touched SL exit fills at the stop level: intra-bar wick through.
 
@@ -754,6 +886,85 @@ def test_crypto_perp_touched_stop_loss_fills_at_level() -> None:
     assert len(fills) == 2
     assert abs(fills[1].price - 98.0) < 1e-6
     assert abs(closed[0].exit_price - 98.0) < 1e-6
+
+
+def test_crypto_perp_trailing_stop_activation_holds_static_stop() -> None:
+    """An activated trailing stop is a static entry stop until the move arms it.
+
+    Entry at 100, 5% trailing distance, 5% activation. Bar 2 dips to 95.5: plain
+    trailing has already ratcheted off bar 2's high (103 * 0.95 = 97.85) and exits
+    there, while activation keeps the static 95 stop (95.5 > 95) alive. Bar 3 reaches
+    106, arming the ratchet; the trailed level 106 * 0.95 = 100.7 fires on bar 4.
+    """
+    md = MarketData.from_records(
+        [
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T01:00:00Z",
+            },
+            {
+                "open": 100.5,
+                "high": 103.0,
+                "low": 95.5,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T02:00:00Z",
+            },
+            {
+                "open": 103.0,
+                "high": 106.0,
+                "low": 103.0,
+                "close": 105.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T03:00:00Z",
+            },
+            {
+                "open": 105.0,
+                "high": 105.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T04:00:00Z",
+            },
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "timestamp": "2024-01-01T05:00:00Z",
+            },
+        ]
+    )
+    signals = from_target(np.array([1, 1, 1, 1, 1, 1]))
+
+    def _run(exit_cfg):
+        cfg = _exit_cfg(exit_cfg)
+        state = init(cfg)
+        _, events = step(md, signals, state, cfg)
+        return [
+            e
+            for e in events
+            if e.event_type == EventType.FILL and e.exit_reason == "trailing_stop"
+        ]
+
+    (plain,) = _run(TrailingStop(0.05))
+    (activated,) = _run(TrailingStop(0.05, activation=0.05))
+
+    assert abs(plain.price - 97.85) < 1e-6
+    assert abs(activated.price - 100.7) < 1e-6
 
 
 def test_crypto_perp_risk_exit_before_entry_fill_books_on_triggering_bar() -> None:

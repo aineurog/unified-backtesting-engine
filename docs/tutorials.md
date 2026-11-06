@@ -171,6 +171,16 @@ result = ube.run(
 )
 ```
 
+Layer an ATR-scaled target into the same `exit` tuple when you want the
+take-profit distance to scale with volatility instead of a fixed percent:
+
+```python
+exit=(
+    ube.ATRStop(mult=2.0, period=14, atr="atr_1h"),
+    ube.ATRTakeProfit(mult=3.0, period=14, atr="atr_1h"),  # entry ± 3 × ATR
+)
+```
+
 ---
 
 ## Tutorial 4: Paper Trading (Single Window)
@@ -410,6 +420,14 @@ config = ube.BacktestConfig(
 result = ube.run(md, signals, config)
 ```
 
+By default the trail is armed on the entry bar. Set `activation` to wait for a
+favourable move first; before that the stop is the static entry-anchored level:
+
+```python
+ube.TrailingStop(percent=0.02, activation=0.015)
+# long: entry * 0.98 until price reaches entry * 1.015, then trail 2% off the peak
+```
+
 Use an ATR-trailing stop when you want the trail distance to scale with
 volatility rather than a fixed percentage:
 
@@ -461,6 +479,15 @@ result = ube.run(md, signals, config)
 
 for t in result.trades:
     print(t.exit_reason, t.net_pnl)
+```
+
+Size the target from the stop instead of a fixed percent with `RiskRewardTP`; the
+target is set at entry from the linked stop's initial risk and does not follow a
+trailing stop:
+
+```python
+stop = ube.StopLoss(percent=0.01)
+exit=(stop, ube.RiskRewardTP(ratio=2.0, stop=stop))  # target = entry ± 2 × 1%
 ```
 
 Rules to remember:

@@ -29,6 +29,8 @@ def test_top_level_exposes_user_facing_surface():
         "RiskConfig",
         "SizeModel",
         "TakeProfit",
+        "ATRTakeProfit",
+        "RiskRewardTP",
         "StopLoss",
         "ATRStop",
         "TrailingStop",

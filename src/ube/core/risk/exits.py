@@ -40,6 +40,8 @@ __all__ = [
     "Trigger",
     "TRIGGERS",
     "TakeProfit",
+    "ATRTakeProfit",
+    "RiskRewardTP",
     "StopLoss",
     "ATRStop",
     "TrailingStop",
@@ -50,6 +52,10 @@ __all__ = [
     "RiskConfig",
     "atr",
     "take_profit_level",
+    "atr_take_profit_level",
+    "risk_reward_take_profit_level",
+    "initial_risk_distance",
+    "exit_atr_config",
     "atr_stop_level",
     "trailing_stop_level",
     "chandelier_level",
@@ -146,6 +152,41 @@ class TakeProfit:
 
 
 @dataclass(frozen=True)
+class ATRTakeProfit:
+    """ATR-based take-profit target: a fixed multiple off entry (§8).
+
+    Long: ``target = entry + mult * atr``; short: ``target = entry - mult * atr``. Like
+    the fixed :class:`ATRStop`, the level moves only because ATR changes. Unlike a stop,
+    it may scale out of the position.
+
+    Attributes:
+        mult: ATR multiple.
+        trigger: The §4.7 trigger rule.
+        scale_out: Fraction of the position to exit when hit, in ``(0, 1]`` (§6.4).
+        period: ATR lookback, used when ``atr`` (the aux_data reference) is ``None``.
+        atr: Optional ``aux_data`` name (§5.2); resolved by the caller into an
+            ``atr_series`` passed to :func:`atr_take_profit_level`.
+    """
+
+    mult: float
+    trigger: Trigger = "touched"
+    scale_out: float = 1.0
+    period: int = 14
+    atr: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "mult", _validate_positive(self.mult, "ATRTakeProfit.mult")
+        )
+        object.__setattr__(self, "trigger", _validate_trigger(self.trigger))
+        object.__setattr__(self, "scale_out", _validate_scale_out(self.scale_out))
+        object.__setattr__(
+            self, "period", _validate_period(self.period, "ATRTakeProfit.period")
+        )
+        object.__setattr__(self, "atr", _validate_atr_name(self.atr))
+
+
+@dataclass(frozen=True)
 class StopLoss:
     """Static stop-loss: a fixed distance from entry, never ratcheted (§8).
 
@@ -209,19 +250,34 @@ class TrailingStop:
     Long: ``stop = running_high_since_entry * (1 - percent)``. Short:
     ``stop = running_low_since_entry * (1 + percent)``.
 
+    With ``activation`` set, the trailing stop does not ratchet until price has made a
+    favourable move of that fraction from entry. Until then it is a static,
+    entry-anchored stop: ``entry * (1 - percent)`` long / ``entry * (1 + percent)`` short.
+    Once activated it trails normally off the running peak/trough. The trailing level is
+    always at or above the static level after activation, so the stop never loosens.
+
     Attributes:
         percent: Trailing distance off the peak/trough, as a fraction.
         trigger: The §4.7 trigger rule.
+        activation: Favourable move from entry required before trailing begins, as a
+            fraction; ``None`` (default) trails from the entry bar.
     """
 
     percent: float
     trigger: Trigger = "touched"
+    activation: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "percent", _validate_positive(self.percent, "TrailingStop.percent")
         )
         object.__setattr__(self, "trigger", _validate_trigger(self.trigger))
+        if self.activation is not None:
+            object.__setattr__(
+                self,
+                "activation",
+                _validate_positive(self.activation, "TrailingStop.activation"),
+            )
 
 
 @dataclass(frozen=True)
@@ -232,7 +288,9 @@ class TimeExit:
     position has been held for ``bars`` bars (i.e. at bar ``entry_bar + bars``). The
     "exit at a bar timestamp" form is not implemented separately (it would need calendar
     machinery and is out of scope for item 06). A time exit has no price level and no
-    ``trigger`` — time is discrete, so there is no touched/close ambiguity.
+    ``trigger`` — time is discrete, so there is no touched/close ambiguity. Durations
+    such as ``"12h"`` are converted to a bar count by the caller from the bar interval;
+    the library performs no calendar math.
 
     Attributes:
         bars: Number of bars to hold before exiting (a positive integer).
@@ -270,11 +328,63 @@ class ChandelierExit:
         object.__setattr__(self, "atr", _validate_atr_name(self.atr))
 
 
+#: A stop config a :class:`RiskRewardTP` can link its initial risk to.
+_RiskStop = StopLoss | ATRStop | TrailingStop | ChandelierExit
+
+
+@dataclass(frozen=True)
+class RiskRewardTP:
+    """Take-profit placed at a multiple of the linked stop's initial risk (§6.4, §8).
+
+    The target is anchored once, at entry: ``target = entry ± ratio * risk``, where
+    ``risk`` is the distance from ``entry`` to the stop's initial level, computed by
+    :func:`initial_risk_distance`. With a ``StopLoss(percent)`` or
+    ``TrailingStop(percent)`` the risk is ``entry * percent``; with an ``ATRStop`` it is
+    ``mult * ATR``; with a ``ChandelierExit`` it is the distance to the entry bar's
+    chandelier level. The target does not move while the linked stop trails — it is a
+    fixed risk/reward target set at entry.
+
+    Attributes:
+        ratio: Reward-to-risk multiple (``2.0`` means target twice the initial risk).
+        stop: The stop whose initial risk anchors the target.
+        trigger: The §4.7 trigger rule.
+        scale_out: Fraction of the position to exit when hit, in ``(0, 1]`` (§6.4).
+    """
+
+    ratio: float
+    stop: _RiskStop
+    trigger: Trigger = "touched"
+    scale_out: float = 1.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "ratio", _validate_positive(self.ratio, "RiskRewardTP.ratio")
+        )
+        if not isinstance(self.stop, (StopLoss, ATRStop, TrailingStop, ChandelierExit)):
+            raise ConfigError(
+                "RiskRewardTP.stop must be a StopLoss, ATRStop, TrailingStop, or "
+                f"ChandelierExit; got {type(self.stop).__name__}"
+            )
+        object.__setattr__(self, "trigger", _validate_trigger(self.trigger))
+        object.__setattr__(self, "scale_out", _validate_scale_out(self.scale_out))
+
+
 #: The union of exit config types (§8).
-Exit = TakeProfit | StopLoss | ATRStop | TrailingStop | TimeExit | ChandelierExit
+Exit = (
+    TakeProfit
+    | ATRTakeProfit
+    | RiskRewardTP
+    | StopLoss
+    | ATRStop
+    | TrailingStop
+    | TimeExit
+    | ChandelierExit
+)
 
 _EXIT_NAMES: tuple[str, ...] = (
     "TakeProfit",
+    "ATRTakeProfit",
+    "RiskRewardTP",
     "StopLoss",
     "ATRStop",
     "TrailingStop",
@@ -285,8 +395,41 @@ _EXIT_NAMES: tuple[str, ...] = (
 
 def _is_exit(obj: object) -> TypeGuard[Exit]:
     return isinstance(
-        obj, (TakeProfit, StopLoss, ATRStop, TrailingStop, TimeExit, ChandelierExit)
+        obj,
+        (
+            TakeProfit,
+            ATRTakeProfit,
+            RiskRewardTP,
+            StopLoss,
+            ATRStop,
+            TrailingStop,
+            TimeExit,
+            ChandelierExit,
+        ),
     )
+
+
+def _is_take_profit(
+    cfg: object,
+) -> TypeGuard[TakeProfit | ATRTakeProfit | RiskRewardTP]:
+    """Whether ``cfg`` is a take-profit family exit (fixed, ATR-scaled, or RR)."""
+    return isinstance(cfg, (TakeProfit, ATRTakeProfit, RiskRewardTP))
+
+
+def exit_atr_config(
+    cfg: Exit,
+) -> ATRStop | ATRTakeProfit | ChandelierExit | None:
+    """The ATR-consuming config ``cfg`` references, or ``None``.
+
+    A :class:`RiskRewardTP` references its nested stop's ATR series; every other ATR
+    exit references its own. Engines use this to resolve the aux ``atr_data`` series
+    once, regardless of whether ATR sits on the exit or on a nested stop.
+    """
+    if isinstance(cfg, RiskRewardTP):
+        return exit_atr_config(cfg.stop)
+    if isinstance(cfg, (ATRStop, ATRTakeProfit, ChandelierExit)):
+        return cfg
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +546,105 @@ def take_profit_level(
     return np.full(md.n_bars, entry * mult, dtype=np.float64)
 
 
+def atr_take_profit_level(
+    cfg: ATRTakeProfit,
+    market_data: MarketData,
+    *,
+    side: object,
+    entry_price: object,
+    entry_bar: int = 0,
+    atr_series: object | None = None,
+) -> np.ndarray:
+    """Per-bar ATR take-profit target: ``entry ± mult * atr`` (§8).
+
+    Long: ``entry + mult * atr``; short: ``entry - mult * atr``. ``entry_bar`` is
+    validated for a uniform dispatch signature but does not affect the level.
+    """
+    md = _require_market_data(market_data)
+    s = _validate_side(side)
+    entry = _validate_entry_price(entry_price)
+    _validate_entry_bar(entry_bar, md.n_bars)
+    atr_arr = _resolve_atr(atr_series, md, cfg.period)
+    return entry + cfg.mult * atr_arr if s > 0 else entry - cfg.mult * atr_arr
+
+
+def initial_risk_distance(
+    cfg: RiskRewardTP,
+    *,
+    market_data: MarketData,
+    side: object,
+    entry_price: object,
+    entry_bar: int = 0,
+    atr_series: object | None = None,
+) -> float:
+    """Distance from entry to the linked stop's initial level (§6.4, §8).
+
+    ``StopLoss`` and ``TrailingStop`` are entry-anchored, so the risk is
+    ``entry * percent`` regardless of side. ``ATRStop`` (fixed or trailing) uses its
+    entry-anchored level ``mult * ATR`` at ``entry_bar``. ``ChandelierExit`` uses the
+    distance to the entry bar's chandelier level, which depends on that bar's high/low.
+    A non-positive or non-finite distance means the stop sits at or beyond entry and is
+    rejected rather than producing an inverted target. A precomputed ``atr_series`` is
+    used verbatim: supply a causal (lagged) series so the value read at ``entry_bar``
+    was known at entry.
+    """
+    md = _require_market_data(market_data)
+    s = _validate_side(side)
+    entry = _validate_entry_price(entry_price)
+    eb = _validate_entry_bar(entry_bar, md.n_bars)
+    stop = cfg.stop
+
+    if isinstance(stop, (StopLoss, TrailingStop)):
+        distance = entry * stop.percent
+    elif isinstance(stop, ATRStop):
+        atr_arr = _resolve_atr(atr_series, md, stop.period)
+        distance = stop.mult * atr_arr[eb]
+    else:  # ChandelierExit
+        atr_arr = _resolve_atr(atr_series, md, stop.period)
+        if s > 0:
+            level = md.high[eb] - stop.mult * atr_arr[eb]
+            distance = entry - level
+        else:
+            level = md.low[eb] + stop.mult * atr_arr[eb]
+            distance = level - entry
+
+    if not math.isfinite(distance) or distance <= 0.0:
+        raise ConfigError(
+            "RiskRewardTP initial risk distance must be finite and positive; "
+            f"got {distance!r} (entry={entry}, stop={type(stop).__name__})"
+        )
+    return float(distance)
+
+
+def risk_reward_take_profit_level(
+    cfg: RiskRewardTP,
+    market_data: MarketData,
+    *,
+    side: object,
+    entry_price: object,
+    entry_bar: int = 0,
+    atr_series: object | None = None,
+) -> np.ndarray:
+    """Per-bar risk/reward target: a constant ``entry ± ratio * initial_risk`` (§8).
+
+    The risk is taken from :func:`initial_risk_distance` at ``entry_bar`` and the target
+    is anchored there; it does not move while a linked trailing stop ratchets.
+    """
+    md = _require_market_data(market_data)
+    s = _validate_side(side)
+    entry = _validate_entry_price(entry_price)
+    risk = initial_risk_distance(
+        cfg,
+        market_data=md,
+        side=s,
+        entry_price=entry,
+        entry_bar=entry_bar,
+        atr_series=atr_series,
+    )
+    target = entry + cfg.ratio * risk if s > 0 else entry - cfg.ratio * risk
+    return np.full(md.n_bars, target, dtype=np.float64)
+
+
 def stop_loss_level(
     cfg: StopLoss, market_data: MarketData, *, side: object, entry_price: object
 ) -> np.ndarray:
@@ -459,16 +701,45 @@ def trailing_stop_level(
     *,
     side: object,
     entry_bar: int = 0,
+    entry_price: object | None = None,
 ) -> np.ndarray:
-    """Per-bar trailing stop as a percentage off the running peak/trough (§8)."""
+    """Per-bar trailing stop as a percentage off the running peak/trough (§8).
+
+    Without ``cfg.activation`` the level trails from the entry bar as before. With it, the
+    level is the static entry-anchored stop until the running peak (long) / trough (short)
+    has moved ``activation`` in the favourable direction from ``entry_price``, then trails
+    off that running extreme. ``entry_price`` is therefore required only for the activation
+    form. As with a plain trailing stop, the running extreme includes the current bar, so a
+    bar that touches the activation threshold and then reverses is treated as armed on that
+    same bar (OHLC has no intra-bar ordering).
+    """
     md = _require_market_data(market_data)
     s = _validate_side(side)
     eb = _validate_entry_bar(entry_bar, md.n_bars)
+    if cfg.activation is None:
+        if s > 0:
+            peak = _running_extreme_since(md.high, eb, maximum=True)
+            return peak * (1.0 - cfg.percent)
+        trough = _running_extreme_since(md.low, eb, maximum=False)
+        return trough * (1.0 + cfg.percent)
+
+    entry = _validate_entry_price(entry_price)
+    n = md.n_bars
     if s > 0:
         peak = _running_extreme_since(md.high, eb, maximum=True)
-        return peak * (1.0 - cfg.percent)
-    trough = _running_extreme_since(md.low, eb, maximum=False)
-    return trough * (1.0 + cfg.percent)
+        armed = np.zeros(n, dtype=np.bool_)
+        armed[eb:] = peak[eb:] >= entry * (1.0 + cfg.activation)
+        static = entry * (1.0 - cfg.percent)
+        level = np.where(np.maximum.accumulate(armed), peak * (1.0 - cfg.percent), static)
+    else:
+        trough = _running_extreme_since(md.low, eb, maximum=False)
+        armed = np.zeros(n, dtype=np.bool_)
+        armed[eb:] = trough[eb:] <= entry * (1.0 - cfg.activation)
+        static = entry * (1.0 + cfg.percent)
+        level = np.where(np.maximum.accumulate(armed), trough * (1.0 + cfg.percent), static)
+    level = np.asarray(level, dtype=np.float64)
+    level[:eb] = np.nan
+    return level
 
 
 def chandelier_level(
@@ -567,7 +838,7 @@ def is_triggered(
 
 def _exit_direction(cfg: Exit, side: int) -> _AboveBelow:
     """Whether an exit's level lies above or below the price, given the side."""
-    if isinstance(cfg, TakeProfit):
+    if _is_take_profit(cfg):
         return "above" if side > 0 else "below"
     return "below" if side > 0 else "above"
 
@@ -589,6 +860,24 @@ def exit_level(
     """
     if isinstance(cfg, TakeProfit):
         return take_profit_level(cfg, market_data, side=side, entry_price=entry_price)
+    if isinstance(cfg, ATRTakeProfit):
+        return atr_take_profit_level(
+            cfg,
+            market_data,
+            side=side,
+            entry_price=entry_price,
+            entry_bar=entry_bar,
+            atr_series=atr_series,
+        )
+    if isinstance(cfg, RiskRewardTP):
+        return risk_reward_take_profit_level(
+            cfg,
+            market_data,
+            side=side,
+            entry_price=entry_price,
+            entry_bar=entry_bar,
+            atr_series=atr_series,
+        )
     if isinstance(cfg, StopLoss):
         return stop_loss_level(cfg, market_data, side=side, entry_price=entry_price)
     if isinstance(cfg, ATRStop):
@@ -601,7 +890,13 @@ def exit_level(
             atr_series=atr_series,
         )
     if isinstance(cfg, TrailingStop):
-        return trailing_stop_level(cfg, market_data, side=side, entry_bar=entry_bar)
+        return trailing_stop_level(
+            cfg,
+            market_data,
+            side=side,
+            entry_bar=entry_bar,
+            entry_price=entry_price,
+        )
     if isinstance(cfg, ChandelierExit):
         return chandelier_level(
             cfg, market_data, side=side, entry_bar=entry_bar, atr_series=atr_series
@@ -700,11 +995,11 @@ def first_reached_exit(
 def scale_out_fraction(cfg: Exit) -> float:
     """The scale-out fraction an exit exits when it fires (§6.4).
 
-    ``TakeProfit`` exits ``cfg.scale_out`` of the position; every stop (``ATRStop``,
-    ``TrailingStop``, ``ChandelierExit``, ``TimeExit``) always exits 100% of the
-    remaining position.
+    ``TakeProfit``, ``ATRTakeProfit``, and ``RiskRewardTP`` exit ``cfg.scale_out`` of
+    the position; every stop (``ATRStop``, ``TrailingStop``, ``ChandelierExit``,
+    ``TimeExit``) always exits 100% of the remaining position.
     """
-    if isinstance(cfg, TakeProfit):
+    if _is_take_profit(cfg):
         return cfg.scale_out
     return 1.0
 
@@ -821,7 +1116,7 @@ class RiskConfig:
                 f"RiskConfig.sizing must be a SizeModel; got {type(self.sizing).__name__}"
             )
         ordered = _coerce_exits(self.exit)
-        total = sum(scale_out_fraction(e) for e in ordered if isinstance(e, TakeProfit))
+        total = sum(scale_out_fraction(e) for e in ordered if _is_take_profit(e))
         if total > 1.0 + 1e-12:
             raise ConfigError(
                 f"take-profit scale_out fractions sum to {total}; must not exceed 1.0"

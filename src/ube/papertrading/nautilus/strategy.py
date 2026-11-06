@@ -37,6 +37,7 @@ from ube.core.risk.exits import (
     Exit,
     TimeExit,
     TrailingStop,
+    exit_atr_config,
     exit_level,
     exit_triggered,
     first_reached_exit,
@@ -222,8 +223,9 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
         """Largest ``period`` among configured ATR-style exits; 0 if none."""
         period = 0
         for cfg in self._exits:
-            if isinstance(cfg, (ATRStop, ChandelierExit)):
-                period = max(period, int(getattr(cfg, "period", 14)))
+            atr_cfg = exit_atr_config(cfg)
+            if atr_cfg is not None:
+                period = max(period, int(atr_cfg.period))
         return period
 
     def exit_seed(self) -> ExitSeed | None:
@@ -475,11 +477,13 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
             # (seed bars + window bars seen so far), silently disabling the risk exit for
             # the whole window (fail-open — the trade then closed on a signal instead).
             atr_series = None
-            atr_name = getattr(cfg, "atr", None)
-            if atr_name is not None and aux_atr is not None and atr_name in aux_atr:
-                atr_series = self._resolve_exit_atr(
-                    str(atr_name), aux_atr[atr_name], md, getattr(cfg, "period", 14)
-                )
+            atr_cfg = exit_atr_config(cfg)
+            if atr_cfg is not None:
+                atr_name = atr_cfg.atr
+                if atr_name is not None and aux_atr is not None and atr_name in aux_atr:
+                    atr_series = self._resolve_exit_atr(
+                        str(atr_name), aux_atr[atr_name], md, atr_cfg.period
+                    )
             try:
                 triggered = exit_triggered(
                     cfg,
@@ -496,11 +500,13 @@ class UbePaperStrategy(Strategy):  # type: ignore[misc]
                 name = type(cfg).__name__
                 reason = {
                     "TakeProfit": "take_profit",
+                    "ATRTakeProfit": "take_profit",
+                    "RiskRewardTP": "take_profit",
                     "StopLoss": "stop_loss",
                     "ATRStop": "atr_stop",
                     "TrailingStop": "trailing_stop",
                     "TimeExit": "time_exit",
-                    "ChandelierExit": "chandelier_exit",
+                    "ChandelierExit": "chandelier",
                 }.get(name, name.lower())
                 # §9.4 alignment: only "touched" exits carry a fill level. TimeExit has no
                 # level at all, and "close"-triggered exits are evaluated against the close

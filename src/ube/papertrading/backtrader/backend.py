@@ -46,7 +46,7 @@ from ube.core.data import MarketData
 from ube.core.errors import EngineError
 from ube.core.instrument import Instrument, allows_short
 from ube.core.ledger import EventType
-from ube.core.risk.exits import ATRStop, ChandelierExit
+from ube.core.risk.exits import exit_atr_config
 from ube.core.signals import Signals
 from ube.papertrading.core import (
     PaperEngine,
@@ -96,8 +96,9 @@ def _max_atr_period(risk: Any) -> int:
         return 0
     period = 0
     for cfg in exits:
-        if isinstance(cfg, (ATRStop, ChandelierExit)):
-            period = max(period, int(getattr(cfg, "period", 14)))
+        atr_cfg = exit_atr_config(cfg)
+        if atr_cfg is not None:
+            period = max(period, int(atr_cfg.period))
     return period
 
 

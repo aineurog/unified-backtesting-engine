@@ -27,12 +27,15 @@ from ube.core.risk.aux import (
 )
 from ube.core.risk.exits import (
     ATRStop,
+    ATRTakeProfit,
     ChandelierExit,
     Exit,
+    RiskRewardTP,
     StopLoss,
     TakeProfit,
     TimeExit,
     TrailingStop,
+    exit_atr_config,
     exit_level,
     exit_triggered,
     scale_out_fraction,
@@ -58,7 +61,7 @@ def resolve_atr_series_map(
     """The main-grid ATR series per exit index, for the ATR/Chandelier exits that need one."""
     out: dict[int, np.ndarray] = {}
     for idx, exit in enumerate(exits):
-        if isinstance(exit, (ATRStop, ChandelierExit)):
+        if exit_atr_config(exit) is not None:
             out[idx] = atr_series_for_exit(exit, aux_data, data)
     return out
 
@@ -93,7 +96,7 @@ def exit_reason_label(cfg: Exit) -> str:
         return "chandelier"
     if isinstance(cfg, TrailingStop):
         return "trailing_stop"
-    if isinstance(cfg, TakeProfit):
+    if isinstance(cfg, (TakeProfit, ATRTakeProfit, RiskRewardTP)):
         return "take_profit"
     if isinstance(cfg, StopLoss):
         return "stop_loss"
