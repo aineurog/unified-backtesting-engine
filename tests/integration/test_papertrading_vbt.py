@@ -10,6 +10,7 @@ positions), because every window re-derives its start and checkpoint balance fro
 from __future__ import annotations
 
 from math import inf, nextafter
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -25,7 +26,7 @@ from ube.core.risk.sizing import SizeModel
 from ube.core.signals import Signals, from_target
 from ube.papertrading import get_paper_engine, get_state_class, init, run
 from ube.papertrading.config import PaperConfig
-from ube.papertrading.core import _open_position_from_ledger, step
+from ube.papertrading.core import _open_position_from_ledger, run_auto, step
 from ube.papertrading.vbt.backend import (
     VbtPaperEngine,
     _apply_policy,
@@ -166,6 +167,66 @@ def test_pending_decisions_execute_across_single_bar_polls(
         (int(timestamps[2]), "long_exit"),
     ]
     assert state.open_position is None
+
+
+@pytest.mark.parametrize("timing", ["next_open", "next_close"])
+def test_run_auto_streams_across_a_carried_position(
+    timing: ExecutionTiming,
+) -> None:
+    data = synthetic_bars(PRESETS[AC], n_bars=6, seed=3)
+    targets = (1, 1, 0, 0, 0, 0)
+    cfg = _config(execution_timing=timing)
+    state = init(cfg)
+    events: list[LedgerEvent] = []
+    timestamps = data.timestamps.as_unit("ns").asi8
+
+    for i in range(data.n_bars):
+        events.extend(
+            run_auto(data.head(i + 1), lambda md: targets[md.n_bars - 1], cfg, state)
+        )
+
+    fills = [event for event in events if event.event_type is EventType.FILL]
+    assert len(fills) == 2
+    expected_entry = float(data.open[1] if timing == "next_open" else data.close[1])
+    expected_exit = float(data.open[3] if timing == "next_open" else data.close[3])
+    assert fills[0].timestamp == int(timestamps[1])
+    assert fills[1].timestamp == int(timestamps[3])
+    assert fills[0].price == pytest.approx(expected_entry)
+    assert fills[1].price == pytest.approx(expected_exit)
+    assert state.open_position is None
+
+
+def test_pending_decision_survives_save_and_load(tmp_path: Path) -> None:
+    data = synthetic_bars(PRESETS[AC], n_bars=6, seed=3)
+    signals = from_target(np.array([1, 1, 0, 0, 0, 0]))
+    state_path = tmp_path / "paper.sqlite"
+    cfg = _config(state_path=str(state_path))
+    state = init(cfg)
+
+    state, _ = step(
+        _slice_md(data, slice(0, 1)), _slice_sig(signals, slice(0, 1)), state, cfg
+    )
+    assert state.pending_decision is not None
+
+    loaded = type(state).load(str(state_path))
+    assert loaded.pending_decision == state.pending_decision
+
+    events: list[LedgerEvent] = []
+    for i in range(1, data.n_bars):
+        loaded, new_events = step(
+            _slice_md(data, slice(0, i + 1)),
+            _slice_sig(signals, slice(0, i + 1)),
+            loaded,
+            cfg,
+        )
+        events.extend(new_events)
+
+    timestamps = data.timestamps.as_unit("ns").asi8
+    fills = [event for event in events if event.event_type is EventType.FILL]
+    assert len(fills) == 2
+    assert fills[0].timestamp == int(timestamps[1])
+    assert fills[1].timestamp == int(timestamps[3])
+    assert loaded.open_position is None
 
 
 # ---------------------------------------------------------------------------

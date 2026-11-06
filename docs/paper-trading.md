@@ -32,9 +32,20 @@ window advances beyond the cursor. Bar gaps are allowed. Duplicate or stale
 input raises `DuplicateBarError`.
 
 `run_auto(data, signal_fn, config, state=...)` evaluates a target callable over
-each growing prefix and processes only the suffix after the cursor. `run()` is a
-strategy-keyed load-or-initialize wrapper around `step()` and requires a
-`db_path` argument or `config.state_path`.
+each growing prefix and processes only the bars after the cursor. VectorBT and
+Backtrader receive the full supplied series on each call, because they replay
+the carried entry and indicator warmup; the other engines receive only the new
+suffix. `run()` is a strategy-keyed load-or-initialize wrapper around `step()`
+and requires a `db_path` argument or `config.state_path`.
+
+### Deferred decisions
+
+Under `next_open`/`next_close`, a signal evaluated on a step's final bar has no
+execution bar yet. The backend stores it in `PaperState.pending_decision` and
+executes it on the first bar after the decision timestamp in the next call, so
+one-bar polls do not drop the last signal. The payload is engine-specific —
+Nautilus stores an order intent, VectorBT and Backtrader store the encoded
+signal flags — so resume a session on the engine that wrote it.
 
 Persistence helpers store state, reconstructed trades, and equity snapshots.
 The package currently records equity points per step rather than rebuilding a

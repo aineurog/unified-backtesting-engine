@@ -549,7 +549,11 @@ class PaperState:
             path-dependent exit needs it.
         pending_decision: A decision taken on the last processed bar whose execution bar
             has not arrived yet (§6.1). Persisted so a live poll that delivers one new bar
-            at a time never drops a signal. ``None`` when no decision is pending.
+            at a time never drops a signal. The payload is engine-specific: Nautilus stores
+            an order intent (``{"kind": "open" | "close" | "reverse", "side": ...}``, plus
+            risk-exit intents) while vectorbt/backtrader store the encoded signal flags
+            (``{"kind": "signal", "ts": <int ns>, "signals": {...}}``). Resume a session on
+            the engine that wrote it. ``None`` when no decision is pending.
         stats_trade_count: Closed trades as of the last snapshot written during this
             process. Informational only; resume-safe snapshot idempotency is determined
             from the database.

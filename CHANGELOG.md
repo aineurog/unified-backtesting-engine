@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subsequent bar using the configured timing. This preserves final-bar signals across
   one-bar polls; vectorbt/backtrader still require the replay history needed to rebuild
   an open position. The paper-state sqlite schema migrates automatically.
+- `run_auto()` passes vectorbt/backtrader the full supplied series instead of the
+  post-cursor suffix, so a carried position can resume across one-bar polls instead of
+  failing when the fetch window excludes the entry bar.
 
 ## [Unreleased]
 

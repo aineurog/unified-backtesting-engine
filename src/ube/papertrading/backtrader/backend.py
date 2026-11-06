@@ -311,9 +311,11 @@ class BacktraderPaperEngine(PaperEngine):
                 pending_execution_idx = None
         if open_pos is not None:
             side = int(open_pos.side)
-            entry_reemitted = bool(
-                win_sig.long_entry[0] if side == 1 else win_sig.short_entry[0]
-            )
+            # The carried entry is decided on the bar before its fill bar, which can
+            # precede the replay window; check the full supplied series, not ``win_sig[0]``.
+            entry_idx = int(np.searchsorted(ts, int(open_pos.entry_ns), side="left")) - 1
+            entry_flag = signals.long_entry if side == 1 else signals.short_entry
+            entry_reemitted = entry_idx >= 0 and bool(entry_flag[entry_idx])
             entry_here = (
                 bool(encoded.long_entry[0]) if side == 1 else bool(encoded.short_entry[0])
             )

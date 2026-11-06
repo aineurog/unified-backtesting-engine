@@ -1307,6 +1307,9 @@ def run_auto(
     processed, so repeated calls with appended history continue the session (the
     signal-function state lives in ``state.signal_fn_state``; the full target array is
     recomputed from history each call, which matches ``from_callable`` semantics).
+    Window-replay engines (vectorbt, backtrader) are handed the full supplied series,
+    not just the post-cursor suffix: they have to re-read the carried entry and warmup
+    bars to rebuild an open position.
 
     Args:
         data: The (possibly full) bar series, or ``{instrument_id: MarketData}`` for a
@@ -1340,9 +1343,13 @@ def run_auto(
     if a >= n:
         return []
 
+    # Window-replay engines rebuild an open position from the bars they replay, so the
+    # slice must keep the history before the cursor; the backend derives its own window
+    # start from the state. Streaming engines only ever see the new bars.
+    start = 0 if get_paper_engine(config.engine).WINDOW_REPLAY else a
     _, events = step(
-        _suffix_market_data(data, a),
-        _suffix_signals(full_targets, a),
+        _suffix_market_data(data, start),
+        _suffix_signals(full_targets, start),
         state,
         config,
     )
@@ -1380,6 +1387,7 @@ def _run_auto_portfolio(
 
     slices_data: dict[str, MarketData] = {}
     slices_signals: dict[str, Signals] = {}
+    window_replay = get_paper_engine(config.engine).WINDOW_REPLAY
     for symbol in portfolio.instrument_ids:
         md = data_map[symbol]
         fn = fn_map[symbol]
@@ -1398,8 +1406,9 @@ def _run_auto_portfolio(
         a = _cursor_offset(md, leg_state.last_processed_ns)
         if a >= n:
             continue
-        slices_data[symbol] = _suffix_market_data(md, a)
-        slices_signals[symbol] = _suffix_signals(full_targets, a)
+        start = 0 if window_replay else a
+        slices_data[symbol] = _suffix_market_data(md, start)
+        slices_signals[symbol] = _suffix_signals(full_targets, start)
 
     if not slices_data:
         return []
