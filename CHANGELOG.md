@@ -20,15 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ATR stop resolves the same named `atr` `aux_data` series as a top-level one.
   Honoured by vectorbt (via the core re-timing fold), backtrader, Nautilus, and all
   paper engines; vectorbt rejects partial `scale_out`, as it does for the other
-  take-profits. `initial_risk_distance` / `risk_reward_take_profit_level` expose the
-  risk and target computations, and `exit_atr_config` resolves a nested ATR config.
+  take-profits. `risk_reward_initial_risk_distance` /
+  `risk_reward_take_profit_level` expose the risk and target computations, and
+  `exit_atr_config` resolves a nested ATR config.
 - `TrailingStop(..., activation=...)`: the stop now holds a static entry-anchored
   level (`entry * (1 - percent)` long / `entry * (1 + percent)` short) until price
   moves `activation` in the favourable direction, then trails the running
   peak/trough. The default `activation=None` preserves the previous behaviour. The
   level is computed in core, so vectorbt, backtrader, Nautilus, and all three paper
   engines share it.
-- Initial project scaffold (structure only, no implementation).
 - Statistics: integrate StratStat (`stratstat>=0.1.0`). `BacktestResult.stats`
   is computed eagerly by `ube.run()` across the returns, trades, exposure, and
   benchmark tiers; paper sessions replace the current wide-format stats row in

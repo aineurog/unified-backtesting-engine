@@ -145,7 +145,7 @@ The risk reference depends on the linked stop:
 |---|---|
 | `StopLoss`, `TrailingStop` | `entry × percent` |
 | `ATRStop` | `mult × ATR` at the entry bar |
-| `ChandelierExit` | distance from entry to the entry bar's chandelier level |
+| `ChandelierExit` | distance from entry to the entry bar's chandelier level: `high[entry_bar] - mult × ATR` long, `low[entry_bar] + mult × ATR` short |
 
 The target is set once at entry and does not follow a trailing stop. An
 ATR-consuming linked stop (or `ChandelierExit`) requires the same named `atr`

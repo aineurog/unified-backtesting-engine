@@ -28,8 +28,8 @@ from ube.core.risk import (
     exit_level,
     exit_triggered,
     first_reached_exit,
-    initial_risk_distance,
     is_triggered,
+    risk_reward_initial_risk_distance,
     risk_reward_take_profit_level,
     scale_out_fraction,
     scale_out_plan,
@@ -272,63 +272,63 @@ def test_atr_take_profit_level_validates_entry_bar_and_side():
         TrailingStop(0.02, activation=0.01),
     ],
 )
-def test_initial_risk_distance_percentage_stops(stop):
+def test_risk_reward_initial_risk_distance_percentage_stops(stop):
     md = _md([100, 101, 102])
     rr = RiskRewardTP(2.0, stop)
-    assert initial_risk_distance(
+    assert risk_reward_initial_risk_distance(
         rr, market_data=md, side=1, entry_price=100
     ) == pytest.approx(2.0)
-    assert initial_risk_distance(
+    assert risk_reward_initial_risk_distance(
         rr, market_data=md, side=-1, entry_price=100
     ) == pytest.approx(2.0)
 
 
 @pytest.mark.parametrize("trailing", [False, True])
-def test_initial_risk_distance_atr_stop_uses_entry_bar_atr(trailing):
+def test_risk_reward_initial_risk_distance_atr_stop_uses_entry_bar_atr(trailing):
     md = _md([100, 101, 102])
     atr_series = np.array([1.0, 2.0, 3.0])
     rr = RiskRewardTP(2.0, ATRStop(3, trailing=trailing))
-    assert initial_risk_distance(
+    assert risk_reward_initial_risk_distance(
         rr, market_data=md, side=1, entry_price=100, entry_bar=1, atr_series=atr_series
     ) == pytest.approx(6.0)
-    assert initial_risk_distance(
+    assert risk_reward_initial_risk_distance(
         rr, market_data=md, side=-1, entry_price=100, entry_bar=1, atr_series=atr_series
     ) == pytest.approx(6.0)
 
 
-def test_initial_risk_distance_chandelier_uses_entry_bar_extreme():
+def test_risk_reward_initial_risk_distance_chandelier_uses_entry_bar_extreme():
     md = _md([100, 101, 102], high=[101, 105, 103], low=[99, 96, 98])
     atr_series = np.ones(3)
     rr = RiskRewardTP(2.0, ChandelierExit(2))
     # long: entry 104, level = high[1] - 2*1 = 103 -> risk 1
-    assert initial_risk_distance(
+    assert risk_reward_initial_risk_distance(
         rr, market_data=md, side=1, entry_price=104, entry_bar=1, atr_series=atr_series
     ) == pytest.approx(1.0)
     # short: entry 97, level = low[1] + 2*1 = 98 -> risk 1
-    assert initial_risk_distance(
+    assert risk_reward_initial_risk_distance(
         rr, market_data=md, side=-1, entry_price=97, entry_bar=1, atr_series=atr_series
     ) == pytest.approx(1.0)
 
 
-def test_initial_risk_distance_rejects_non_positive():
+def test_risk_reward_initial_risk_distance_rejects_non_positive():
     md = _md([100, 100], high=[110, 110], low=[99, 99])
     rr = RiskRewardTP(2.0, ChandelierExit(2))
     # long level = 110 - 2 = 108 is above entry 100 -> negative risk
     with pytest.raises(ConfigError):
-        initial_risk_distance(
+        risk_reward_initial_risk_distance(
             rr, market_data=md, side=1, entry_price=100, atr_series=np.ones(2)
         )
 
 
-def test_initial_risk_distance_validates_entry_bar_and_side():
+def test_risk_reward_initial_risk_distance_validates_entry_bar_and_side():
     md = _md([100, 101, 102])
     rr = RiskRewardTP(2.0, StopLoss(0.02))
     with pytest.raises(ConfigError):
-        initial_risk_distance(
+        risk_reward_initial_risk_distance(
             rr, market_data=md, side=1, entry_price=100, entry_bar=3
         )
     with pytest.raises(ConfigError):
-        initial_risk_distance(rr, market_data=md, side=0, entry_price=100)
+        risk_reward_initial_risk_distance(rr, market_data=md, side=0, entry_price=100)
 
 
 def test_risk_reward_take_profit_level_long_and_short():

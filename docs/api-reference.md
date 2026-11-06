@@ -237,7 +237,7 @@ without running an engine:
 | `is_triggered(trigger, level, *, high, low, close, direction)` | Apply the trigger rule to a raw level array. |
 | `first_reached_exit(levels, *, open_price, triggered=None)` | Which of several touched levels fired first (by distance from the open). |
 | `scale_out_fraction(cfg)` | The fraction an exit takes (only `TakeProfit` / `ATRTakeProfit` / `RiskRewardTP` can be `!= 1.0`). |
-| `initial_risk_distance(cfg, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Distance from entry to a `RiskRewardTP`'s linked stop level. |
+| `risk_reward_initial_risk_distance(cfg, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Distance from entry to a `RiskRewardTP`'s linked stop level. |
 | `risk_reward_take_profit_level(cfg, market_data, *, side, entry_price, entry_bar=0, atr_series=None)` | Per-bar target level for a `RiskRewardTP`. |
 | `exit_atr_config(cfg)` | The ATR-consuming config an exit references (resolves through a `RiskRewardTP`'s nested stop), or `None`. |
 | `scale_out_plan(exits, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Ordered `ExitPlan` of fractions + per-exit triggered masks. |

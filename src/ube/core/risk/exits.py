@@ -54,7 +54,7 @@ __all__ = [
     "take_profit_level",
     "atr_take_profit_level",
     "risk_reward_take_profit_level",
-    "initial_risk_distance",
+    "risk_reward_initial_risk_distance",
     "exit_atr_config",
     "atr_stop_level",
     "trailing_stop_level",
@@ -338,7 +338,7 @@ class RiskRewardTP:
 
     The target is anchored once, at entry: ``target = entry ± ratio * risk``, where
     ``risk`` is the distance from ``entry`` to the stop's initial level, computed by
-    :func:`initial_risk_distance`. With a ``StopLoss(percent)`` or
+    :func:`risk_reward_initial_risk_distance`. With a ``StopLoss(percent)`` or
     ``TrailingStop(percent)`` the risk is ``entry * percent``; with an ``ATRStop`` it is
     ``mult * ATR``; with a ``ChandelierExit`` it is the distance to the entry bar's
     chandelier level. The target does not move while the linked stop trails — it is a
@@ -568,7 +568,7 @@ def atr_take_profit_level(
     return entry + cfg.mult * atr_arr if s > 0 else entry - cfg.mult * atr_arr
 
 
-def initial_risk_distance(
+def risk_reward_initial_risk_distance(
     cfg: RiskRewardTP,
     *,
     market_data: MarketData,
@@ -627,13 +627,14 @@ def risk_reward_take_profit_level(
 ) -> np.ndarray:
     """Per-bar risk/reward target: a constant ``entry ± ratio * initial_risk`` (§8).
 
-    The risk is taken from :func:`initial_risk_distance` at ``entry_bar`` and the target
-    is anchored there; it does not move while a linked trailing stop ratchets.
+    The risk is taken from :func:`risk_reward_initial_risk_distance` at
+    ``entry_bar`` and the target is anchored there; it does not move while a linked
+    trailing stop ratchets.
     """
     md = _require_market_data(market_data)
     s = _validate_side(side)
     entry = _validate_entry_price(entry_price)
-    risk = initial_risk_distance(
+    risk = risk_reward_initial_risk_distance(
         cfg,
         market_data=md,
         side=s,
