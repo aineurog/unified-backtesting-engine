@@ -56,6 +56,7 @@ from ube.papertrading.core import (
     register_paper_engine,
     register_state_class,
 )
+from ube.papertrading.pending import pending_decision, pending_signal_events
 
 from .state import (
     BacktraderPaperState,
@@ -297,8 +298,22 @@ class BacktraderPaperEngine(PaperEngine):
             policy=str(policy),
             initial_side=int(open_pos.side) if open_pos is not None else 0,
         )
+        pending = state.pending_decision
+        pending_execution_idx: int | None = None
+        if pending is not None:
+            pending_ts = pending.get("ts")
+            if isinstance(pending_ts, bool) or not isinstance(pending_ts, int):
+                raise EngineError("backtrader paper state has an invalid pending decision")
+            pending_execution_idx = int(
+                np.searchsorted(win_ts, int(pending_ts), side="right")
+            )
+            if pending_execution_idx >= len(win_ts):
+                pending_execution_idx = None
         if open_pos is not None:
             side = int(open_pos.side)
+            entry_reemitted = bool(
+                win_sig.long_entry[0] if side == 1 else win_sig.short_entry[0]
+            )
             entry_here = (
                 bool(encoded.long_entry[0]) if side == 1 else bool(encoded.short_entry[0])
             )
@@ -315,7 +330,7 @@ class BacktraderPaperEngine(PaperEngine):
                 if warned is None:
                     warned = set()
                     state._carried_warned = warned  # transient; never persisted
-                if warn_key not in warned:
+                if warn_key not in warned and not entry_reemitted:
                     warned.add(warn_key)
                     warnings.warn(
                         f"backtrader paper: carried {'long' if side == 1 else 'short'} entered "
@@ -415,6 +430,7 @@ class BacktraderPaperEngine(PaperEngine):
             config=bt_config,
             carried=carried,
             aux_data=aux or None,
+            pending_decision=pending if pending_execution_idx is not None else None,
         )
 
         events = list(result.ledger.events)
@@ -438,7 +454,20 @@ class BacktraderPaperEngine(PaperEngine):
                 )
             ]
 
-        return events_after_cursor(events, state.ledger, cursor)
+        new_events = events_after_cursor(events, state.ledger, cursor)
+        if pending_execution_idx is not None:
+            state.pending_decision = None
+        can_queue = pending is None or pending_execution_idx is not None
+        if can_queue and (cursor is None or int(win_ts[-1]) > int(cursor)):
+            queued = pending_decision(
+                encoded,
+                timestamp=int(win_ts[-1]),
+                timing=config.base.execution_timing,
+            )
+            if queued is not None:
+                state.pending_decision = queued
+                new_events.extend(pending_signal_events(queued, iid, include_side=True))
+        return new_events
 
 
 register_paper_engine("backtrader", BacktraderPaperEngine)

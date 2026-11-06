@@ -102,6 +102,9 @@ class BtRunContext:
     #: broker and the strategy's own tracker at ``start()``, never re-executed. ``None`` for
     #: a fresh backtest (and the cold paper window).
     carried: BtCarriedFill | None = None
+    #: Execution row and original timestamp for a decision carried from a paper poll.
+    pending_execution_bar: int | None = None
+    pending_decision_ts: int | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,7 @@ class BtSignalRecord:
     bar: int  # the bar the strategy saw the signal on
     action: str
     side: int = 0
+    timestamp: int | None = None
 
 
 @dataclass(frozen=True)
@@ -511,8 +515,19 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
                         if isinstance(fired, _SignalExit)
                         else i
                     )
+                    pending_ts = (
+                        ctx.pending_decision_ts
+                        if isinstance(fired, _SignalExit)
+                        and i == ctx.pending_execution_bar
+                        else None
+                    )
                     self.signal_records.append(
-                        BtSignalRecord(signal_bar, action, exit_side)
+                        BtSignalRecord(
+                            max(0, signal_bar) if pending_ts is not None else signal_bar,
+                            action,
+                            exit_side,
+                            pending_ts,
+                        )
                     )
                     self._pending_exit = {
                         "ref": order.ref,
@@ -565,9 +580,18 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         order = self.buy(size=qty) if side == 1 else self.sell(size=qty)
         self.signal_records.append(
             BtSignalRecord(
-                i - self._ctx.signal_bar_offset,
+                (
+                    max(0, i - self._ctx.signal_bar_offset)
+                    if i == self._ctx.pending_execution_bar
+                    else i - self._ctx.signal_bar_offset
+                ),
                 "long_entry" if side == 1 else "short_entry",
                 side,
+                (
+                    self._ctx.pending_decision_ts
+                    if i == self._ctx.pending_execution_bar
+                    else None
+                ),
             )
         )
         self._pending_entry = {

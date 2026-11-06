@@ -15,6 +15,11 @@ folds the resulting execution records into UBE's event ledger.
 - Paper trading uses replay windows so the backend can reconstruct position and
   indicator context from supplied history. Callers must provide enough historical
   bars for the open position and configured warmup needs.
+- A decision on the final bar of a poll is persisted and applied to the first later
+  execution bar. Open positions still require replay history from their entry bar;
+  passing only the newest bar is not sufficient to resume a vectorbt paper window.
+- For close-only feeds, a `next_open` fill is simulated at the next candle's recorded
+  open when that candle arrives; this is not live order routing at that open.
 
 ## Limits
 

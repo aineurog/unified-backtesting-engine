@@ -17,6 +17,7 @@ import pytest
 from ube.core.config import BacktestConfig, SignalConfig
 from ube.core.data import MarketData
 from ube.core.errors import EngineError
+from ube.core.execution import ExecutionTiming
 from ube.core.ledger import EventLedger, EventType, LedgerEvent, trades
 from ube.core.risk import RiskConfig
 from ube.core.risk.exits import ATRStop, TakeProfit
@@ -37,10 +38,13 @@ from ube.testing.synthetic import PRESETS, synthetic_bars
 AC = "crypto_perp"
 
 
-def _config(**kw: object) -> PaperConfig:
+def _config(
+    *, execution_timing: ExecutionTiming = "next_open", **kw: object
+) -> PaperConfig:
     instr = PRESETS[AC].instrument
     bc = BacktestConfig(
         instrument=instr,
+        execution_timing=execution_timing,
         signal=SignalConfig(on_opposite_signal="reverse"),
     )
     return PaperConfig(base=bc, engine="vectorbt", starting_balance=10_000.0, **kw)
@@ -112,6 +116,56 @@ def _run_windows(
 def test_engine_and_state_class_registered() -> None:
     assert get_paper_engine("vectorbt") is VbtPaperEngine
     assert get_state_class("vectorbt") is VbtPaperState
+
+
+@pytest.mark.parametrize("timing", ["next_open", "next_close"])
+def test_pending_decisions_execute_across_single_bar_polls(
+    timing: ExecutionTiming,
+) -> None:
+    data = synthetic_bars(PRESETS[AC], n_bars=6, seed=3)
+    signals = from_target(np.array([1, 1, 0, 0, 0, 0]))
+    cfg = _config(execution_timing=timing)
+    state = init(cfg)
+    events: list[LedgerEvent] = []
+    timestamps = data.timestamps.as_unit("ns").asi8
+
+    for i in range(data.n_bars):
+        state, new_events = step(
+            _slice_md(data, slice(0, i + 1)),
+            _slice_sig(signals, slice(0, i + 1)),
+            state,
+            cfg,
+        )
+        events.extend(new_events)
+        if i == 0:
+            assert state.pending_decision is not None
+            assert state.pending_decision["ts"] == int(timestamps[0])
+        elif i == 1:
+            assert state.pending_decision is None
+        elif i == 2:
+            assert state.pending_decision is not None
+            assert state.pending_decision["ts"] == int(timestamps[2])
+        elif i == 3:
+            assert state.pending_decision is None
+
+    fills = [event for event in events if event.event_type is EventType.FILL]
+    assert len(fills) == 2
+    expected_entry = float(data.open[1] if timing == "next_open" else data.close[1])
+    expected_exit = float(data.open[3] if timing == "next_open" else data.close[3])
+    assert fills[0].timestamp == int(timestamps[1])
+    assert fills[1].timestamp == int(timestamps[3])
+    assert fills[0].price == pytest.approx(expected_entry)
+    assert fills[1].price == pytest.approx(expected_exit)
+    decisions = [
+        event
+        for event in events
+        if event.event_type is EventType.SIGNAL_EVALUATED
+    ]
+    assert [(event.timestamp, event.action) for event in decisions] == [
+        (int(timestamps[0]), "long_entry"),
+        (int(timestamps[2]), "long_exit"),
+    ]
+    assert state.open_position is None
 
 
 # ---------------------------------------------------------------------------

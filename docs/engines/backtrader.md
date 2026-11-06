@@ -19,6 +19,11 @@ strategy, then folds recorded signals and fills into the canonical event ledger.
   the account balance.
 - Paper trading uses replay windows and carries open positions at their original
   quantity. The replay must include the carried entry bar.
+- A decision on the final bar of a poll is persisted and applied to the first later
+  execution bar. Open positions still require replay history from their entry bar;
+  passing only the newest bar is not sufficient to resume a backtrader paper window.
+- For close-only feeds, a `next_open` fill is simulated at the next candle's recorded
+  open when that candle arrives; this is not live order routing at that open.
 
 ## Diagnosing Differences
 

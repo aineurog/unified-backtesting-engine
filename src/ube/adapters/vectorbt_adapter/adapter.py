@@ -65,7 +65,12 @@ from ube.core.errors import (
     EngineError,
     InvalidSignalError,
 )
-from ube.core.execution import ExecutionTiming, decision_index, shift_signals
+from ube.core.execution import (
+    ExecutionTiming,
+    apply_pending_execution,
+    decision_index,
+    shift_signals,
+)
 from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
 from ube.core.ledger import EventLedger, EventType, FXSeries, LedgerEvent, funding_payments
 from ube.core.result import BacktestResult
@@ -319,6 +324,7 @@ class VectorbtAdapter(EngineAdapter):
         config: BacktestConfig,
         *,
         aux_data: Mapping[str, Any] | None = None,
+        pending_decision: Mapping[str, Any] | None = None,
     ) -> BacktestResult:
         """Run a backtest via vectorbt (§4.5).
 
@@ -329,6 +335,8 @@ class VectorbtAdapter(EngineAdapter):
             aux_data: Optional derived-series map (§5.2) referenced by name from ATR exits
                 and volatility_target sizing (``vol`` series must be supplied by the caller;
                 volatility is never computed from the signal data bars, §6.3).
+            pending_decision: A paper decision from an earlier poll. It is placed directly
+                on the first bar after its decision timestamp rather than shifted again.
 
         Returns:
             The canonical :class:`~ube.core.result.BacktestResult`.
@@ -362,11 +370,18 @@ class VectorbtAdapter(EngineAdapter):
         # §4.5/§6.1: a long-only asset class cannot express a short. Validation raises
         # before any engine work rather than letting the engine silently drop it.
         validate_long_only(signals, config.instrument.asset_class)
+        if pending_decision is not None and config.execution_timing == "same_close":
+            raise ConfigError(
+                "pending decisions are only valid with next_open or next_close"
+            )
 
         # §6.1: signals are decision-time. ``exec_signals`` moves each flag onto the bar
         # the configured timing executes it on; the original ``signals`` is kept so the
         # ledger can stamp ``signal_evaluated`` on the decision bar.
         exec_signals = shift_signals(signals, config.execution_timing)
+        exec_signals, pending_execution_bar = apply_pending_execution(
+            data, exec_signals, pending_decision
+        )
 
         overrides = validate_overrides(config.engine_overrides)
         cost_model: CostModel = (
@@ -487,6 +502,8 @@ class VectorbtAdapter(EngineAdapter):
             multiplier=multiplier,
             starting_balance=starting_balance,
             funding_interval_hours=funding_interval_hours,
+            pending_decision=pending_decision,
+            pending_execution_bar=pending_execution_bar,
         )
 
         # Multi-currency normalization (§4.6): build FXSeries from the synthetic-rates
@@ -528,6 +545,8 @@ class VectorbtAdapter(EngineAdapter):
         multiplier: float,
         starting_balance: float,
         funding_interval_hours: float,
+        pending_decision: Mapping[str, Any] | None = None,
+        pending_execution_bar: int | None = None,
     ) -> EventLedger:
         """Fold vectorbt trades into a canonical append-only ledger (§4.6)."""
         bar_ts = bar_timestamps_ns(data)
@@ -672,15 +691,35 @@ class VectorbtAdapter(EngineAdapter):
                     eval_action = "long_entry"
                 elif bool(signals.short_entry[decision_bar]):
                     eval_action = "short_entry"
+            eval_ts = (
+                int(pending_decision["ts"])
+                if (
+                    pending_decision is not None
+                    and pending_execution_bar == entry_bar
+                    and isinstance(pending_decision.get("ts"), int)
+                )
+                else (
+                    int(bar_ts[decision_bar])
+                    if decision_bar is not None
+                    else None
+                )
+            )
+            if eval_action is None and eval_ts is not None and pending_decision is not None:
+                pending_signals = pending_decision.get("signals", {})
+                if isinstance(pending_signals, Mapping):
+                    if bool(pending_signals.get("long_entry", False)):
+                        eval_action = "long_entry"
+                    elif bool(pending_signals.get("short_entry", False)):
+                        eval_action = "short_entry"
             if eval_action is not None:
                 _add(
                     LedgerEvent(
                         EventType.SIGNAL_EVALUATED,
-                        int(bar_ts[decision_bar]),
+                        int(eval_ts if eval_ts is not None else bar_ts[decision_bar]),
                         instrument_id,
                         action=eval_action,
                     ),
-                    int(bar_ts[decision_bar]),
+                    int(eval_ts if eval_ts is not None else bar_ts[decision_bar]),
                 )
 
             # Entry fill + cash leg + position change.
@@ -742,14 +781,24 @@ class VectorbtAdapter(EngineAdapter):
                     exit_action = "long_exit" if side == 1 else "short_exit"
                 else:
                     exit_action = f"exit_{exit_reason}"
+                signal_ts = (
+                    int(pending_decision["ts"])
+                    if (
+                        pending_decision is not None
+                        and pending_execution_bar == exit_bar
+                        and exit_reason == "signal"
+                        and isinstance(pending_decision.get("ts"), int)
+                    )
+                    else int(bar_ts[exit_bar])
+                )
                 _add(
                     LedgerEvent(
                         EventType.SIGNAL_EVALUATED,
-                        int(bar_ts[exit_bar]),
+                        signal_ts,
                         instrument_id,
                         action=exit_action,
                     ),
-                    int(bar_ts[exit_bar]),
+                    signal_ts,
                 )
 
             # Exit ORDER_SUBMITTED (§4.6): mirrors the nautilus actor, which records one

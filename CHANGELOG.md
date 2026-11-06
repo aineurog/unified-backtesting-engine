@@ -17,10 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the same signals produced different results per engine. All engines now honour
   the same setting. Set `execution_timing="same_close"` to restore the old
   vectorbt/nautilus behaviour.
-- Nautilus paper trading carries a decision taken on a step's final bar in
-  `PaperState.pending_decision` and executes it on the next step's first bar, so
-  live polls that deliver one new bar at a time no longer drop the last signal.
-  The paper-state sqlite schema migrates automatically.
+- Paper trading on Nautilus, vectorbt, and backtrader carries a decision taken on a
+  step's final bar in `PaperState.pending_decision` and executes it on the first
+  subsequent bar using the configured timing. This preserves final-bar signals across
+  one-bar polls; vectorbt/backtrader still require the replay history needed to rebuild
+  an open position. The paper-state sqlite schema migrates automatically.
 
 ## [Unreleased]
 

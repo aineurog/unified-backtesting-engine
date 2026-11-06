@@ -26,6 +26,7 @@ schedule.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal
 
 import numpy as np
@@ -37,6 +38,7 @@ from ube.core.signals import Signals
 __all__ = [
     "EXECUTION_TIMINGS",
     "ExecutionTiming",
+    "apply_pending_execution",
     "decision_index",
     "execution_index",
     "execution_price",
@@ -132,4 +134,61 @@ def shift_signals(signals: Signals, timing: ExecutionTiming) -> Signals:
         long_exit=_shift(signals.long_exit),
         short_entry=_shift(signals.short_entry),
         short_exit=_shift(signals.short_exit),
+    )
+
+
+def apply_pending_execution(
+    data: MarketData,
+    execution_signals: Signals,
+    pending: Mapping[str, object] | None,
+) -> tuple[Signals, int | None]:
+    """Place a persisted paper decision on its first available execution bar.
+
+    Unlike :func:`shift_signals`, this decision was made in an earlier poll, so its
+    execution row is the first bar strictly after ``pending["ts"]``. The original
+    decision timestamp remains in the pending record for ledger attribution.
+    """
+    if pending is None:
+        return execution_signals, None
+    if execution_signals.n_bars != data.n_bars:
+        raise ConfigError("pending execution signals must align with market data")
+
+    decision_ts = pending.get("ts")
+    if isinstance(decision_ts, bool) or not isinstance(decision_ts, (int, np.integer)):
+        raise ConfigError("pending decision must contain an integer 'ts'")
+    signal_flags = pending.get("signals")
+    if not isinstance(signal_flags, Mapping):
+        raise ConfigError("pending decision must contain a 'signals' mapping")
+
+    names = ("long_entry", "long_exit", "short_entry", "short_exit")
+    flags: list[bool] = []
+    for name in names:
+        flag = signal_flags.get(name, False)
+        if not isinstance(flag, bool):
+            raise ConfigError(f"pending decision signal {name!r} must be a bool")
+        flags.append(flag)
+    if not any(flags):
+        raise ConfigError("pending decision must contain at least one signal")
+
+    timestamps = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    execution_idx = int(np.searchsorted(timestamps, int(decision_ts), side="right"))
+    if execution_idx >= data.n_bars:
+        return execution_signals, None
+
+    columns = [
+        np.array(execution_signals.long_entry, dtype=bool, copy=True),
+        np.array(execution_signals.long_exit, dtype=bool, copy=True),
+        np.array(execution_signals.short_entry, dtype=bool, copy=True),
+        np.array(execution_signals.short_exit, dtype=bool, copy=True),
+    ]
+    for column, flag in zip(columns, flags, strict=True):
+        column[execution_idx] = flag
+    return (
+        Signals(
+            long_entry=columns[0],
+            long_exit=columns[1],
+            short_entry=columns[2],
+            short_exit=columns[3],
+        ),
+        execution_idx,
     )

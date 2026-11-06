@@ -58,7 +58,7 @@ from ube.core.config import BacktestConfig
 from ube.core.cost import CostModel, fill_cost, resolve_cost_model, slipped_price
 from ube.core.data import MarketData, resolve_price_precision, snap_prices
 from ube.core.errors import ConfigError, DataShapeError, EngineError, InvalidSignalError
-from ube.core.execution import shift_signals
+from ube.core.execution import apply_pending_execution, shift_signals
 from ube.core.fx import stablecoin_peg_rate, warn_stablecoin_peg
 from ube.core.ledger import (
     EventLedger,
@@ -141,6 +141,7 @@ class BacktraderAdapter(EngineAdapter):
         *,
         aux_data: Mapping[str, Any] | None = None,
         carried: BtCarriedFill | None = None,
+        pending_decision: Mapping[str, Any] | None = None,
     ) -> BacktestResult:
         """Run a backtest via backtrader (§4.5).
 
@@ -155,6 +156,8 @@ class BacktraderAdapter(EngineAdapter):
                 ``data[0]`` must be the carried entry's fill bar; the strategy holds it from
                 bar 0 instead of re-executing it. ``None`` for a fresh backtest and the
                 cold paper window.
+            pending_decision: A paper decision from an earlier poll. It is placed directly
+                on the first bar after its decision timestamp rather than shifted again.
 
         Returns:
             The canonical :class:`~ube.core.result.BacktestResult`.
@@ -183,6 +186,10 @@ class BacktraderAdapter(EngineAdapter):
         # §4.5/§6.1: a long-only asset class cannot express a short. Validation raises
         # before any engine work rather than letting the engine silently drop it.
         validate_long_only(signals, config.instrument.asset_class)
+        if pending_decision is not None and config.execution_timing == "same_close":
+            raise ConfigError(
+                "pending decisions are only valid with next_open or next_close"
+            )
 
         # §6.1 execution timing. Signals are decision-time; the strategy reads the frame
         # on the bar that *executes* the decision, so ``next_*`` shifts every column one
@@ -192,6 +199,9 @@ class BacktraderAdapter(EngineAdapter):
         signal_bar_offset = 0 if timing == "same_close" else 1
         exec_signals = (
             signals if signal_bar_offset == 0 else shift_signals(signals, timing)
+        )
+        exec_signals, pending_execution_bar = apply_pending_execution(
+            data, exec_signals, pending_decision
         )
         fill_at_open = timing == "next_open"
 
@@ -256,6 +266,13 @@ class BacktraderAdapter(EngineAdapter):
             fill_at_open=fill_at_open,
             signal_bar_offset=signal_bar_offset,
             carried=carried,
+            pending_execution_bar=pending_execution_bar,
+            pending_decision_ts=(
+                int(pending_decision["ts"])
+                if pending_decision is not None
+                and isinstance(pending_decision.get("ts"), int)
+                else None
+            ),
         )
         frame = to_signal_frame(data, exec_signals)
         strat = run_backtrader(
@@ -365,15 +382,20 @@ class BacktraderAdapter(EngineAdapter):
 
         # Signal evaluations (§4.6): one per action the strategy took, on the bar it took it.
         for srec in strat.signal_records:
+            signal_ts = (
+                int(srec.timestamp)
+                if srec.timestamp is not None
+                else int(bar_ts[srec.bar])
+            )
             _add(
                 LedgerEvent(
                     EventType.SIGNAL_EVALUATED,
-                    int(bar_ts[srec.bar]),
+                    signal_ts,
                     instrument_id,
                     action=srec.action,
                     side=srec.side,
                 ),
-                int(bar_ts[srec.bar]),
+                signal_ts,
             )
 
         # Orders in strict submission order (chronological for market orders — see
