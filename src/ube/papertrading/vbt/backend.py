@@ -218,7 +218,7 @@ class VbtPaperEngine(PaperEngine):
 
         overrides = dict(config.base.engine_overrides) if config.base.engine_overrides else {}
         iid = state.instrument_id
-        ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
+        ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined, unused-ignore]
         period_ns = int(np.median(np.diff(ts))) if n > 1 else _PERIOD_FALLBACK_NS
         cursor = state.last_processed_ns
         open_pos = state.open_position
@@ -308,7 +308,7 @@ class VbtPaperEngine(PaperEngine):
                 index=lead_ts.append(win_data.timestamps),
             )
             win_ts = np.asarray(
-                win_data.timestamps.as_unit("ns").asi8, dtype=np.int64  # type: ignore[attr-defined]
+                win_data.timestamps.as_unit("ns").asi8, dtype=np.int64  # type: ignore[attr-defined, unused-ignore]
             )
             blank = np.zeros(1, dtype=bool)
             win_sig = Signals(

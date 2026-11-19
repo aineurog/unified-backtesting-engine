@@ -429,7 +429,7 @@ def _drop_warmup_trades(
     if warmup_bars >= len(index):
         return ()
     if isinstance(index, pd.DatetimeIndex):
-        asi8: np.ndarray = index.as_unit("ns").asi8  # type: ignore[attr-defined]
+        asi8: np.ndarray = index.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
         cutoff = int(asi8[warmup_bars])
     else:
         cutoff = int(index[warmup_bars])
@@ -448,7 +448,7 @@ def _drop_warmup_table_rows(
     if warmup_bars >= len(index):
         return table.iloc[0:0]
     if isinstance(index, pd.DatetimeIndex):
-        asi8: np.ndarray = index.as_unit("ns").asi8  # type: ignore[attr-defined]
+        asi8: np.ndarray = index.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
         cutoff = int(asi8[warmup_bars])
     else:
         cutoff = int(index[warmup_bars])

@@ -449,7 +449,7 @@ class NautilusAdapter(EngineAdapter):
         # from_ledger/trade_table/equity_curve consume — the nautilus-cache
         # mark rates registered above do NOT feed those lookups. Absent a
         # declaration the dict is empty and missing pairs raise as before (§4.7).
-        _grid = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
+        _grid = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined, unused-ignore]
         fx_rates = _synthetic_fx_rates(overrides, _grid)
         # Auto-seed a 1:1 USD/USDT rate when the instrument settles in USD
         # but the account base currency is USDT (or vice-versa). USDT is a
@@ -679,7 +679,7 @@ def _carry_rates(cost_model: CostModel) -> tuple[float, float]:
 
 def _bar_timestamps_ns(data: MarketData) -> np.ndarray:
     """The bar-boundary axis as int64 nanoseconds (matching :mod:`ube.core.ledger`)."""
-    return cast(np.ndarray, data.timestamps.as_unit("ns").asi8)  # type: ignore[attr-defined]
+    return cast(np.ndarray, data.timestamps.as_unit("ns").asi8)  # type: ignore[attr-defined, unused-ignore]
 
 
 def _fill_timestamp_ns(row: Any) -> int:

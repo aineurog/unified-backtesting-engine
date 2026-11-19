@@ -59,7 +59,7 @@ def _asi8(index: pd.DatetimeIndex) -> np.ndarray:
     microsecond resolution by default, and ``asi8`` is the canonical accessor but is
     absent from ``pandas-stubs`` (hence the targeted ignore).
     """
-    return cast(np.ndarray, index.as_unit("ns").asi8)  # type: ignore[attr-defined]
+    return cast(np.ndarray, index.as_unit("ns").asi8)  # type: ignore[attr-defined, unused-ignore]
 
 
 class TradingCalendar(ABC):

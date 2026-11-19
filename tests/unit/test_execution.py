@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from tests._engines import ENGINE_MODULES, engine_is_installed
 from ube.core.config import BacktestConfig
 from ube.core.data import MarketData
 from ube.core.errors import ConfigError
@@ -149,6 +150,9 @@ def test_shift_signals_single_bar_drops_everything() -> None:
 
 @pytest.mark.parametrize("timing", EXECUTION_TIMINGS)
 def test_all_engines_honour_execution_timing(timing: str) -> None:
+    missing = [name for name in ENGINE_MODULES if not engine_is_installed(name)]
+    if missing:
+        pytest.skip(f"needs all engines; missing {', '.join(missing)}")
     from ube.adapters.backtrader_adapter.adapter import BacktraderAdapter
     from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
     from ube.adapters.vectorbt_adapter.adapter import VectorbtAdapter

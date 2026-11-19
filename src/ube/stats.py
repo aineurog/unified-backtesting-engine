@@ -1125,7 +1125,7 @@ def _exposure_frame(
     if not isinstance(index, pd.DatetimeIndex) or index.size == 0 or not instruments:
         return None
     try:
-        grid_start = int(index.as_unit("ns").asi8[0])  # type: ignore[attr-defined]
+        grid_start = int(index.as_unit("ns").asi8[0])  # type: ignore[attr-defined, unused-ignore]
     except (AttributeError, ValueError):
         grid_start = int(index[0].value)
 
@@ -1138,7 +1138,7 @@ def _exposure_frame(
                 errors["exposure"] = f"no market data for {instrument_id!r}; exposure skipped"
                 return None
             try:
-                bar_start = int(md.timestamps.as_unit("ns").asi8[0])  # type: ignore[attr-defined]
+                bar_start = int(md.timestamps.as_unit("ns").asi8[0])  # type: ignore[attr-defined, unused-ignore]
             except (AttributeError, ValueError):
                 bar_start = int(md.index[0].value)
             if bar_start > grid_start:

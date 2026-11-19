@@ -120,7 +120,7 @@ def to_nautilus_bars(
     bar_type = build_bar_type(build.instrument_id, derive_bar_period_ns(market_data))
     price_precision = int(build.instrument.price_precision)
     size_precision = int(build.instrument.size_precision)
-    ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
     synthetic_open = fill_price_source == "open"
 
     bars: list[Bar] = []
@@ -168,7 +168,7 @@ def to_signal_map(
             f"signals cover {signals.n_bars} bars but market data has "
             f"{market_data.n_bars}; signal rows must be row-aligned with bars"
         )
-    ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
     return {
         int(ts_ns[i]): (
             bool(signals.long_entry[i]),

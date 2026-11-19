@@ -131,7 +131,7 @@ class NautilusPaperEngine(PaperEngine):
                 else resolve_cost_model(canonical)
             )
 
-            ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+            ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
             ts = np.asarray(ts, dtype=np.int64)
             n = data.n_bars
             period_ns = int(np.median(np.diff(ts))) if n > 1 else 60_000_000_000

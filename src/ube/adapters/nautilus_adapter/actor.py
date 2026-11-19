@@ -215,7 +215,7 @@ class UbeActor(Strategy):  # type: ignore[misc]
         # named ``aux_data`` series (§6.3) — never computed from the signal bars.
         self._vol = self._resolve_vol() if self._sizing.kind == "volatility_target" else None
 
-        ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+        ts_ns = market_data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
         self._ts_to_index: dict[int, int] = {
             int(ts_ns[i]): i for i in range(market_data.n_bars)
         }

@@ -426,7 +426,7 @@ def derive_bar_period_ns(market_data: MarketData | pd.DatetimeIndex) -> int:
             f"cannot derive a bar period from {len(index)} bar(s); "
             "require at least two bars"
         )
-    deltas = np.diff(index.as_unit("ns").asi8)  # type: ignore[attr-defined]
+    deltas = np.diff(index.as_unit("ns").asi8)  # type: ignore[attr-defined, unused-ignore]
     return int(np.median(deltas[deltas > 0]))
 
 

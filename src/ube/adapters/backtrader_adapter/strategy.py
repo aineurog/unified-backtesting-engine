@@ -699,7 +699,6 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         row.
         """
         last = self._ctx.data.n_bars - 1
-        ctx = self._ctx
         close_price = self._raw_fill_price()
         pending = self._pending_exit
         if pending is not None:

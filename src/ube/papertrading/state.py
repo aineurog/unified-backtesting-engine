@@ -781,7 +781,7 @@ class PaperState:
             return None, "config did not resolve to an Instrument"
         if not self.ledger.events:
             return None, "the ledger is empty"
-        ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
+        ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined, unused-ignore]
         first = min(int(e.timestamp) for e in self.ledger.events)
         last = max(int(e.timestamp) for e in self.ledger.events)
         if int(ts[0]) > first or int(ts[-1]) < last:
@@ -1313,7 +1313,7 @@ class PortfolioPaperState(PaperState):
                 equity_note = f"combined equity derivation failed: {type(exc).__name__}: {exc}"
             else:
                 if through_ns is not None:
-                    keep = curve.index.asi8 <= int(through_ns)  # type: ignore[attr-defined]
+                    keep = curve.index.asi8 <= int(through_ns)  # type: ignore[attr-defined, unused-ignore]
                     index, equity = curve.index[keep], curve.equity[keep]
                 else:
                     index, equity = curve.index, curve.equity

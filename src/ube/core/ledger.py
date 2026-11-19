@@ -974,7 +974,7 @@ def positions(ledger: EventLedger, instrument_id: str | None = None) -> Position
 
 def _asi8(index: pd.DatetimeIndex) -> np.ndarray:
     """int64 nanosecond view of a ``DatetimeIndex`` (normalized to ns — pandas 3.x)."""
-    return cast(np.ndarray, index.as_unit("ns").asi8)  # type: ignore[attr-defined]
+    return cast(np.ndarray, index.as_unit("ns").asi8)  # type: ignore[attr-defined, unused-ignore]
 
 
 def _timestamps_ns(md: MarketData) -> np.ndarray:

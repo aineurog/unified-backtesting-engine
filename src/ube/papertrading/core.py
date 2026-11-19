@@ -89,7 +89,7 @@ def _auto_live_anchor_ns(data: MarketData) -> int | None:
     """
     if data.n_bars == 0:
         return None
-    ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
     last_ns = int(ts[data.n_bars - 1])
     if time.time_ns() - last_ns <= _LIVE_ANCHOR_TOLERANCE_NS:
         return last_ns
@@ -741,7 +741,7 @@ def step(
     # backend work (same validate phase as the backtest adapters).
     validate_long_only(signals, asset_class)
 
-    ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
     ts = np.asarray(ts, dtype=np.int64)
     # Monotonicity of the *slice* guards against corrupt/out-of-order data (still a
     # DuplicateBarError — these are effectively replays of already-seen bars).
@@ -1315,7 +1315,7 @@ def _suffix_market_data(data: MarketData, a: int) -> MarketData:
 
 def _cursor_offset(data: MarketData, last_processed_ns: int | None) -> int:
     """First bar index strictly after the persisted cursor."""
-    ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined]
+    ts = np.asarray(data.timestamps.as_unit("ns").asi8, dtype=np.int64)  # type: ignore[attr-defined, unused-ignore]
     if last_processed_ns is None:
         return 0
     return int(np.searchsorted(ts, int(last_processed_ns), side="right"))
@@ -1531,7 +1531,7 @@ class RecordingBackend(PaperEngine):
 
         events: list[LedgerEvent] = []
         iid = state.instrument_id
-        ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+        ts = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
 
         # Resume the simulated position from the state (so resume is exercised).
         sim_side = 0

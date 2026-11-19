@@ -170,7 +170,7 @@ def apply_pending_execution(
     if not any(flags):
         raise ConfigError("pending decision must contain at least one signal")
 
-    timestamps = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined]
+    timestamps = data.timestamps.as_unit("ns").asi8  # type: ignore[attr-defined, unused-ignore]
     execution_idx = int(np.searchsorted(timestamps, int(decision_ts), side="right"))
     if execution_idx >= data.n_bars:
         return execution_signals, None
