@@ -148,9 +148,21 @@ def get_engine(name: str = "auto") -> type[EngineAdapter]:
     key = resolve_engine_name(name)
     adapter = _REGISTRY.get(key)
     if adapter is None:
-        available = registered_engines()
-        raise ConfigError(
-            f"unknown engine {name!r} — registered engines: "
-            f"{', '.join(available) if available else 'none'}"
-        )
+        # Lazy plugin discovery: only an unknown name pays for the entry-point scan,
+        # and a broken plugin never prevents the built-in engines from resolving.
+        from ube.adapters.discovery import register_entry_point_engines
+
+        failures = register_entry_point_engines()
+        adapter = _REGISTRY.get(key)
+        if adapter is None:
+            available = registered_engines()
+            detail = (
+                f"; plugin load failed for {key!r}: {failures[key]}"
+                if key in failures
+                else ""
+            )
+            raise ConfigError(
+                f"unknown engine {name!r} — registered engines: "
+                f"{', '.join(available) if available else 'none'}{detail}"
+            )
     return adapter

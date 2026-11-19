@@ -19,6 +19,23 @@ every input. Built-in backtest adapters document a single-instrument contract;
 mapping-shaped portfolio input to `ube.run()` is forwarded to adapters and does
 not mean every built-in engine supports portfolio execution.
 
+## Plugin adapters
+
+An installed package can advertise an additional engine through Python entry
+points; UBE resolves it lazily when a config names it. Two groups are supported:
+
+- `ube.engines` — backtest adapters; the entry-point value resolves to a concrete
+  `EngineAdapter` subclass.
+- `ube.paper_engines` — paper-trading backends; the value resolves to a concrete
+  `PaperEngine` subclass. A backend module may also register its engine-specific
+  state class when imported.
+
+Plugin engines are never selected by `engine="auto"`; name them explicitly in
+`BacktestConfig.engine` / `PaperConfig.engine`. Registration failures are isolated:
+a broken plugin is reported only when its name is requested and does not prevent
+the built-in engines from resolving. In-process registration via
+`ube.register_engine(...)` is unchanged.
+
 ## Shared Contract
 
 All adapters consume canonical `MarketData`, `Signals`, and `BacktestConfig`,

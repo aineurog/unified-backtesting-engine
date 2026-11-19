@@ -324,6 +324,12 @@ def register_paper_engine(name: str, engine: type[PaperEngine]) -> None:
         )
     if engine is PaperEngine or bool(getattr(engine, "__abstractmethods__", False)):
         raise ConfigError(f"registered paper engine {name!r} must be a concrete class")
+    current = _REGISTRY.get(key)
+    if current is not None and current is not engine:
+        raise ConfigError(
+            f"paper engine {name!r} is already registered to {current.__name__}; "
+            f"refusing to overwrite with {engine.__name__}"
+        )
     _REGISTRY[key] = engine
 
 
@@ -356,9 +362,21 @@ def get_paper_engine(name: str = "nautilus") -> type[PaperEngine]:
                     f"to be installed: {exc}"
                 ) from exc
         else:
-            raise ConfigError(
-                f"unknown paper engine {name!r}; registered: {sorted(_REGISTRY) or 'none'}"
-            )
+            # Lazy plugin discovery: only an unknown name pays for the entry-point scan,
+            # and a broken plugin never prevents the built-in backends from resolving.
+            from ube.papertrading.discovery import register_entry_point_paper_engines
+
+            failures = register_entry_point_paper_engines()
+            if key not in _REGISTRY:
+                detail = (
+                    f"; plugin load failed for {key!r}: {failures[key]}"
+                    if key in failures
+                    else ""
+                )
+                raise ConfigError(
+                    f"unknown paper engine {name!r}; "
+                    f"registered: {sorted(_REGISTRY) or 'none'}{detail}"
+                )
     return _REGISTRY[key]
 
 
@@ -377,6 +395,12 @@ def register_state_class(name: str, state_cls: type[PaperState]) -> None:
         raise ConfigError(
             f"register_state_class({name!r}, ...) expects a PaperState subclass; "
             f"got {state_cls!r}"
+        )
+    current = _STATE_REGISTRY.get(key)
+    if current is not None and current is not state_cls:
+        raise ConfigError(
+            f"paper engine {name!r} state class is already registered to "
+            f"{current.__name__}; refusing to overwrite with {state_cls.__name__}"
         )
     _STATE_REGISTRY[key] = state_cls
 
@@ -412,9 +436,14 @@ def get_state_class(name: str | None = "nautilus") -> type[PaperState]:
                     f"to be installed: {exc}"
                 ) from exc
         else:
-            return PaperState
-    # After lazy import, the backend's ``register_state_class`` has already added the
-    # subclass to ``_STATE_REGISTRY``; fall through to fetch it.
+            # A plugin backend may register its state class at import time. Keep the
+            # documented fallback: after discovery, a genuinely unknown name still
+            # resolves to the base ``PaperState``.
+            from ube.papertrading.discovery import register_entry_point_paper_engines
+
+            register_entry_point_paper_engines()
+    # After lazy import/discovery, the backend's ``register_state_class`` has already
+    # added the subclass to ``_STATE_REGISTRY``; fall through to fetch it.
     return _STATE_REGISTRY.get(key, PaperState)
 
 
