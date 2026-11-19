@@ -1052,3 +1052,50 @@ def test_build_instrument_commodities_defaults_to_fractional_lots():
     inst = build_instrument(PRESETS["commodities"].instrument)
     assert inst.size_precision == 2
     assert inst.size_increment == pytest.approx(0.01)
+
+
+# ---------------------------------------------------------------------------
+# Level-exit slippage is applied exactly once (§4.6, §9.4).
+# ---------------------------------------------------------------------------
+
+
+def _level_exit_fills(exit_config, target):
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=10)
+    slip = 0.0005
+    result = BacktraderAdapter().run(
+        md,
+        from_target(target),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            cost_model=CostModel(commission=0.0, slippage=slip, funding=0.0),
+            risk=RiskConfig(exit=(exit_config,)),
+            engine_overrides={"starting_balance": 100000.0},
+        ),
+    )
+    return _fills(result), slip
+
+
+def test_stop_loss_level_is_slipped_once():
+    # The strategy records the raw touched level; the ledger fold slips it once.
+    # Slipping in the strategy as well would book ``level * (1 - slip)^2``.
+    fills, slip = _level_exit_fills(StopLoss(percent=0.001), [1] * 10)
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "stop_loss")]
+    entry, exit_fill = fills
+    level = entry.price * (1.0 - 0.001)
+    assert exit_fill.price == pytest.approx(level * (1.0 - slip), rel=1e-12)
+
+
+def test_take_profit_level_is_slipped_once():
+    fills, slip = _level_exit_fills(TakeProfit(percent=0.001), [1] * 10)
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "take_profit")]
+    entry, exit_fill = fills
+    level = entry.price * (1.0 + 0.001)
+    assert exit_fill.price == pytest.approx(level * (1.0 - slip), rel=1e-12)
+
+
+def test_short_stop_loss_level_is_slipped_once():
+    fills, slip = _level_exit_fills(StopLoss(percent=0.001), [-1] * 10)
+    assert [(e.side, e.exit_reason) for e in fills] == [(-1, None), (1, "stop_loss")]
+    entry, exit_fill = fills
+    level = entry.price * (1.0 + 0.001)
+    assert exit_fill.price == pytest.approx(level * (1.0 + slip), rel=1e-12)

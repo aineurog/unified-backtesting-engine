@@ -659,12 +659,13 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
             )
             self._pending_entry = None
         else:
-            # A touched risk exit is booked at its own level (slipped like every other
-            # fill), not at the submit bar's close — §9.4 parity with the reference. Signal
+            # A touched risk exit is booked at its own raw level, not at the submit bar's
+            # close — §9.4 parity with the reference. The fold applies slippage exactly
+            # once, like every other fill; slipping here would apply it twice. Signal
             # closes and level-less exits keep the bar-close ``price`` stamped above.
             level_price = meta.get("level_price")
             if level_price is not None:
-                price = float(slipped_price(float(level_price), side, ctx.slip))
+                price = float(level_price)
             self.order_records.append(
                 BtOrderRecord(
                     submit_bar,
@@ -702,16 +703,13 @@ class BacktraderStrategy(BtStrategyBase):  # type: ignore[misc]  # untyped backt
         close_price = self._raw_fill_price()
         pending = self._pending_exit
         if pending is not None:
-            # Book an in-flight exit at the price ``notify_order`` would have used: a touched
-            # risk exit at its own slipped level (so a seam-bar touch keeps §9.4 parity with
-            # the full run), a signal close or level-less exit at the snapped final close.
+            # Book an in-flight exit at the raw price ``notify_order`` would have used: a
+            # touched risk exit at its own level (the fold slips it once, so a seam-bar
+            # touch keeps §9.4 parity with the full run), a signal close or level-less
+            # exit at the snapped final close.
             level_price = pending.get("level_price")
             exit_price = (
-                close_price
-                if level_price is None
-                else float(
-                    slipped_price(float(level_price), int(pending["side"]), ctx.slip)
-                )
+                close_price if level_price is None else float(level_price)
             )
             self.order_records.append(
                 BtOrderRecord(
