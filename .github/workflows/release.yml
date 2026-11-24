@@ -9,17 +9,27 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Install build tooling
         run: python -m pip install --upgrade pip build
       - name: Build distributions
         run: python -m build
+      # Optional: set the PYPI_API_TOKEN repository secret to publish from tags.
+      # Without it the build still succeeds and nothing is uploaded; use
+      # `scripts/release.sh` locally with ~/.pypirc instead.
+      - name: Detect PyPI token
+        id: pypi
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: echo "configured=${PYPI_API_TOKEN:+1}" >> "$GITHUB_OUTPUT"
       - name: Publish to PyPI
+        if: steps.pypi.outputs.configured == '1'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
