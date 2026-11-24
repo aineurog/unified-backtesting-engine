@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-19
+
+### Added
+
+- Generic engine discovery through Python entry points. An installed package can
+  advertise a backtest adapter in the `ube.engines` group and a paper-trading
+  backend in the `ube.paper_engines` group; `ube` resolves the entry point lazily
+  when a config names that engine. Registration failures are isolated per plugin,
+  and plugin engines are never selected by `engine="auto"`. In-process
+  `ube.register_engine(...)` is unchanged. Documented in
+  `docs/engines/overview.md`.
+
 ## [0.3.0] - 2026-11-06
 
 ### Added
