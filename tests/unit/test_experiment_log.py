@@ -18,6 +18,7 @@ from ube.core.experiment_log import (
     ExperimentLog,
     PortfolioDataReference,
     RecordInput,
+    _config_to_json,
     _expand_home,
     _resolve_path,
 )
@@ -308,6 +309,23 @@ def test_params_deterministic(tmp_path):
     _record(log, "run-1")
     _record(log, "run-2")
     assert log.get("run-1").params == log.get("run-2").params
+
+
+def test_params_serialize_time_exit_duration():
+    from datetime import timedelta
+
+    from ube.core.risk import RiskConfig
+    from ube.core.risk.exits import TimeExit
+
+    cfg = BacktestConfig(
+        instrument=_inst(),
+        engine="vectorbt",
+        risk=RiskConfig(exit=(TimeExit(duration=timedelta(hours=12)),)),
+    )
+    params = json.loads(_config_to_json(cfg))
+    duration = params["risk"]["exit"][0]["duration"]
+    assert duration == pd.Timedelta(hours=12).isoformat()
+    assert pd.Timedelta(duration) == pd.Timedelta(hours=12)
 
 
 # ---------------------------------------------------------------------------

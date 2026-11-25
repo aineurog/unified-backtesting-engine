@@ -7,6 +7,7 @@ contract + the engine registry (§4.1).
 """
 
 from dataclasses import replace
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -1387,6 +1388,37 @@ def test_nautilus_actor_time_exit_closes_at_hold_bar():
     # Stamped on the decision bar (bar 3), one before the bar-4 execution.
     assert evaluated[int(data.timestamps.asi8[3])] == "exit_time_exit"
     assert float(result.equity_curve.equity[-1]) == pytest.approx(101980.5, rel=1e-6)
+
+
+def test_nautilus_actor_time_exit_duration_uses_bar_timestamps():
+    from ube.adapters.nautilus_adapter.adapter import NautilusAdapter
+    from ube.core.config import BacktestConfig
+    from ube.core.risk import RiskConfig, TimeExit
+
+    # Entry fills at +5m (signal bar 0); the 12h deadline (+12h05m) lands between the
+    # +11h and +13h bars, so the exit decision is the +13h bar and it fills at +15h.
+    data = _bars_from_rows(
+        [
+            "2024-01-01 00:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 00:05:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 02:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 11:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 13:00:00+00:00,100.00,100.50,99.50,100.00",
+            "2024-01-01 15:00:00+00:00,100.00,100.50,99.50,100.00",
+        ]
+    )
+    result = NautilusAdapter().run(
+        data,
+        from_target([1] * 6),
+        BacktestConfig(
+            instrument=PRESETS["stocks"].instrument,
+            risk=RiskConfig(exit=(TimeExit(duration=timedelta(hours=12)),)),
+        ),
+    )
+    (trade,) = result.trades
+    assert trade.exit_reason == "time_exit"
+    assert trade.exit_timestamp == int(data.timestamps.asi8[5])
+    assert not _fills_by_reason(result, "signal")
 
 
 def test_nautilus_actor_close_trigger_mode_ignores_intra_bar_touch():

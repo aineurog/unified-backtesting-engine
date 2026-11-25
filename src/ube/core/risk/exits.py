@@ -27,6 +27,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Literal, TypeGuard, cast
 
 import numpy as np
@@ -111,6 +112,15 @@ def _validate_trigger(value: object) -> str:
 def _validate_period(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ConfigError(f"{name} must be a positive integer; got {value!r}")
+    return value
+
+
+def _validate_duration(value: object, name: str) -> timedelta:
+    """Validate a wall-clock holding period: a positive ``datetime.timedelta``."""
+    if not isinstance(value, timedelta):
+        raise ConfigError(f"{name} must be a datetime.timedelta; got {value!r}")
+    if value <= timedelta(0):
+        raise ConfigError(f"{name} must be positive; got {value!r}")
     return value
 
 
@@ -282,24 +292,37 @@ class TrailingStop:
 
 @dataclass(frozen=True)
 class TimeExit:
-    """Time-based exit: exit ``bars`` bars after entry (§8).
+    """Holding-period exit: exactly one of ``bars`` or ``duration`` (§8).
 
-    Chosen signature: ``TimeExit(bars)`` — a holding-period exit that fires once the
-    position has been held for ``bars`` bars (i.e. at bar ``entry_bar + bars``). The
-    "exit at a bar timestamp" form is not implemented separately (it would need calendar
-    machinery and is out of scope for item 06). A time exit has no price level and no
-    ``trigger`` — time is discrete, so there is no touched/close ambiguity. Durations
-    such as ``"12h"`` are converted to a bar count by the caller from the bar interval;
-    the library performs no calendar math.
+    ``TimeExit(bars=n)`` fires once the position has been held ``n`` bars (at bar
+    ``entry_bar + n``). ``TimeExit(duration=d)`` fires at the first bar whose timestamp is
+    at or after ``entry_bar.timestamp + d`` — the wall-clock form that remains meaningful
+    on irregular bars (event-driven, custom, session bars). Both forms are exact elapsed
+    time: the duration is measured in UTC against the timestamp at which each bar formed,
+    with no calendar/session/DST adjustment. A time exit has no price level and no
+    ``trigger``; it fills at the bar close under the engine's execution-timing rules.
 
     Attributes:
-        bars: Number of bars to hold before exiting (a positive integer).
+        bars: Number of bars to hold before exiting (a positive integer), or ``None``
+            when ``duration`` is used.
+        duration: Wall-clock holding period, or ``None`` when ``bars`` is used.
     """
 
-    bars: int
+    bars: int | None = None
+    duration: timedelta | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "bars", _validate_period(self.bars, "TimeExit.bars"))
+        if (self.bars is None) == (self.duration is None):
+            raise ConfigError(
+                "TimeExit requires exactly one of bars or duration; "
+                f"got bars={self.bars!r}, duration={self.duration!r}"
+            )
+        if self.bars is not None:
+            object.__setattr__(self, "bars", _validate_period(self.bars, "TimeExit.bars"))
+        else:
+            object.__setattr__(
+                self, "duration", _validate_duration(self.duration, "TimeExit.duration")
+            )
 
 
 @dataclass(frozen=True)
@@ -766,21 +789,36 @@ def chandelier_level(
 def time_exit_mask(cfg: TimeExit, market_data: MarketData, *, entry_bar: int = 0) -> np.ndarray:
     """Per-bar trigger mask for a holding-period exit (§8).
 
-    ``True`` from the bar at which the position has been held ``cfg.bars`` bars (i.e.
-    ``i >= entry_bar + cfg.bars``).
+    The bar form is ``True`` from ``entry_bar + cfg.bars``. The duration form is ``True``
+    from the first bar whose timestamp is at or after ``index[entry_bar] + cfg.duration``
+    (a left-sided search on the sorted bar index), so irregular bar spacing is handled by
+    the timestamps rather than by a bar count. If no bar reaches that timestamp, the mask
+    is all ``False``.
     """
     md = _require_market_data(market_data)
     eb = _validate_entry_bar(entry_bar, md.n_bars)
-    return np.arange(md.n_bars) >= eb + cfg.bars
+    duration = cfg.duration
+    if duration is not None:
+        target = md.index[eb] + duration
+        fire_at = int(md.index.searchsorted(target, side="left"))
+        return np.arange(md.n_bars) >= fire_at
+    bars = cfg.bars
+    if bars is None:  # pragma: no cover - __post_init__ enforces exactly one
+        raise ConfigError("TimeExit is missing both bars and duration")
+    return np.arange(md.n_bars) >= eb + bars
 
 
-def time_exit_mask_for_entries(entries: object, bars: int) -> np.ndarray:
+def time_exit_mask_for_entries(
+    entries: object, cfg: TimeExit, *, timestamps: pd.Index
+) -> np.ndarray:
     """Holding-period exit mask driven by an entry-action column (§8, engine helper).
 
     Vectorized engines receive signal *actions* rather than a single ``entry_bar``: each
-    fresh ``entries`` bar re-arms a countdown and the mask fires at ``entry + bars``,
-    then goes idle until the next entry (a stale ``True`` must never close a later
-    position). This is the entry-column form of :func:`time_exit_mask`.
+    fresh ``entries`` bar re-arms the exit and the mask fires on the first bar at or after
+    that entry's own deadline, then goes idle until the next entry (a stale ``True`` must
+    never close a later position). The deadline is ``entry + cfg.bars`` for the bar form
+    and the first bar at or after ``timestamps[entry] + cfg.duration`` for the duration
+    form. This is the entry-column form of :func:`time_exit_mask`.
     """
     ent = np.asarray(entries)
     if ent.ndim != 1 or ent.dtype != np.bool_:
@@ -788,15 +826,31 @@ def time_exit_mask_for_entries(entries: object, bars: int) -> np.ndarray:
             f"entries must be a 1-D boolean array; got dtype {ent.dtype} "
             f"with shape {ent.shape}"
         )
-    held = _validate_period(bars, "TimeExit bars")
+    if not isinstance(timestamps, pd.DatetimeIndex):
+        raise DataShapeError(
+            f"timestamps must be a DatetimeIndex; got {type(timestamps).__name__}"
+        )
     n = ent.shape[0]
+    if len(timestamps) != n:
+        raise DataShapeError(
+            f"timestamps has {len(timestamps)} entries, expected {n}"
+        )
+    duration = cfg.duration
+    bars = cfg.bars
+    if duration is None and bars is None:  # pragma: no cover - enforced in __post_init__
+        raise ConfigError("TimeExit is missing both bars and duration")
     mask = np.zeros(n, dtype=np.bool_)
     armed = False
     fire_at: int | None = None
     for i in range(n):
         if bool(ent[i]):
             armed = True
-            fire_at = i + held
+            if duration is not None:
+                target = timestamps[i] + duration
+                fire_at = int(timestamps.searchsorted(target, side="left"))
+            else:
+                assert bars is not None
+                fire_at = i + bars
         if armed and fire_at is not None and i >= fire_at:
             mask[i] = True
             armed = False

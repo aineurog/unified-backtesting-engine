@@ -212,13 +212,13 @@ tuple and each exit is evaluated in that order.
 | `ATRTakeProfit` | `(mult, trigger='touched', scale_out=1.0, period=14, atr=None)` | Target `mult × ATR` beyond entry (moves with ATR); `scale_out` behaves as for `TakeProfit`. `atr` **must** name an `aux_data` series. |
 | `RiskRewardTP` | `(ratio, stop, trigger='touched', scale_out=1.0)` | Target anchored at entry at `ratio ×` the linked stop's initial risk. `stop` is a `StopLoss`, `ATRStop`, `TrailingStop`, or `ChandelierExit`; a nested ATR stop needs its named `atr` series. |
 | `TrailingStop` | `(percent, trigger='touched', activation=None)` | Trailing percentage stop off the running peak/trough since entry. With `activation`, a static entry-anchored stop applies until price moves that fraction favourably. |
-| `TimeExit` | `(bars)` | Close after N bars held. |
+| `TimeExit` | `(bars=None, duration=None)` | Close after N bars, or at the first bar at/after entry + `duration` (a `timedelta`). Exactly one is required. |
 | `ATRStop` | `(mult, trigger='touched', trailing=False, period=14, atr=None)` | ATR stop (entry-anchored, or ratcheting when `trailing=True`). `atr` **must** name an `aux_data` series. |
 | `ChandelierExit` | `(mult, trigger='touched', period=14, atr=None)` | Running high/low offset by `mult × ATR`. `atr` **must** name an `aux_data` series. |
 
 **Trigger** (`Trigger = Literal["touched", "close"]`) is the intrabar rule:
 `"touched"` compares the bar's high/low to the level; `"close"` compares only the
-close. `TimeExit` has no trigger. See
+close. `TimeExit` has no trigger (it fills at the close of the triggering bar). See
 [risk and costs](risk-and-costs.md#exits) for full semantics, scale-out
 constraints, and the named-`atr` `aux_data` requirement.
 
@@ -233,7 +233,8 @@ without running an engine:
 | `atr(market_data, period=14)` | Wilder's ATR series. |
 | `exit_level(cfg, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Per-bar level for a price-level exit. |
 | `exit_triggered(cfg, *, market_data, side, entry_price, entry_bar=0, atr_series=None)` | Per-bar bool mask (level + trigger rule) for any exit. |
-| `time_exit_mask(cfg, market_data, *, entry_bar=0)` | Per-bar mask for a `TimeExit`. |
+| `time_exit_mask(cfg, market_data, *, entry_bar=0)` | Per-bar mask for a `TimeExit` (bar-count or duration form). |
+| `time_exit_mask_for_entries(entries, cfg, *, timestamps)` | Entry-column form: re-arms on each entry and fires at that entry's deadline. |
 | `is_triggered(trigger, level, *, high, low, close, direction)` | Apply the trigger rule to a raw level array. |
 | `first_reached_exit(levels, *, open_price, triggered=None)` | Which of several touched levels fired first (by distance from the open). |
 | `scale_out_fraction(cfg)` | The fraction an exit takes (only `TakeProfit` / `ATRTakeProfit` / `RiskRewardTP` can be `!= 1.0`). |

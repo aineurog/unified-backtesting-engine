@@ -7,7 +7,8 @@ beyond the ``--state``/``--run-id`` already stubbed. Daemon mode remains a stub 
 defers it to a "later task"; synchronous ``run_auto`` in ``core.py`` is production Mode B).
 
 The YAML shape mirrors what :func:`ube.papertrading.core.init` serializes
-(``yaml.safe_dump(asdict(config.base))``), with a few conveniences:
+(``asdict(config.base)``, with durations stored as ISO-8601 strings), with a few
+conveniences:
   * ``symbol`` / ``asset_class`` are the minimal instrument fields (the rest default).
   * nested configs (``risk``, ``signal``, ``benchmark``, ``cost_model``) are rebuilt from
     their dataclass dicts.
@@ -29,6 +30,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import yaml  # type: ignore[import-untyped]
 
 from ube.core.benchmark import BenchmarkConfig
@@ -62,6 +64,9 @@ def _rebuild_exit(data: dict[str, Any]) -> Exit:
     """Rebuild one exit config, using a ``_type`` discriminator if present (§20)."""
     data = dict(data)
     etype = data.pop("_type", None)
+    # Stored durations are ISO-8601 strings (``TimeExit.duration``).
+    if isinstance(data.get("duration"), str):
+        data["duration"] = pd.Timedelta(data["duration"]).to_pytimedelta()
     if "stop" in data and isinstance(data["stop"], dict):
         data["stop"] = _rebuild_exit(
             _require_mapping(data["stop"], "RiskRewardTP.stop")
@@ -86,7 +91,7 @@ def _rebuild_exit(data: dict[str, Any]) -> Exit:
     # are indistinguishable from keys, so require _type for those.
     if "ratio" in data:
         return RiskRewardTP(**data)
-    if "bars" in data:
+    if "bars" in data or "duration" in data:
         return TimeExit(**data)
     if "mult" in data:
         if "scale_out" in data:

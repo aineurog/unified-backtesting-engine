@@ -71,13 +71,14 @@ import os
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 from ube.core.config import BacktestConfig
 from ube.core.data import OHLCV_COLUMNS, MarketData
@@ -703,9 +704,9 @@ def _config_to_json(config: BacktestConfig) -> str:
     """Serialize a ``BacktestConfig`` to a deterministic JSON string (§4.8 ``params``).
 
     ``dataclasses.asdict`` recursively flattens the nested frozen sub-configs; a
-    JSON-safe ``default`` handles the remaining non-primitive leaves (timestamps, numpy
-    scalars, enums); ``sort_keys=True`` makes the output deterministic. The config is
-    never mutated.
+    JSON-safe ``default`` handles the remaining non-primitive leaves (timestamps,
+    timedeltas, numpy scalars, enums); ``sort_keys=True`` makes the output
+    deterministic. The config is never mutated.
     """
     data: dict[str, Any] = asdict(config)
     try:
@@ -718,6 +719,9 @@ def _config_to_json(config: BacktestConfig) -> str:
 
 def _json_default(value: object) -> object:
     """JSON ``default`` hook for the leaf values ``asdict`` leaves non-primitive."""
+    if isinstance(value, timedelta):
+        # ISO-8601 duration (e.g. "P0DT12H0M0S"); note ``timedelta`` is not a ``date``.
+        return pd.Timedelta(value).isoformat()
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, np.generic):

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-25
+
+### Added
+
+- `TimeExit(duration=timedelta(...))`: a wall-clock holding-period exit alongside the
+  existing `TimeExit(bars=n)` bar-count form. Exactly one form is required. The
+  duration form exits at the first bar whose timestamp is at or after
+  `entry_bar.timestamp + duration`, which makes it meaningful on irregular
+  (event-driven/custom) bars where a bar count does not correspond to a fixed holding
+  period. The duration is exact elapsed UTC time, with no calendar/session/DST
+  adjustment. Supported by vectorbt, backtrader, Nautilus, and all paper engines;
+  durations are stored as ISO-8601 strings in paper configs and the experiment log.
+  The bar-count form is unchanged.
+
 ## [0.4.0] - 2026-11-19
 
 ### Added

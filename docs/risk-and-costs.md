@@ -66,7 +66,7 @@ core exposes eight exit configs:
 | `TrailingStop` | `(percent, trigger="touched", activation=None)` | Percentage stop that trails the running peak (long) / trough (short) since entry. With `activation`, a static entry-anchored stop applies until price moves that fraction favourably. |
 | `ATRStop` | `(mult, trigger="touched", trailing=False, period=14, atr=None)` | Stop `mult × ATR` from entry; `trailing=True` ratchets it. Requires a named `atr` aux series. |
 | `ChandelierExit` | `(mult, trigger="touched", period=14, atr=None)` | Running high/low offset by `mult × ATR`. Requires a named `atr` aux series. |
-| `TimeExit` | `(bars)` | Close once the position has been held `bars` bars. |
+| `TimeExit` | `(bars=None, duration=None)` | Close after `bars` bars, or at the first bar at/after entry + `duration` (a `timedelta`). Exactly one form is required. |
 
 ### The trigger rule
 
@@ -76,17 +76,33 @@ Every price-level exit has a `trigger`:
   even if the close did not.
 - `"close"` — only the bar's **close** is compared to the level.
 
-`TimeExit` has no `trigger`; time is discrete, so there is no touched/close
-ambiguity.
+`TimeExit` has no `trigger`; it fills at the bar close under the engine's
+execution-timing rules.
 
-### Holding-period exits and calendar durations
+### Holding-period exits: bars or wall-clock duration
 
-`TimeExit(bars)` counts **bars**, not wall-clock time. A UI that offers durations such
-as `"12h"` converts them to a bar count from the signal bar interval (`12h / 1h = 12`)
-before building the config; `max_duration`-style inputs are likewise the caller's
-responsibility. UBE deliberately performs no exchange-calendar or session-aware
-duration math, so intra-day breaks, holidays, and timezone shifts do not change the
-bar count.
+`TimeExit` has two mutually exclusive forms:
+
+- `TimeExit(bars=n)` counts **bars**: the exit fires at `entry_bar + n`, regardless of
+  how much time those bars span.
+- `TimeExit(duration=d)` measures **elapsed wall-clock time** (`d` is a
+  `datetime.timedelta`): the exit fires at the first bar whose timestamp is at or after
+  `entry_bar.timestamp + d`. This is the form to use on irregular bars (event-driven,
+  custom, or session bars), where a bar count does not correspond to a fixed holding
+  period.
+
+The duration is exact elapsed time in UTC, measured against the timestamp at which each
+bar formed. UBE deliberately performs no exchange-calendar or session-aware adjustment,
+so a duration spanning a session break, holiday, or DST change is still that exact
+elapsed time; "one trading day" must be expressed as a bar count or by the caller.
+Because the trigger is a timestamp comparison against the sorted bar index, a duration
+that falls between bars fires on the next bar (e.g. a 12h exit on bars at +11h and +13h
+fires at +13h), and a duration beyond the last bar never fires.
+
+```python
+ube.TimeExit(bars=48)                          # 48 bars after entry
+ube.TimeExit(duration=timedelta(hours=12))     # first bar at/after entry + 12h
+```
 
 ```python
 ube.StopLoss(percent=0.02)                     # intrabar touch
@@ -118,8 +134,9 @@ ube.ATRStop(mult=2.0, period=14, atr="atr_1h", trailing=True)
 # Chandelier: running_high - mult * ATR (long), running_low + mult * ATR (short)
 ube.ChandelierExit(mult=3.0, period=14, atr="atr_1h")
 
-# Holding-period exit
+# Holding-period exit: bar count (regular bars) or wall-clock duration (any bars)
 ube.TimeExit(bars=24)
+ube.TimeExit(duration=timedelta(hours=24))
 ```
 
 Stops (`StopLoss`, `TrailingStop`, `ATRStop`, `ChandelierExit`, `TimeExit`)

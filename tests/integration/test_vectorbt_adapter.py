@@ -11,6 +11,7 @@ It never touches the Nautilus adapter or its tests — every assertion here runs
 """
 
 from dataclasses import replace
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -795,6 +796,38 @@ def test_vectorbt_time_exit_yields_to_earlier_signal_exit():
     )
     (trade,) = result.trades
     assert trade.exit_reason == "signal"
+
+
+def test_vectorbt_time_exit_duration_uses_bar_timestamps():
+    # Irregular grid: the entry signal fires at +1h, so a 12h hold reaches its deadline
+    # between the +11h and +13h bars. The exit decision lands on +13h and fills at the
+    # +15h open (next-open timing) — a bar count could not express this.
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=6)
+    index = pd.DatetimeIndex(
+        [
+            "2024-01-01T00:00:00Z",
+            "2024-01-01T01:00:00Z",
+            "2024-01-01T02:00:00Z",
+            "2024-01-01T11:00:00Z",
+            "2024-01-01T13:00:00Z",
+            "2024-01-01T15:00:00Z",
+        ]
+    ).tz_convert("UTC")
+    md = replace(md, index=index)
+    result = VectorbtAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(TimeExit(duration=timedelta(hours=12)),)),
+            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
+        ),
+    )
+    fills = _fills(result)
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "time_exit")]
+    (trade,) = result.trades
+    assert trade.exit_reason == "time_exit"
+    assert trade.exit_timestamp == int(bar_timestamps_ns(md)[5])
 
 
 def test_vectorbt_volatility_target_sizing_runs():

@@ -27,6 +27,7 @@ import logging
 import time
 import warnings
 from collections.abc import Callable, Mapping
+from datetime import timedelta
 from typing import Any
 
 import numpy as np
@@ -513,10 +514,26 @@ def init(
         last_processed_ns=None,
         # Persist the resolved canonical config as YAML (plan blocker #10) so a resumed
         # run is self-contained — the caller need not re-supply ``base`` (though it may).
-        config_ref=yaml.safe_dump(dataclasses.asdict(config.base)),
+        config_ref=yaml.safe_dump(_yaml_safe_config(dataclasses.asdict(config.base))),
         run_id=run_id,
         db_path=db_path,
     )
+
+
+def _yaml_safe_config(value: Any) -> Any:
+    """Convert config leaves that ``yaml.safe_dump`` cannot represent.
+
+    ``dataclasses.asdict`` leaves ``timedelta`` values (e.g. ``TimeExit.duration``) as
+    objects, which PyYAML's safe dumper rejects. Durations are stored as ISO-8601 strings
+    and parsed back by the paper CLI.
+    """
+    if isinstance(value, Mapping):
+        return {k: _yaml_safe_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_yaml_safe_config(v) for v in value]
+    if isinstance(value, timedelta):
+        return pd.Timedelta(value).isoformat()
+    return value
 
 
 def _portfolio_shared_balance(config: PaperConfig) -> float:
@@ -586,7 +603,7 @@ def init_portfolio(
     if db_path is None:
         db_path = config.state_path
     state_cls = get_state_class(config.engine)
-    config_ref = yaml.safe_dump(dataclasses.asdict(config.base))
+    config_ref = yaml.safe_dump(_yaml_safe_config(dataclasses.asdict(config.base)))
     # Resolve every leg's settlement currency and validate it converts into the base;
     # an unconvertible pair fails here, not on the first equity snapshot.
     base_currency = config.base.base_currency or portfolio.base_currency

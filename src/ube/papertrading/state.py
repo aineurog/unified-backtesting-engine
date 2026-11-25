@@ -540,7 +540,8 @@ class PaperState:
         signal_fn_state: State carried by a streaming signal function (§9.5); ``{}`` when
             stateless.
         config_ref: YAML dump of the canonical ``BacktestConfig`` at ``init`` time
-            (via ``yaml.safe_dump(asdict(base))``). Stored for self-contained resume
+            (``asdict`` with durations encoded as ISO-8601 strings). Stored for
+            self-contained resume
             but *not* auto-applied on ``load()`` — caller must pass ``config`` to
             ``step()``/``run_auto()`` or reconstruct via ``get_config_dict()`` (Point 8).
         exit_seed: Minimal exit-level seed (extreme price + ATR warmup window) written by

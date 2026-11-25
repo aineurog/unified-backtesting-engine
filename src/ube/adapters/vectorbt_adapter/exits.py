@@ -61,25 +61,28 @@ def apply_time_exits(
 ) -> VbtSignalInputs:
     """Fold ``TimeExit`` into the vectorbt exit masks so vectorbt actually exits (§6.4).
 
-    vectorbt has no native holding-period primitive, so a ``TimeExit(bars)`` is translated
-    into an exit-signal mask with the core :func:`time_exit_mask` semantics: a position
-    opened at bar ``e`` exits at the first bar at or after ``e + bars``. The mask is applied
-    to both the long and the short exit columns (a time exit closes whichever side is open);
-    a signal exit or stop that already closed the position makes a later mask bar idle, and
-    a new entry re-arms the countdown. Returns a (possibly mutated) copy of ``inputs``.
+    vectorbt has no native holding-period primitive, so a ``TimeExit`` is translated into
+    an exit-signal mask with the core :func:`time_exit_mask` semantics: a position opened
+    at bar ``e`` exits at the first bar at or after ``e + bars`` (bar form) or the first
+    bar whose timestamp is at or after ``index[e] + duration`` (duration form). The mask is
+    applied to both the long and the short exit columns (a time exit closes whichever side
+    is open); a signal exit or stop that already closed the position makes a later mask bar
+    idle, and a new entry re-arms the countdown. Returns a (possibly mutated) copy of
+    ``inputs``.
     """
-    time_bars = [e.bars for e in exits if isinstance(e, TimeExit)]
-    if not time_bars:
+    time_exits = [e for e in exits if isinstance(e, TimeExit)]
+    if not time_exits:
         return inputs
     n = data.n_bars
     long_mask = np.zeros(n, dtype=np.bool_)
     short_mask = np.zeros(n, dtype=np.bool_)
-    for bars in time_bars:
+    timestamps = data.index
+    for cfg in time_exits:
         long_mask |= time_exit_mask_for_entries(
-            inputs.entries.to_numpy(dtype=np.bool_), bars
+            inputs.entries.to_numpy(dtype=np.bool_), cfg, timestamps=timestamps
         )
         short_mask |= time_exit_mask_for_entries(
-            inputs.short_entries.to_numpy(dtype=np.bool_), bars
+            inputs.short_entries.to_numpy(dtype=np.bool_), cfg, timestamps=timestamps
         )
     idx = inputs.close.index
     inputs.long_exits = inputs.long_exits | pd.Series(long_mask, index=idx, dtype=bool)

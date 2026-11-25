@@ -20,6 +20,7 @@ against :class:`~ube.adapters.backtrader_adapter.adapter.BacktraderAdapter` only
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -464,6 +465,41 @@ def test_time_exit_executes_and_stamps_reason():
     (trade,) = result.trades
     assert trade.exit_reason == "time_exit"
     assert fills[1].price == pytest.approx(float(md.open[5]), abs=1e-6)
+
+
+def test_time_exit_duration_uses_bar_timestamps():
+    # Irregular grid: entry fills at +2h (signal bar 1), a 12h hold reaches its deadline
+    # between +13h and +15h, so the exit decision is the +15h bar and it fills at the
+    # +17h open. The bar-count form would have fired at +11h instead.
+    md = synthetic_bars(PRESETS["crypto_perp"], seed=11, n_bars=7)
+    index = pd.DatetimeIndex(
+        [
+            "2024-01-01T00:00:00Z",
+            "2024-01-01T01:00:00Z",
+            "2024-01-01T02:00:00Z",
+            "2024-01-01T11:00:00Z",
+            "2024-01-01T13:00:00Z",
+            "2024-01-01T15:00:00Z",
+            "2024-01-01T17:00:00Z",
+        ]
+    ).tz_convert("UTC")
+    md = replace(md, index=index)
+    result = BacktraderAdapter().run(
+        md,
+        from_target([0, 1, 1, 1, 1, 1, 1]),
+        BacktestConfig(
+            instrument=PRESETS["crypto_perp"].instrument,
+            risk=RiskConfig(exit=(TimeExit(duration=timedelta(hours=12)),)),
+            engine_overrides={"starting_balance": 100000.0, "funding_interval_hours": 1.0},
+        ),
+    )
+    fills = _fills(result)
+    assert len(fills) == 2
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "time_exit")]
+    (trade,) = result.trades
+    assert trade.exit_reason == "time_exit"
+    assert trade.exit_timestamp == int(bar_timestamps_ns(md)[6])
+    assert fills[1].price == pytest.approx(float(md.open[6]), abs=1e-6)
 
 
 

@@ -1,6 +1,7 @@
 """Tests for the exit subsystem (§6.4, §8)."""
 
 from dataclasses import FrozenInstanceError
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,7 @@ from ube.core.risk import (
     stop_loss_level,
     take_profit_level,
     time_exit_mask,
+    time_exit_mask_for_entries,
     trailing_stop_level,
 )
 
@@ -54,6 +56,28 @@ def _md(close, *, high=None, low=None, open_=None) -> MarketData:
         close=close,
         volume=np.ones(n),
         index=pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC"),
+    )
+
+
+def _irregular_md() -> MarketData:
+    """Entry at t0; later bars at +5m, +2h, +11h, +13h (irregular spacing)."""
+    index = pd.DatetimeIndex(
+        [
+            "2024-01-01T00:00:00Z",
+            "2024-01-01T00:05:00Z",
+            "2024-01-01T02:00:00Z",
+            "2024-01-01T11:00:00Z",
+            "2024-01-01T13:00:00Z",
+        ]
+    ).tz_convert("UTC")
+    n = len(index)
+    return MarketData(
+        open=np.full(n, 10.0),
+        high=np.full(n, 10.5),
+        low=np.full(n, 9.5),
+        close=np.full(n, 10.0),
+        volume=np.ones(n),
+        index=index,
     )
 
 
@@ -173,6 +197,31 @@ def test_time_exit_validation():
         TimeExit(0)
     with pytest.raises(ConfigError):
         TimeExit(-2)
+    with pytest.raises(ConfigError):
+        TimeExit()
+
+
+def test_time_exit_requires_exactly_one_form():
+    with pytest.raises(ConfigError):
+        TimeExit(bars=2, duration=timedelta(hours=1))
+    cfg = TimeExit(2)
+    assert cfg.bars == 2 and cfg.duration is None
+    cfg = TimeExit(duration=timedelta(hours=1))
+    assert cfg.bars is None and cfg.duration == timedelta(hours=1)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [timedelta(0), timedelta(seconds=-1), "12h", 12, 12.0, True],
+)
+def test_time_exit_duration_validation(value):
+    with pytest.raises(ConfigError):
+        TimeExit(duration=value)
+
+
+def test_time_exit_accepts_pandas_timedelta():
+    cfg = TimeExit(duration=pd.Timedelta(hours=12))
+    assert cfg.duration == timedelta(hours=12)
 
 
 def test_chandelier_validation():
@@ -473,6 +522,102 @@ def test_time_exit_mask_respects_entry_bar():
     md = _md([10, 11, 12, 13, 14])
     mask = time_exit_mask(TimeExit(2), md, entry_bar=2)
     np.testing.assert_array_equal(mask, [False, False, False, False, True])
+
+
+def test_time_exit_mask_regular_duration_matches_bar_form():
+    # On a regular grid a duration of N bar steps must be identical to TimeExit(bars=N).
+    md = _md([10] * 8)
+    for entry_bar in (0, 1, 3):
+        np.testing.assert_array_equal(
+            time_exit_mask(TimeExit(duration=timedelta(hours=3)), md, entry_bar=entry_bar),
+            time_exit_mask(TimeExit(bars=3), md, entry_bar=entry_bar),
+        )
+
+
+def test_time_exit_mask_duration_exact_boundary_fires_on_that_bar():
+    md = _md([10] * 5)
+    mask = time_exit_mask(TimeExit(duration=timedelta(hours=2)), md)
+    np.testing.assert_array_equal(mask, [False, False, True, True, True])
+
+
+def test_time_exit_mask_duration_between_bars_fires_on_the_next_bar():
+    md = _md([10] * 6)
+    mask = time_exit_mask(TimeExit(duration=timedelta(hours=2, minutes=30)), md)
+    np.testing.assert_array_equal(mask, [False, False, False, True, True, True])
+
+
+def test_time_exit_mask_duration_respects_entry_bar():
+    md = _md([10] * 5)
+    mask = time_exit_mask(TimeExit(duration=timedelta(hours=2)), md, entry_bar=2)
+    np.testing.assert_array_equal(mask, [False, False, False, False, True])
+
+
+def test_time_exit_mask_duration_irregular_index():
+    # The reported case: entry at t0, bars at +5m, +2h, +11h, +13h; 12h fires at +13h.
+    md = _irregular_md()
+    mask = time_exit_mask(TimeExit(duration=timedelta(hours=12)), md)
+    np.testing.assert_array_equal(mask, [False, False, False, False, True])
+    # A bar count would fire at +11h instead — the clock, not the spacing, decides.
+    np.testing.assert_array_equal(
+        time_exit_mask(TimeExit(bars=3), md), [False, False, False, True, True]
+    )
+
+
+def test_time_exit_mask_duration_beyond_last_bar_never_fires():
+    md = _md([10] * 5)
+    mask = time_exit_mask(TimeExit(duration=timedelta(days=30)), md)
+    assert not mask.any()
+
+
+def test_time_exit_mask_for_entries_bars_form():
+    entries = np.array([True, False, False, True, False, False, False])
+    timestamps = pd.date_range("2024-01-01", periods=7, freq="h", tz="UTC")
+    mask = time_exit_mask_for_entries(entries, TimeExit(bars=2), timestamps=timestamps)
+    np.testing.assert_array_equal(
+        mask, [False, False, True, False, False, True, False]
+    )
+
+
+def test_time_exit_mask_for_entries_duration_irregular():
+    md = _irregular_md()
+    entries = np.array([True, False, False, False, False])
+    mask = time_exit_mask_for_entries(
+        entries, TimeExit(duration=timedelta(hours=12)), timestamps=md.index
+    )
+    np.testing.assert_array_equal(mask, [False, False, False, False, True])
+
+
+def test_time_exit_mask_for_entries_duration_rearms_on_new_entry():
+    # Entry at +5m has its own deadline (+12h05m), so the +13h bar still fires it.
+    md = _irregular_md()
+    entries = np.array([False, True, False, False, False])
+    mask = time_exit_mask_for_entries(
+        entries, TimeExit(duration=timedelta(hours=12)), timestamps=md.index
+    )
+    np.testing.assert_array_equal(mask, [False, False, False, False, True])
+
+
+def test_time_exit_mask_for_entries_validates_timestamps():
+    entries = np.array([True, False])
+    with pytest.raises(DataShapeError):
+        time_exit_mask_for_entries(
+            entries, TimeExit(bars=1), timestamps=pd.RangeIndex(2)
+        )
+    with pytest.raises(DataShapeError):
+        time_exit_mask_for_entries(
+            entries,
+            TimeExit(bars=1),
+            timestamps=pd.date_range("2024-01-01", periods=3, freq="h", tz="UTC"),
+        )
+
+
+def test_exit_triggered_duration_matches_time_exit_mask():
+    md = _irregular_md()
+    cfg = TimeExit(duration=timedelta(hours=12))
+    np.testing.assert_array_equal(
+        exit_triggered(cfg, market_data=md, side=1, entry_price=10.0),
+        time_exit_mask(cfg, md),
+    )
 
 
 def test_exit_level_dispatches():
