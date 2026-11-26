@@ -1178,6 +1178,86 @@ def test_vectorbt_early_atr_stop_keeps_the_trade_open_when_the_core_never_fires(
     ]
 
 
+def _early_stop_then_reentry(second_entry_bar: int):
+    """Bars where a long is stopped early but the core holds to bar 4; entry #2 is on bar ``n``.
+
+    vectorbt's frozen stop (98.0) closes the first long on bar 1 (``low=97``), but ATR
+    widens to 3.0 there so the core level drops to 94.0 and the core keeps holding; ATR
+    returns to 1.0 on bar 4 and ``low=97.5`` reaches the 98.0 core level, so the core exit
+    is bar 4. A second `long_entry` lets vectorbt open a *fresh* long while the reference
+    engine is still positioned — the phantom leg this path must reject.
+    """
+    n = 6
+    atr = np.array([1.0, 3.0, 3.0, 3.0, 1.0, 1.0])
+    low = np.array([99.0, 97.0, 103.0, 103.0, 97.5, 103.0])
+    md, aux = _widening_atr_bars(atr, low)
+    long_entry = np.zeros(n, dtype=bool)
+    long_entry[0] = True
+    long_entry[second_entry_bar] = True
+    signals = Signals(
+        long_entry=long_entry,
+        long_exit=np.zeros(n, dtype=bool),
+        short_entry=np.zeros(n, dtype=bool),
+        short_exit=np.zeros(n, dtype=bool),
+    )
+    config = BacktestConfig(
+        instrument=PRESETS["crypto_perp"].instrument,
+        risk=RiskConfig(exit=(ATRStop(atr="atr_1h", mult=2.0),)),
+        engine_overrides={"starting_balance": 100000.0},
+        execution_timing="same_close",
+    )
+    return VectorbtAdapter().run(md, signals, config, aux_data=aux), md
+
+
+def test_vectorbt_phantom_reentry_while_core_holds_is_dropped() -> None:
+    """vectorbt's early stop must not let a second entry open before the core exit.
+
+    Live BTC-USDT regression: the frozen stop closed the first leg early, vectorbt opened a
+    fresh long on the next signal while the core (ATR stop) still held the first leg to a
+    later bar. Both longs were folded — ``position_after`` summed them and then collapsed to
+    zero per exit — so the ledger showed a phantom round trip (``position_size_pct`` ~271%),
+    equity went negative and bar returns went NaN. The record entering at or before the
+    core exit bar is phantom and must be dropped; only the core's single entry/exit stands.
+    """
+    result, md = _early_stop_then_reentry(second_entry_bar=2)
+    stamps = md.timestamps.as_unit("ns").asi8
+    fills = _fills(result)
+    assert [(e.side, e.exit_reason) for e in fills] == [(1, None), (-1, "atr_stop")]
+    # One entry, re-timed to the core trigger bar 4 (not vectorbt's native bar 1).
+    assert [int(e.timestamp) for e in fills] == [int(stamps[0]), int(stamps[4])]
+    # No summed/duplicated position: held once, then flat.
+    pcs = [float(e.position_after) for e in _ledger_events(result, EventType.POSITION_CHANGE)]
+    assert pcs == pytest.approx([float(fills[0].quantity), 0.0])
+    # The phantom leg no longer corrupts the mark/cash balance: equity stays finite and
+    # positive at every bar instead of collapsing to <= 0 (which produced NaN returns).
+    equity = result.equity_curve.equity
+    assert np.isfinite(equity).all()
+    assert (equity > 0.0).all()
+
+
+def test_vectorbt_reentry_after_the_core_exit_is_kept() -> None:
+    """An entry after the previous leg's core exit is a legitimate re-entry, not phantom.
+
+    Guards against over-dropping: the phantom filter is bounded by the core exit bar, so a
+    signal that fills on a *later* bar must still open a new position.
+    """
+    result, md = _early_stop_then_reentry(second_entry_bar=5)
+    stamps = md.timestamps.as_unit("ns").asi8
+    fills = _fills(result)
+    assert [(e.side, e.exit_reason) for e in fills] == [
+        (1, None),
+        (-1, "atr_stop"),
+        (1, None),
+    ]
+    assert [int(e.timestamp) for e in fills] == [
+        int(stamps[0]),
+        int(stamps[4]),
+        int(stamps[5]),
+    ]
+    pcs = [float(e.position_after) for e in _ledger_events(result, EventType.POSITION_CHANGE)]
+    assert pcs == pytest.approx([float(fills[0].quantity), 0.0, float(fills[2].quantity)])
+
+
 def test_vectorbt_stop_on_the_final_bar_keeps_the_position_open() -> None:
     """A stop that only reaches on the window's last bar must not close the trade.
 

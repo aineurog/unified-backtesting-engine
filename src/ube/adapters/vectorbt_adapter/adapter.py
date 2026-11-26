@@ -22,7 +22,8 @@ backtrader and nautilus fill at. The *reason* is classified against the same cor
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import replace
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -591,12 +592,15 @@ class VectorbtAdapter(EngineAdapter):
             int(bar_ts[0]),
         )
 
+        # Provisional record-order running total; every POSITION_CHANGE is re-stamped
+        # chronologically after the loop, once re-timing has settled each exit bar.
         net: float = 0.0
-        # The bar a *risk* stop closed the previous leg on. The reference engines consume
-        # that bar: an opposite entry signal on it does not re-enter (only a signal exit
-        # reverses same-bar — §4.6). vectorbt encodes the flip as a separate record that
-        # enters on the stop bar; the phantom leg is dropped below so the ledger stays flat
-        # until the next signal, matching nautilus/backtrader.
+        # The bar a *risk* stop closed the previous leg on, in the core's timeline. The
+        # reference engines hold that leg until this bar: no entry can take effect before
+        # it (only a same-bar signal exit reverses — §4.6). vectorbt, having flattened early
+        # on its own frozen stop, encodes any later entry as a fresh record; those phantom
+        # legs are dropped below so the ledger stays flat until the next signal, matching
+        # nautilus/backtrader.
         prev_risk_exit_bar: int | None = None
         for _, trade in records.iterrows():
             entry_dt = pd.Timestamp(trade["Entry Timestamp"])
@@ -608,7 +612,13 @@ class VectorbtAdapter(EngineAdapter):
             size = abs(float(trade["Size"]))
             direction = str(trade["Direction"])
             side = 1 if direction == "Long" else -1
-            if prev_risk_exit_bar is not None and entry_bar == prev_risk_exit_bar:
+            # Any record whose vectorbt entry falls at or before the previous leg's *core*
+            # exit bar is phantom: the reference engine still held that leg (which is why the
+            # exit was not re-timed to this entry's bar) and would have ignored the entry
+            # signal as "already positioned". vectorbt, having stopped/flattened early,
+            # happily opens a new record — on its native stop bar or any bar after it, up to
+            # the core exit. ``<=`` (not ``==`` on the early native bar) drops all of them.
+            if prev_risk_exit_bar is not None and entry_bar <= prev_risk_exit_bar:
                 continue
             # An open record carries the last bar as its "exit" in vectorbt; the position
             # is still held at the end of the run and must stay open in the ledger (the
@@ -859,11 +869,37 @@ class VectorbtAdapter(EngineAdapter):
                     int(bar_ts[exit_bar]),
                 )
 
-            # Arm the same-bar re-entry guard only for a real, risk-terminated close; a
-            # signal exit (or an open/carried leg) leaves the next bar free to enter.
+            # Arm the re-entry guard only for a real, risk-terminated close; a signal exit
+            # (or an open/carried leg) leaves the next bar free to enter. The bound is the
+            # *core* exit bar (``exit_bar`` after re-timing), not vectorbt's earlier native
+            # stop: the reference engine held the leg right up to this bar, so every record
+            # vectorbt opened before it is phantom (see the ``<=`` check above).
             prev_risk_exit_bar = (
                 exit_bar if (not is_open and exit_reason != "signal") else None
             )
+
+        # Re-stamp ``position_after`` on the timeline, not in record order. Core re-timing
+        # can move a leg's exit past a *later* record's entry (``core_stop_exit_window``),
+        # so the running total accumulated while iterating records is not the position the
+        # ledger actually held at that instant — the emitted stream can show an open leg
+        # flattened to zero while another leg is still live, making cash and marks diverge.
+        # Walk the emitted fills in ``(timestamp, emission)`` order and stamp each
+        # POSITION_CHANGE with the position held there; the neutral default fill sign and
+        # positive quantity give the signed delta, and emission order keeps each leg's fill
+        # ahead of the position change it implies (including same-bar flips, where a close
+        # and the incoming open share a bar).
+        position = 0.0
+        rebuilt_events: list[tuple[int, int, int, LedgerEvent]] = []
+        for ts, rank, event_seq, event in sorted(
+            sorted_events, key=lambda item: (item[0], item[2])
+        ):
+            if event.event_type is EventType.FILL:
+                # A FILL always carries side and positive quantity (§4.6 schema).
+                position += cast(float, event.side) * cast(float, event.quantity)
+            elif event.event_type is EventType.POSITION_CHANGE:
+                event = replace(event, position_after=position)
+            rebuilt_events.append((ts, rank, event_seq, event))
+        sorted_events = rebuilt_events
 
         # Carry (funding/swap + short borrow) from the core cost model (§24).
         funding_rate = float(cost_model.funding)

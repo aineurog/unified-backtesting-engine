@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "unified-backtesting-engine"
-version = "0.5.0"
+version = "0.5.1"
 description = "A unified interface and output across backtesting engines (vectorbt, backtrader, NautilusTrader)."
 readme = "README.md"
 requires-python = ">=3.11"

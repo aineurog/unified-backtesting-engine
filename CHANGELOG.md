@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-25
+
+### Fixed
+
+- vectorbt fold: a phantom re-entry opened while the core engine was still holding a leg
+  is now dropped. vectorbt's entry-anchored fraction stop can close a trade *earlier*
+  than the core rule; the fold re-times that close later (`core_stop_exit_window`), but
+  vectorbt had already freed the slot and opened any later entry signal as a fresh record.
+  The re-entry guard only suppressed a record entering on the re-timed exit bar itself, so
+  an entry one or more bars after vectorbt's native stop leaked into the ledger as a second
+  concurrent position. The guard now drops every record entering at or before the core exit
+  bar. Symptoms were a summed `position_after` (double-counted size, e.g. `position_size_pct`
+  ~271%), equity collapsing to zero or below, and NaN bar returns.
+- vectorbt fold: `position_after` is now derived from the fills in `(timestamp, emission)`
+  order rather than from the record-iteration running total. When re-timing moved an exit
+  past another record's entry, the record-order total stamped a chronologically
+  inconsistent position stream (and a correspondingly wrong funding step series).
+
 ## [0.5.0] - 2026-11-25
 
 ### Added
