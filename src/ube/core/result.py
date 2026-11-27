@@ -245,9 +245,12 @@ class BacktestResult:
         # §10: the strategy statistics are computed once, here, from the same warm-up
         # sliced views the result is about to expose — the equity grid, the closed trades,
         # the ledger (position history) and the bars that price it. Failures never reach
-        # the caller: they are recorded inside the returned StatsResult.
+        # the caller: they are recorded inside the returned StatsResult. ``compute_stats``
+        # is the per-run switch (safe under concurrent runs); ``stats_enabled()`` remains
+        # the process-wide switch. Skipping stats leaves every other view — including the
+        # benchmark — untouched.
         stats_view: StatsResult | None = None
-        if stats_enabled():
+        if config.compute_stats and stats_enabled():
             stats_view = stats_from_arrays(
                 combined.index,
                 combined.equity,

@@ -63,7 +63,7 @@ from ube import papertrading as paper  # noqa: E402
 
 sys.modules["ube.paper"] = paper
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 __all__ = [
     "AUTO_ENGINE_ORDER",

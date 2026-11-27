@@ -1,7 +1,7 @@
 # Statistics
 
 UBE computes a full statistical profile of every run with
-[StratStat](https://pypi.org/project/stratstat/) (`stratstat>=0.1.0`, a core
+[StratStat](https://pypi.org/project/stratstat/) (`stratstat>=0.2.0`, a core
 dependency). The same four tiers are produced for backtests and for paper
 sessions:
 
@@ -20,7 +20,7 @@ the result you log, pickle, or compare:
 ```python
 result = ube.run(data, signals, config)
 
-result.stats.n_metrics            # 151 with all four tiers
+result.stats.n_metrics            # every metric across the four tiers
 result.stats.tiers                # ('returns', 'trades', 'exposure', 'benchmark')
 result.stats.values["sharpe_ratio"]
 result.stats.values["max_drawdown"]
@@ -29,7 +29,14 @@ result.stats.to_dict()            # JSON-serialisable payload
 result.stats.table()              # metric / value / category DataFrame
 ```
 
-`result.metrics` remains `None`; `stats` is the populated field.
+`result.metrics` remains `None`; `stats` is the populated field. Set
+`BacktestConfig.compute_stats=False` to skip the stats pass for one run —
+`result.stats` is then `None`, while the benchmark and all other result views are
+still built. Unlike `ube.stats.set_enabled()`, this is per-run and safe under
+concurrent runs.
+
+Metrics named `*_pct` (and the percentage element of `underperforming_periods`)
+use a 0–100 scale, following StratStat's convention.
 
 ### `StatsResult`
 

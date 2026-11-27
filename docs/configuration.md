@@ -31,6 +31,10 @@ config = ube.BacktestConfig(
   that it is a mapping; each adapter validates its own supported keys.
 - `date_range=(start, end)` bounds the run inclusively.
 - `warmup_bars` excludes leading bars from derived result views.
+- `compute_stats` (default `True`) controls the eager `result.stats` pass. Set it
+  `False` to skip statistics per run while still building and attaching the benchmark
+  and every other result view. Unlike `ube.stats.set_enabled(False)`, it is per run
+  and safe under concurrent runs in one process.
 - `base_currency` is required for portfolio input. Single-instrument runs can
   use the instrument's settlement currency.
 - `signal.on_opposite_signal` is required for paper trading. Select `reverse`,

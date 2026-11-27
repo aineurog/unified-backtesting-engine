@@ -948,7 +948,7 @@ def _stratstat() -> Any:
     except ImportError as exc:  # pragma: no cover — depends on the environment
         raise ImportError(
             "ube.stats requires the 'stratstat' package; install it with "
-            "`pip install 'stratstat>=0.1.0'`"
+            "`pip install 'stratstat>=0.2.0'`"
         ) from exc
     return stratstat
 

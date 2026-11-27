@@ -122,6 +122,12 @@ class BacktestConfig:
             ``{instrument_id: MarketData}`` run uses the shared-capital portfolio path
             (one combined equity curve, one pool) instead of forwarding the mapping to a
             single adapter. ``None`` keeps the single-instrument contract unchanged.
+        compute_stats: Whether a backtest run eagerly computes
+            :class:`~ube.stats.StatsResult` (default ``True``). Set ``False`` to skip the
+            stats pass entirely — ``BacktestResult.stats`` is ``None`` — while the
+            benchmark, equity, trades, and positions views are still built and attached.
+            Per-run and safe under concurrent runs in one process; unlike
+            :func:`ube.stats.set_enabled`, it does not mutate a process global.
     """
 
     instrument: Instrument
@@ -136,6 +142,7 @@ class BacktestConfig:
     base_currency: str | None = None
     warmup_bars: int = 0
     portfolio: PortfolioConfig | None = None
+    compute_stats: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.instrument, Instrument):
@@ -220,6 +227,10 @@ class BacktestConfig:
                     f"got {self.instrument.symbol!r}, expected one of "
                     f"{list(self.portfolio.instrument_ids)}"
                 )
+        if not isinstance(self.compute_stats, bool):
+            raise ConfigError(
+                f"compute_stats must be a bool; got {self.compute_stats!r}"
+            )
 
     def validate(self, *, portfolio: bool = False, paper_trading: bool = False) -> None:
         """Validate cross-field constraints for a run mode (§4.7).

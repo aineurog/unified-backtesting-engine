@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "unified-backtesting-engine"
-version = "0.5.1"
+version = "0.6.0"
 description = "A unified interface and output across backtesting engines (vectorbt, backtrader, NautilusTrader)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,7 +28,7 @@ dependencies = [
     "pyyaml>=6.0",
     "tqdm>=4.66",
     "pyarrow>=14.0",
-    "stratstat>=0.1.0",
+    "stratstat>=0.2.0",
 ]
 
 [project.optional-dependencies]

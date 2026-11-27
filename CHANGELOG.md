@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-27
+
+### Added
+
+- `BacktestConfig.compute_stats` (default `True`): a per-run switch that skips the
+  eager `result.stats` pass. When `False`, `BacktestResult.stats` is `None` while the
+  benchmark, equity, trades, positions, and trades table are still built and attached.
+  It is per-run and concurrency-safe, unlike the process-global
+  `ube.stats.set_enabled()`.
+
+### Changed
+
+- Requires `stratstat>=0.2.0`. New stratstat metrics flow through `StatsResult`
+  automatically (scalars in `values`, everything else in `objects`); no per-metric UBE
+  change is needed. `result.metrics` remains `None`.
+- Percentage metrics adopted from stratstat now report on a 0–100 scale, matching
+  their `_pct` names: `long_exposure_pct`, `short_exposure_pct`, `long_short_trade_pct`,
+  and the percentage element of `underperforming_periods`. Consumers that assumed 0–1
+  fractions must rescale. Paper-trading stats rows written before stratstat 0.2.0 store
+  the old 0–1 values, so old and new rows in one session are not directly comparable.
+
 ## [0.5.1] - 2026-11-25
 
 ### Fixed

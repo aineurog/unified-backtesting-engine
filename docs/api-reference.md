@@ -110,7 +110,7 @@ Four boolean arrays, one element per bar. `False` = no action.
 
 ## Configuration
 
-### `ube.BacktestConfig(instrument, cost_model=None, risk=..., signal=..., benchmark=..., engine='auto', engine_overrides=None, date_range=None, base_currency=None, warmup_bars=0)`
+### `ube.BacktestConfig(instrument, cost_model=None, risk=..., signal=..., benchmark=..., engine='auto', engine_overrides=None, date_range=None, base_currency=None, warmup_bars=0, compute_stats=True)`
 
 The immutable run contract.
 
@@ -126,6 +126,7 @@ The immutable run contract.
 | `date_range` | `tuple \| None` | Inclusive `(start, end)` bounds. |
 | `base_currency` | `str \| None` | Required for portfolio runs. |
 | `warmup_bars` | `int` | Leading bars excluded from result views. |
+| `compute_stats` | `bool` | Eager `result.stats` pass; `False` leaves `stats=None` per run. |
 
 **Methods:**
 

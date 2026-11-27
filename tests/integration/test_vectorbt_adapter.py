@@ -1012,10 +1012,32 @@ def test_run_end_to_end_via_ube_run_with_vectorbt(tmp_path):
     result = ube.run(md, signals, config, log_path=tmp_path / "experiments.db")
     assert isinstance(result, BacktestResult)
     assert len(result.trades) == 1
+    assert result.stats is not None  # eager stats pass is on by default
     with ExperimentLog(path=tmp_path / "experiments.db") as log:
         record = log.get(result.run_id)
         assert record is not None
         assert record.engine == "vectorbt"
+
+
+def test_run_compute_stats_false_skips_stats_but_keeps_benchmark(tmp_path):
+    md = synthetic_bars(PRESETS["futures"], seed=7, n_bars=20)
+    signals = from_target([0, 1, 1, 1] + [0] * (md.n_bars - 4))
+    config = BacktestConfig(
+        instrument=PRESETS["futures"].instrument,
+        engine="vectorbt",
+        engine_overrides={"starting_balance": 100000.0},
+        warmup_bars=3,
+        compute_stats=False,
+    )
+
+    result = ube.run(md, signals, config, log_path=tmp_path / "experiments.db")
+
+    assert result.stats is None
+    # The benchmark is still built from the same warm-up/date-range-sliced bars and
+    # stays positionally aligned with the strategy equity curve.
+    assert result.benchmark is not None
+    assert len(result.benchmark.returns) == len(result.equity_curve.index)
+    assert result.benchmark.n_bars == md.n_bars - config.warmup_bars
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """Tests for BacktestResult (§7.3, §4.6)."""
 
 import uuid
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import numpy as np
 import pandas as pd
@@ -267,6 +267,50 @@ def test_trade_table_has_one_row_per_closed_trade():
     ]
 
 
+def test_trade_table_closed_rows_match_trades():
+    # The closed rows of the display table are the same round-trips as result.trades,
+    # both before and after the warm-up filter (same fold, same entry-time cutoff).
+    for warmup in (0, 1):
+        result, _, _, _ = _two_trades(warmup_bars=warmup)
+        closed = result.trade_table[result.trade_table["status"] == "closed"]
+        assert len(closed) == len(result.trades)
+        assert list(closed["entry_datetime"]) == [
+            pd.Timestamp(t.entry_timestamp, unit="ns", tz="UTC") for t in result.trades
+        ]
+        assert list(closed["exit_datetime"]) == [
+            pd.Timestamp(t.exit_timestamp, unit="ns", tz="UTC") for t in result.trades
+        ]
+        assert closed["side"].tolist() == [t.side for t in result.trades]
+        assert closed["quantity"].tolist() == pytest.approx(
+            [t.quantity for t in result.trades]
+        )
+
+
+def test_trade_table_open_row_marks_last_bar():
+    market_data = {"A": _time_bars([_T0, _T1, _T2, _T3], [100.0, 110.0, 115.0, 120.0])}
+    instruments = {"A": Instrument("A", asset_class="stocks", settlement_currency="USD")}
+    ledger = EventLedger(
+        [
+            _cash(_T0, 1000.0),
+            _fill(_T0, "A", 1, 10.0, 100.0),
+            _position(_T0, "A", 10.0),
+        ]
+    )
+    config = BacktestConfig(instrument=instruments["A"], base_currency="USD")
+    result = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments
+    )
+
+    assert result.trades == ()  # nothing closed
+    (row,) = result.trade_table.to_dict("records")
+    assert row["status"] == "open"
+    assert row["entry_datetime"] == pd.Timestamp(_T0)
+    assert row["exit_datetime"] == pd.Timestamp(_T3)  # last bar
+    assert row["exit_price"] == pytest.approx(120.0)  # last close mark
+    assert pd.isna(row["duration"])
+    assert row["realized_pnl"] == 0.0
+
+
 def test_metrics_populated_and_benchmark_optional():
     ledger, market_data, instruments, config = _single_instrument()
     result = BacktestResult.from_ledger(
@@ -298,6 +342,26 @@ def test_benchmark_is_stored_when_provided():
         ledger, config, market_data=market_data, instruments=instruments, benchmark=curve
     )
     assert result.benchmark is curve
+
+
+def test_compute_stats_false_skips_stats_but_keeps_benchmark():
+    ledger, market_data, instruments, config = _single_instrument()
+    curve = buy_and_hold_curve(market_data["A"])
+
+    default = BacktestResult.from_ledger(
+        ledger, config, market_data=market_data, instruments=instruments, benchmark=curve
+    )
+    assert default.stats is not None  # default is on
+
+    skipped = BacktestResult.from_ledger(
+        ledger,
+        replace(config, compute_stats=False),
+        market_data=market_data,
+        instruments=instruments,
+        benchmark=curve,
+    )
+    assert skipped.stats is None
+    assert skipped.benchmark is curve  # benchmark attachment is independent of stats
 
 
 # ---------------------------------------------------------------------------

@@ -67,6 +67,7 @@ def test_defaults_match_spec():
     assert cfg.date_range is None
     assert cfg.base_currency is None  # NOT silently defaulted (§4.8)
     assert cfg.warmup_bars == 0
+    assert cfg.compute_stats is True
 
 
 def test_config_is_frozen():
@@ -172,6 +173,12 @@ def test_empty_base_currency_raises():
 def test_invalid_warmup_bars_raises(bad):
     with pytest.raises(ConfigError):
         BacktestConfig(instrument=_inst(), warmup_bars=bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad", [0, 1, "yes", None])
+def test_invalid_compute_stats_raises(bad):
+    with pytest.raises(ConfigError):
+        BacktestConfig(instrument=_inst(), compute_stats=bad)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
